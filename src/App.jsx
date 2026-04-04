@@ -383,8 +383,7 @@ function IngredientCard({ item }) {
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <span style={{ fontWeight: 600, fontSize: 15 }}>{item.ingredient}</span>
-            {item.inferred && <Chip color={C.blue}>inferred</Chip>}
-            {item.status === 'missing' && <Chip color={C.red}>missing</Chip>}
+{item.status === 'missing' && <Chip color={C.red}>missing</Chip>}
             {item.status === 'substitute' && <Chip color={C.amber}>substitute</Chip>}
           </div>
           {item.location && (
@@ -663,6 +662,18 @@ export default function App() {
       if (mode === 'photo') data = await analyzeRecipePhoto(recipePhoto, inventoryText)
       else if (mode === 'name') data = await analyzeCocktailName(cocktailName.trim(), inventoryText)
       else data = await analyzeBarMenu(menuPhoto, menuCocktailName.trim(), inventoryText)
+      const EXCLUDE_FROM_INVENTORY = [
+        "orange peel", "lemon twist", "lemon peel", "lime wheel", "lime wedge",
+        "citrus peel", "citrus garnish", "mint", "fresh herbs", "rosemary",
+        "sugar", "salt", "cream", "milk", "egg", "eggs", "soda water", "tonic water"
+      ]
+      if (Array.isArray(data.ingredients)) {
+        data.ingredients = data.ingredients.filter(item =>
+          !EXCLUDE_FROM_INVENTORY.some(term =>
+            item.ingredient.toLowerCase().includes(term)
+          )
+        )
+      }
       setResult(data)
     } catch (err) {
       setError(err.message)
