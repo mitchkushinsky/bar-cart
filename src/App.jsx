@@ -372,6 +372,13 @@ function VariationCard({ variation }) {
 function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, onFeedback, feedbackLoading }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
+  const adjustmentNoteRef = useRef(null)
+
+  useEffect(() => {
+    if (adjustmentNote) {
+      adjustmentNoteRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+  }, [adjustmentNote])
   const ingredientCount = result.ingredients?.length || 0
   const variationCount = result.variations?.length || 0
   const isFav = favorites.some(f => f.id === result._favId || f.recipeName === result.recipe_name)
@@ -405,7 +412,7 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
 
       {/* Adjustment note */}
       {adjustmentNote && (
-        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, background: C.gold + '18', border: `1px solid ${C.gold}44`, borderRadius: 10, padding: '12px 16px', marginBottom: 20 }}>
+        <div ref={adjustmentNoteRef} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, background: C.gold + '18', border: `1px solid ${C.gold}44`, borderRadius: 10, padding: '12px 16px', marginBottom: 20 }}>
           <span style={{ fontSize: 16, flexShrink: 0, marginTop: 1 }}>✓</span>
           <div>
             <span style={{ fontSize: 12, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: C.gold }}>Adjusted </span>
