@@ -292,7 +292,13 @@ function UploadZone({ file, onFile, onRemove }) {
 // ─── Ingredient Card ──────────────────────────────────────────────────────────
 
 function IngredientCard({ item, shoppingList, onAddToList }) {
-  const isExpired = item.shelf_warning && item.shelf_warning.toLowerCase().includes('expired')
+  const isExpired = (() => {
+    if (!item.shelf_warning) return false
+    const match = item.shelf_warning.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/)
+    if (!match) return false
+    const now = new Date(); now.setHours(0, 0, 0, 0)
+    return new Date(+match[3], +match[1] - 1, +match[2]) < now
+  })()
   const inList = shoppingList.some(s => s.name.toLowerCase() === item.ingredient.toLowerCase())
   const dotColor = item.status === 'found' ? C.green : item.status === 'substitute' ? C.amber : C.red
 
@@ -683,11 +689,16 @@ export default function App() {
 
   const processResult = useCallback((data) => {
     const filtered = applyGarnishFilter(data)
-    // Auto-add expired items to shopping list
+    // Auto-add ingredients whose shelf date has passed
+    const now = new Date()
+    now.setHours(0, 0, 0, 0)
     if (Array.isArray(filtered.ingredients)) {
       filtered.ingredients.forEach(item => {
-        if (item.shelf_warning && item.shelf_warning.toLowerCase().includes('expired')) {
-          addToShopping(item.ingredient)
+        if (!item.shelf_warning) return
+        const match = item.shelf_warning.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/)
+        if (match) {
+          const date = new Date(+match[3], +match[1] - 1, +match[2])
+          if (date < now) addToShopping(item.ingredient)
         }
       })
     }
@@ -771,7 +782,7 @@ export default function App() {
       <div style={{ padding: '24px 0 18px', borderBottom: `1px solid ${C.border}`, marginBottom: 20 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
           <div>
-            <div style={{ fontSize: 24, fontWeight: 800, letterSpacing: '-0.04em', color: C.gold }}>Bar Cart</div>
+            <div onClick={() => setScreen('main')} style={{ fontSize: 24, fontWeight: 800, letterSpacing: '-0.04em', color: C.gold, cursor: 'pointer' }}>Bar Cart</div>
             <div style={{ fontSize: 13, color: C.textFaint, marginTop: 2 }}>home cocktail assistant</div>
           </div>
           {inventoryLoading && <span style={{ fontSize: 13, color: C.textFaint }}>Loading inventory…</span>}
