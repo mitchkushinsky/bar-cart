@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Bar Cart — Generate Icons</title>
+  <style>
+    body { background: #111; color: #f0ede8; font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; gap: 24px; padding: 40px; }
+    canvas { border: 1px solid #333; border-radius: 8px; }
+    button { background: #c8a96e; border: none; border-radius: 8px; color: #0f0f0f; font-size: 15px; font-weight: 700; padding: 10px 24px; cursor: pointer; }
+    .row { display: flex; gap: 32px; align-items: flex-start; }
+    label { font-size: 13px; color: #888; display: block; margin-bottom: 8px; text-align: center; }
+  </style>
+</head>
+<body>
+  <h2 style="color:#c8a96e;margin:0">Bar Cart — Icon Generator</h2>
+  <p style="color:#888;font-size:14px;margin:0">Click Generate, then download both icons and place them in <code>public/</code>.</p>
+
+  <div class="row">
+    <div><label>192×192</label><canvas id="c192" width="192" height="192"></canvas></div>
+    <div><label>512×512</label><canvas id="c512" width="512" height="512"></canvas></div>
+  </div>
+
+  <div style="display:flex;gap:12px">
+    <button onclick="generate()">Generate</button>
+    <button onclick="download('c192','icon-192.png')">Download 192</button>
+    <button onclick="download('c512','icon-512.png')">Download 512</button>
+  </div>
+
+  <script>
+    function drawIcon(canvas) {
+      const size = canvas.width;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#1a1a1a';
+      ctx.fillRect(0, 0, size, size);
+      ctx.font = `${size * 0.72}px serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('🍸', size / 2, size * 0.52);
+    }
+
+    function generate() {
+      drawIcon(document.getElementById('c192'));
+      drawIcon(document.getElementById('c512'));
+    }
+
+    function download(id, filename) {
+      const canvas = document.getElementById(id);
+      const a = document.createElement('a');
+      a.download = filename;
+      a.href = canvas.toDataURL('image/png');
+      a.click();
+    }
+
+    generate();
+  </script>
+</body>
+</html>
