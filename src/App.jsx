@@ -596,6 +596,46 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
   )
 }
 
+// ─── Settings Screen ──────────────────────────────────────────────────────────
+
+function SettingsScreen({ sheetUrlInput, setSheetUrlInput, onReload, inventoryLoading, inventoryError, inventory, inStockCount, oosCount }) {
+  return (
+    <div>
+      <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 12 }}>Spreadsheet</div>
+      <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 10 }}>Google Sheet published as CSV</div>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 14, alignItems: 'center' }}>
+        <input
+          type="text"
+          value={sheetUrlInput}
+          onChange={(e) => setSheetUrlInput(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && onReload()}
+          placeholder="Google Sheet CSV URL"
+          style={{ flex: 1, minWidth: 0, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, padding: '9px 12px', fontSize: 13, outline: 'none' }}
+        />
+        <button
+          onClick={onReload}
+          disabled={inventoryLoading}
+          style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, color: inventoryLoading ? C.textFaint : C.text, padding: '9px 14px', fontSize: 13, cursor: inventoryLoading ? 'default' : 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}
+        >
+          {inventoryLoading ? 'Loading…' : 'Reload'}
+        </button>
+      </div>
+      {inventoryLoading && <div style={{ fontSize: 13, color: C.textFaint }}>Loading inventory…</div>}
+      {inventoryError && (
+        <div style={{ background: C.red + '15', border: `1px solid ${C.red}44`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: C.red }}>
+          Failed to load inventory: {inventoryError}
+        </div>
+      )}
+      {!inventoryLoading && !inventoryError && inventory && (
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 13, background: C.green + '22', color: C.green, border: `1px solid ${C.green}44`, borderRadius: 20, padding: '3px 10px', fontWeight: 600 }}>{inStockCount} in stock</span>
+          {oosCount > 0 && <span style={{ fontSize: 13, background: C.amber + '22', color: C.amber, border: `1px solid ${C.amber}44`, borderRadius: 20, padding: '3px 10px', fontWeight: 600 }}>{oosCount} OOS</span>}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Inventory Screen ─────────────────────────────────────────────────────────
 
 function InventoryScreen({ inventory, inStockCount, oosCount }) {
@@ -952,8 +992,13 @@ export default function App() {
             <div onClick={() => setScreen('main')} style={{ fontSize: 24, fontWeight: 800, letterSpacing: '-0.04em', color: C.gold, cursor: 'pointer' }}>Bar Cart</div>
             <div style={{ fontSize: 13, color: C.textFaint, marginTop: 2 }}>home cocktail assistant</div>
           </div>
-          {inventoryLoading && <span style={{ fontSize: 13, color: C.textFaint }}>Loading inventory…</span>}
-          {inventoryError && <span style={{ fontSize: 12, background: C.red + '22', color: C.red, border: `1px solid ${C.red}44`, borderRadius: 20, padding: '3px 10px' }}>Inventory error</span>}
+          <button
+            onClick={() => toggleScreen('settings')}
+            title="Settings"
+            style={{ background: screen === 'settings' ? C.gold + '22' : 'none', border: `1px solid ${screen === 'settings' ? C.gold + '55' : 'transparent'}`, borderRadius: 8, color: screen === 'settings' ? C.gold : C.textMuted, fontSize: 20, lineHeight: 1, padding: '6px 8px', cursor: 'pointer', transition: 'color 0.15s, background 0.15s' }}
+          >
+            ⚙️
+          </button>
         </div>
 
         {/* Nav pills */}
@@ -984,29 +1029,18 @@ export default function App() {
         </div>
       </div>
 
-      {/* Inventory URL row — always visible */}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 20, alignItems: 'center' }}>
-        <input
-          type="text"
-          value={sheetUrlInput}
-          onChange={(e) => setSheetUrlInput(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && handleReload()}
-          placeholder="Google Sheet CSV URL"
-          style={{ flex: 1, minWidth: 0, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, padding: '8px 12px', fontSize: 13, outline: 'none' }}
+      {/* Screen: Settings */}
+      {screen === 'settings' && (
+        <SettingsScreen
+          sheetUrlInput={sheetUrlInput}
+          setSheetUrlInput={setSheetUrlInput}
+          onReload={handleReload}
+          inventoryLoading={inventoryLoading}
+          inventoryError={inventoryError}
+          inventory={inventory}
+          inStockCount={inStockCount}
+          oosCount={oosCount}
         />
-        <button
-          onClick={handleReload}
-          disabled={inventoryLoading}
-          style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, color: inventoryLoading ? C.textFaint : C.text, padding: '8px 14px', fontSize: 13, cursor: inventoryLoading ? 'default' : 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}
-        >
-          {inventoryLoading ? 'Loading…' : 'Reload'}
-        </button>
-      </div>
-
-      {inventoryError && (
-        <div style={{ background: C.red + '15', border: `1px solid ${C.red}44`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: C.red, marginBottom: 20 }}>
-          Failed to load inventory: {inventoryError}
-        </div>
       )}
 
       {/* Screen: Inventory */}
