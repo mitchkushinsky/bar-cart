@@ -161,7 +161,10 @@ SHELF LIFE GUIDANCE (apply when Date Opened is not "N/A"):
 - Amaro: 6–12 months after opening
 - Commercial liqueurs: generally stable 6+ months
 
-For shelf warnings, always calculate and state the specific expiration date, not a duration. For example: "Opened 1/1/2026 — best by approximately 4/1/2026 (refrigerated)" or "Opened 1/1/2026 — expired approximately 2/1/2026, consider replacing." Never say "still good for X months" — always give the actual date.
+For shelf warnings, always calculate and state the specific expiration date, not a duration. Use wording that depends on whether the date is in the past or future relative to today:
+- If the expiration date is still in the future: "Opened 3/20/2026 — best by approximately 4/20/2026"
+- If the expiration date has already passed: "Opened 1/1/2026 — expired approximately 2/1/2026, consider replacing"
+Never use the word "expired" when the date is still in the future. Never say "still good for X months" — always give the actual date.
 
 Common fresh garnishes (orange peel, lemon twist, lime wheel, citrus peels, fresh herbs) and pantry staples (sugar, salt, cream, milk, eggs, soda water) should appear in the recipe array with their amounts as normal, but must be excluded from the ingredients array entirely. Do not check them against inventory.
 
