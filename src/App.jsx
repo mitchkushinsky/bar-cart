@@ -369,7 +369,7 @@ function VariationCard({ variation }) {
 
 // ─── Results ──────────────────────────────────────────────────────────────────
 
-function Results({ result, shoppingList, onAddToList, favorites, onToggleFavorite, onFeedback, feedbackLoading }) {
+function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, onFeedback, feedbackLoading }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
   const ingredientCount = result.ingredients?.length || 0
@@ -401,6 +401,17 @@ function Results({ result, shoppingList, onAddToList, favorites, onToggleFavorit
         <p style={{ color: C.textMuted, fontSize: 15, marginBottom: 24, lineHeight: 1.65, maxWidth: 600 }}>
           {result.summary}
         </p>
+      )}
+
+      {/* Adjustment note */}
+      {adjustmentNote && (
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, background: C.gold + '18', border: `1px solid ${C.gold}44`, borderRadius: 10, padding: '12px 16px', marginBottom: 20 }}>
+          <span style={{ fontSize: 16, flexShrink: 0, marginTop: 1 }}>✓</span>
+          <div>
+            <span style={{ fontSize: 12, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: C.gold }}>Adjusted </span>
+            <span style={{ fontSize: 14, color: C.text }}>{adjustmentNote}</span>
+          </div>
+        </div>
       )}
 
       {/* Canonical recipe */}
@@ -626,6 +637,7 @@ export default function App() {
   const [error, setError] = useState(null)
   const [lastRequestBody, setLastRequestBody] = useState(null)
   const [feedbackLoading, setFeedbackLoading] = useState(false)
+  const [adjustmentNote, setAdjustmentNote] = useState(null)
 
   // Inventory loading
   const loadInventory = useCallback(async (url) => {
@@ -707,7 +719,7 @@ export default function App() {
 
   const handleAnalyze = async () => {
     if (!canAnalyze()) return
-    setLoading(true); setError(null); setResult(null)
+    setLoading(true); setError(null); setResult(null); setAdjustmentNote(null)
     const menuParseStep = mode === 'menu' && menuStep === 'upload'
     setLoadingMsg(menuParseStep ? 'Reading menu…' : mode === 'photo' ? 'Analyzing recipe…' : mode === 'name' ? 'Looking up cocktail…' : 'Analyzing cocktail…')
 
@@ -743,11 +755,12 @@ export default function App() {
         messages: [
           ...lastRequestBody.messages,
           { role: 'assistant', content: JSON.stringify(result) },
-          { role: 'user', content: `The user reviewed this analysis and provided this feedback: ${feedbackText}. Please revise your response accordingly and return the same JSON structure.` },
+          { role: 'user', content: `The user reviewed this analysis and provided this feedback: ${feedbackText}. Please revise your response accordingly and return the same JSON structure, with one additional field at the top level: "adjustment_note" — a 1-2 sentence plain English explanation of what specifically changed and why (e.g. "Scaled all amounts to a 4 oz total while maintaining the 1:1:1 Negroni ratio."). Do not include adjustment_note if nothing meaningful changed.` },
         ],
       }
       const revised = await callClaude(feedbackBody)
       setLastRequestBody(feedbackBody)
+      setAdjustmentNote(revised.adjustment_note || null)
       setResult(processResult(revised))
     } catch (err) {
       setError(err.message)
@@ -961,6 +974,7 @@ export default function App() {
           {result && !loading && (
             <Results
               result={result}
+              adjustmentNote={adjustmentNote}
               shoppingList={shoppingList}
               onAddToList={addToShopping}
               favorites={favorites}
