@@ -848,6 +848,26 @@ export default function App() {
 
   useEffect(() => { loadInventory(sheetUrl) }, [sheetUrl, loadInventory])
 
+  // Read shared image from service worker cache when launched via share target
+  useEffect(() => {
+    if (!window.location.search.includes('shared=1')) return
+    const readSharedImage = async () => {
+      try {
+        const cache = await caches.open('bar-cart-share-v1')
+        const response = await cache.match('/shared-image')
+        if (!response) return
+        const blob = await response.blob()
+        const file = new File([blob], 'shared.jpg', { type: blob.type || 'image/jpeg' })
+        await cache.delete('/shared-image')
+        setMode('photo')
+        setRecipePhoto(file)
+        // Clean the URL without reloading
+        window.history.replaceState({}, '', '/')
+      } catch (_) { /* silently ignore if cache API unavailable */ }
+    }
+    readSharedImage()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleReload = () => {
     if (sheetUrlInput === sheetUrl) loadInventory(sheetUrlInput)
     else setSheetUrl(sheetUrlInput)
