@@ -200,11 +200,11 @@ async function analyzeCocktailName(name, inventoryText) {
   })
 }
 
-async function analyzeBarMenu(imageFile, cocktailName, inventoryText) {
+async function parseMenuCocktails(imageFile) {
   const { base64, mediaType } = await fileToBase64(imageFile)
   return callClaude({
     model: MODEL,
-    max_tokens: MAX_TOKENS,
+    max_tokens: 800,
     messages: [{
       role: 'user',
       content: [
@@ -214,10 +214,34 @@ async function analyzeBarMenu(imageFile, cocktailName, inventoryText) {
         },
         {
           type: 'text',
-          text: `The image shows a bar menu. Find the cocktail named "${cocktailName}" in the menu. Read its description carefully and infer the most likely ingredients from it. Set "inferred": true for any ingredient you are inferring from a vague description rather than one that is explicitly listed. Then check each ingredient against the bar inventory and provide a full analysis.\n\n${sharedPromptSuffix(inventoryText)}`,
+          text: 'This image shows a cocktail menu. Return ONLY a JSON object with no markdown fences. Use this exact structure: {"cocktails": ["name1", "name2"]}. List every cocktail name found on the menu in the order they appear. No extra text.',
         },
       ],
     }],
+  })
+}
+
+async function analyzeBarMenu(menuFile, cocktailName, inventoryText, cocktailPhotoFile) {
+  const { base64, mediaType } = await fileToBase64(menuFile)
+  const content = [
+    { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+  ]
+  if (cocktailPhotoFile) {
+    const { base64: b2, mediaType: mt2 } = await fileToBase64(cocktailPhotoFile)
+    content.push({ type: 'image', source: { type: 'base64', media_type: mt2, data: b2 } })
+    content.push({
+      type: 'text',
+      text: 'The second image is a photo of the actual cocktail as served — use it to help infer ingredients, color, garnish, and glassware.',
+    })
+  }
+  content.push({
+    type: 'text',
+    text: `The first image shows a bar menu. Find the cocktail named "${cocktailName}" in the menu. Read its description carefully and infer the most likely ingredients from it. Set "inferred": true for any ingredient you are inferring from a vague description rather than one that is explicitly listed. Then check each ingredient against the bar inventory and provide a full analysis.\n\n${sharedPromptSuffix(inventoryText)}`,
+  })
+  return callClaude({
+    model: MODEL,
+    max_tokens: MAX_TOKENS,
+    messages: [{ role: 'user', content }],
   })
 }
 
@@ -605,7 +629,10 @@ export default function App() {
   const [recipePhoto, setRecipePhoto] = useState(null)
   const [cocktailName, setCocktailName] = useState('')
   const [menuPhoto, setMenuPhoto] = useState(null)
-  const [menuCocktailName, setMenuCocktailName] = useState('')
+  const [menuStep, setMenuStep] = useState('upload') // 'upload' | 'selecting' | 'ready'
+  const [menuCocktails, setMenuCocktails] = useState([])
+  const [menuSelectedCocktail, setMenuSelectedCocktail] = useState('')
+  const [menuCocktailPhoto, setMenuCocktailPhoto] = useState(null)
 
   const [loading, setLoading] = useState(false)
   const [loadingMsg, setLoadingMsg] = useState('')
@@ -645,7 +672,7 @@ export default function App() {
     if (!inventory || inventoryLoading || loading) return false
     if (mode === 'photo') return !!recipePhoto
     if (mode === 'name') return cocktailName.trim().length > 0
-    if (mode === 'menu') return !!menuPhoto && menuCocktailName.trim().length > 0
+    if (mode === 'menu') return menuStep === 'upload' ? !!menuPhoto : menuStep === 'ready'
     return false
   }
 
@@ -654,14 +681,30 @@ export default function App() {
     setLoading(true)
     setError(null)
     setResult(null)
-    setLoadingMsg({ photo: 'Analyzing recipe…', name: 'Looking up cocktail…', menu: 'Reading menu…' }[mode])
+    const menuParseStep = mode === 'menu' && menuStep === 'upload'
+    setLoadingMsg(
+      menuParseStep ? 'Reading menu…'
+      : mode === 'photo' ? 'Analyzing recipe…'
+      : mode === 'name' ? 'Looking up cocktail…'
+      : 'Analyzing cocktail…'
+    )
 
     try {
+      // Menu Step 1 — parse cocktail list from menu image
+      if (menuParseStep) {
+        const parsed = await parseMenuCocktails(menuPhoto)
+        const list = Array.isArray(parsed?.cocktails) ? parsed.cocktails : []
+        setMenuCocktails(list)
+        setMenuStep('selecting')
+        setLoading(false)
+        return
+      }
+
       const inventoryText = inventoryToText(inventory)
       let data
       if (mode === 'photo') data = await analyzeRecipePhoto(recipePhoto, inventoryText)
       else if (mode === 'name') data = await analyzeCocktailName(cocktailName.trim(), inventoryText)
-      else data = await analyzeBarMenu(menuPhoto, menuCocktailName.trim(), inventoryText)
+      else data = await analyzeBarMenu(menuPhoto, menuSelectedCocktail, inventoryText, menuCocktailPhoto)
       const EXCLUDE_FROM_INVENTORY = [
         "orange peel", "lemon twist", "lemon peel", "lime wheel", "lime wedge",
         "citrus peel", "citrus garnish", "mint", "fresh herbs", "rosemary",
@@ -686,6 +729,11 @@ export default function App() {
     setMode(m)
     setResult(null)
     setError(null)
+    setMenuPhoto(null)
+    setMenuStep('upload')
+    setMenuCocktails([])
+    setMenuSelectedCocktail('')
+    setMenuCocktailPhoto(null)
   }
 
   const MODES = [
@@ -847,31 +895,102 @@ export default function App() {
         )}
 
         {mode === 'menu' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-            <UploadZone
-              file={menuPhoto}
-              onFile={setMenuPhoto}
-              onRemove={() => { setMenuPhoto(null); setMenuCocktailName('') }}
-            />
-            {menuPhoto && (
-              <input
-                type="text"
-                value={menuCocktailName}
-                onChange={(e) => setMenuCocktailName(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && canAnalyze() && handleAnalyze()}
-                placeholder="Which cocktail do you want to replicate?"
-                autoFocus
-                style={{
-                  width: '100%',
-                  background: C.surface,
-                  border: `1px solid ${C.border}`,
-                  borderRadius: 10,
-                  color: C.text,
-                  padding: '12px 14px',
-                  fontSize: 15,
-                  outline: 'none',
-                }}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* Step 1 — upload menu */}
+            {menuStep === 'upload' && (
+              <UploadZone
+                file={menuPhoto}
+                onFile={setMenuPhoto}
+                onRemove={() => setMenuPhoto(null)}
               />
+            )}
+
+            {/* Step 2 — cocktail list + optional cocktail photo */}
+            {(menuStep === 'selecting' || menuStep === 'ready') && (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                  <div style={{ fontSize: 13, color: C.textMuted }}>
+                    {menuCocktails.length} cocktail{menuCocktails.length !== 1 ? 's' : ''} found — tap one to select
+                  </div>
+                  <button
+                    onClick={() => { setMenuStep('upload'); setMenuCocktails([]); setMenuSelectedCocktail(''); setMenuCocktailPhoto(null) }}
+                    style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0 }}
+                  >
+                    ← new menu
+                  </button>
+                </div>
+
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  {menuCocktails.map((name) => {
+                    const selected = name === menuSelectedCocktail
+                    return (
+                      <button
+                        key={name}
+                        onClick={() => { setMenuSelectedCocktail(name); setMenuStep('ready'); setResult(null); setError(null) }}
+                        style={{
+                          background: selected ? C.gold : C.surface,
+                          border: `1px solid ${selected ? C.gold : C.border}`,
+                          borderRadius: 20,
+                          color: selected ? '#0f0f0f' : C.text,
+                          fontSize: 13,
+                          fontWeight: selected ? 700 : 400,
+                          padding: '6px 14px',
+                          cursor: 'pointer',
+                          transition: 'background 0.15s, color 0.15s, border-color 0.15s',
+                        }}
+                      >
+                        {name}
+                      </button>
+                    )
+                  })}
+                </div>
+
+                {menuStep === 'ready' && (
+                  <>
+                    <div style={{ fontSize: 15, fontWeight: 600, color: C.gold }}>
+                      {menuSelectedCocktail}
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 12, color: C.textFaint, marginBottom: 8 }}>
+                        Add a photo of the cocktail (optional) — helps with replication
+                      </div>
+                      {menuCocktailPhoto ? (
+                        <div style={{ position: 'relative', display: 'inline-block' }}>
+                          <img
+                            src={URL.createObjectURL(menuCocktailPhoto)}
+                            alt="Cocktail preview"
+                            style={{ maxHeight: 160, borderRadius: 8, border: `1px solid ${C.border}`, display: 'block' }}
+                          />
+                          <button
+                            onClick={() => setMenuCocktailPhoto(null)}
+                            style={{
+                              position: 'absolute', top: 6, right: 6,
+                              background: 'rgba(0,0,0,0.8)', border: `1px solid ${C.border}`,
+                              color: C.text, borderRadius: 5, padding: '2px 8px', fontSize: 11, cursor: 'pointer',
+                            }}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      ) : (
+                        <label style={{
+                          display: 'flex', alignItems: 'center', gap: 8,
+                          border: `1px dashed ${C.border}`, borderRadius: 8,
+                          padding: '10px 14px', cursor: 'pointer',
+                          color: C.textMuted, fontSize: 13,
+                        }}>
+                          <input
+                            type="file" accept="image/*" style={{ display: 'none' }}
+                            onChange={(e) => { if (e.target.files[0]) setMenuCocktailPhoto(e.target.files[0]) }}
+                          />
+                          <span style={{ fontSize: 18 }}>🍸</span>
+                          Click to add cocktail photo
+                        </label>
+                      )}
+                    </div>
+                  </>
+                )}
+              </>
             )}
           </div>
         )}
