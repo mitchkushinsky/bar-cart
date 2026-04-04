@@ -831,6 +831,7 @@ export default function App() {
   const [lastRequestBody, setLastRequestBody] = useState(null)
   const [feedbackLoading, setFeedbackLoading] = useState(false)
   const [adjustmentNote, setAdjustmentNote] = useState(null)
+  const [sharedImage, setSharedImage] = useState(null) // pending share-target file awaiting mode selection
 
   // Inventory loading
   const loadInventory = useCallback(async (url) => {
@@ -859,9 +860,7 @@ export default function App() {
         const blob = await response.blob()
         const file = new File([blob], 'shared.jpg', { type: blob.type || 'image/jpeg' })
         await cache.delete('/shared-image')
-        setMode('photo')
-        setRecipePhoto(file)
-        // Clean the URL without reloading
+        setSharedImage(file)
         window.history.replaceState({}, '', '/')
       } catch (_) { /* silently ignore if cache API unavailable */ }
     }
@@ -1048,6 +1047,55 @@ export default function App() {
           })}
         </div>
       </div>
+
+      {/* Share target mode prompt */}
+      {sharedImage && (
+        <div style={{ marginTop: 16 }}>
+          <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 6 }}>
+            What is this a photo of?
+          </div>
+          <div style={{ fontSize: 14, color: C.textMuted, marginBottom: 24 }}>
+            Choose how to use this image:
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <button
+              onClick={() => {
+                setMode('photo')
+                setRecipePhoto(sharedImage)
+                setSharedImage(null)
+                setScreen('main')
+              }}
+              style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, color: C.text, padding: '20px 16px', fontSize: 17, fontWeight: 600, cursor: 'pointer', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 14, transition: 'border-color 0.15s, background 0.15s' }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = C.gold; e.currentTarget.style.background = C.gold + '12' }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.background = C.surface }}
+            >
+              <span style={{ fontSize: 32, lineHeight: 1 }}>📷</span>
+              <div>
+                <div>Recipe</div>
+                <div style={{ fontSize: 13, fontWeight: 400, color: C.textMuted, marginTop: 3 }}>A screenshot or photo of a cocktail recipe</div>
+              </div>
+            </button>
+            <button
+              onClick={() => {
+                setMode('menu')
+                setMenuPhoto(sharedImage)
+                setMenuStep('upload')
+                setSharedImage(null)
+                setScreen('main')
+              }}
+              style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, color: C.text, padding: '20px 16px', fontSize: 17, fontWeight: 600, cursor: 'pointer', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 14, transition: 'border-color 0.15s, background 0.15s' }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = C.gold; e.currentTarget.style.background = C.gold + '12' }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.background = C.surface }}
+            >
+              <span style={{ fontSize: 32, lineHeight: 1 }}>🍹</span>
+              <div>
+                <div>Bar Menu</div>
+                <div style={{ fontSize: 13, fontWeight: 400, color: C.textMuted, marginTop: 3 }}>A photo of a cocktail menu at a bar or restaurant</div>
+              </div>
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Screen: Settings */}
       {screen === 'settings' && (
