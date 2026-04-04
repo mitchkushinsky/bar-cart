@@ -95,6 +95,21 @@ function extractJSON(text) {
   throw new Error('Could not parse JSON from Claude response')
 }
 
+async function callClaudeText(body) {
+  const res = await fetch('/api/claude', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }))
+    throw new Error(err.error || `HTTP ${res.status}`)
+  }
+  const data = await res.json()
+  const textBlock = (data.content || []).filter((b) => b.type === 'text').pop()
+  return textBlock?.text?.trim() || ''
+}
+
 async function callClaude(body) {
   const res = await fetch('/api/claude', {
     method: 'POST',
@@ -289,9 +304,64 @@ function UploadZone({ file, onFile, onRemove }) {
   )
 }
 
+// ─── Ingredient Drawer ────────────────────────────────────────────────────────
+
+function IngredientDrawer({ item, flavorProfile, loading, onClose, inventory }) {
+  const invMatch = inventory?.find(inv =>
+    inv.spirit.toLowerCase() === item.ingredient.toLowerCase() ||
+    item.ingredient.toLowerCase().includes(inv.spirit.toLowerCase()) ||
+    inv.spirit.toLowerCase().includes(item.ingredient.toLowerCase())
+  )
+
+  return (
+    <>
+      {/* Backdrop */}
+      <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 99, transition: 'opacity 0.25s' }} />
+      {/* Drawer */}
+      <div style={{ position: 'fixed', bottom: 0, left: '50%', transform: 'translateX(-50%)', width: '100%', maxWidth: 700, background: '#1c1c1c', borderTop: `1px solid ${C.border}`, borderTopLeftRadius: 18, borderTopRightRadius: 18, padding: '20px 20px 36px', zIndex: 100, maxHeight: '72vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 16 }}>
+          <div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: C.text, letterSpacing: '-0.02em' }}>{item.ingredient}</div>
+            {(invMatch?.category || item.location) && (
+              <div style={{ fontSize: 13, color: C.textMuted, marginTop: 4, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                {invMatch?.category && <span>{invMatch.category}</span>}
+                {item.location && <span>📍 {item.location}</span>}
+              </div>
+            )}
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textMuted, fontSize: 20, lineHeight: 1, padding: '2px 9px', cursor: 'pointer', flexShrink: 0 }}>×</button>
+        </div>
+
+        {/* Flavor profile */}
+        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 14 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Flavor Profile</div>
+          {loading
+            ? <div style={{ color: C.textMuted, fontSize: 14 }}>Loading…</div>
+            : <p style={{ fontSize: 14, color: C.text, lineHeight: 1.65, margin: 0 }}>{flavorProfile || '—'}</p>
+          }
+        </div>
+
+        {item.shelf_warning && (
+          <div style={{ fontSize: 13, color: C.amber, background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 8, padding: '8px 12px', marginBottom: 10 }}>
+            ⚠️ {item.shelf_warning}
+          </div>
+        )}
+        {item.refrigerate_tip && (
+          <div style={{ fontSize: 13, color: C.blue, background: C.blue + '12', border: `1px solid ${C.blue}33`, borderRadius: 8, padding: '8px 12px', marginBottom: 10 }}>
+            ❄️ {item.refrigerate_tip}
+          </div>
+        )}
+        {invMatch?.notes && (
+          <div style={{ fontSize: 13, color: C.textFaint, marginTop: 6 }}>{invMatch.notes}</div>
+        )}
+      </div>
+    </>
+  )
+}
+
 // ─── Ingredient Card ──────────────────────────────────────────────────────────
 
-function IngredientCard({ item, shoppingList, onAddToList }) {
+function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer }) {
   const isExpired = (() => {
     if (!item.shelf_warning) return false
     const match = item.shelf_warning.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/)
@@ -308,7 +378,7 @@ function IngredientCard({ item, shoppingList, onAddToList }) {
         <span style={{ display: 'inline-block', width: 9, height: 9, borderRadius: '50%', background: dotColor, flexShrink: 0, marginTop: 3 }} />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 2 }}>
-            <span style={{ fontWeight: 600, fontSize: 15 }}>{item.ingredient}</span>
+            <span onClick={() => onOpenDrawer(item)} style={{ fontWeight: 600, fontSize: 15, cursor: 'pointer', textDecoration: 'underline', textDecorationStyle: 'dotted', textUnderlineOffset: 3 }}>{item.ingredient}</span>
             {item.status === 'missing' && <Chip color={C.red}>missing</Chip>}
             {item.status === 'substitute' && <Chip color={C.amber}>substitute</Chip>}
             {(item.status === 'missing' || item.status === 'substitute') && !inList && (
@@ -369,16 +439,40 @@ function VariationCard({ variation }) {
 
 // ─── Results ──────────────────────────────────────────────────────────────────
 
-function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, onFeedback, feedbackLoading }) {
+function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, onFeedback, feedbackLoading, inventory }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
   const adjustmentNoteRef = useRef(null)
+  const [drawerItem, setDrawerItem] = useState(null)
+  const [flavorCache, setFlavorCache] = useState({})
+  const [drawerLoading, setDrawerLoading] = useState(false)
 
   useEffect(() => {
     if (adjustmentNote) {
       adjustmentNoteRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
     }
   }, [adjustmentNote])
+
+  const openDrawer = async (item) => {
+    setDrawerItem(item)
+    if (flavorCache[item.ingredient] !== undefined) return
+    setDrawerLoading(true)
+    try {
+      const text = await callClaudeText({
+        model: MODEL,
+        max_tokens: 300,
+        messages: [{
+          role: 'user',
+          content: `Describe ${item.ingredient} briefly for a cocktail enthusiast: its flavor profile, common cocktail uses, and what cocktail families or drink styles it belongs to. 2-3 sentences max.`,
+        }],
+      })
+      setFlavorCache(prev => ({ ...prev, [item.ingredient]: text }))
+    } catch (_) {
+      setFlavorCache(prev => ({ ...prev, [item.ingredient]: 'Could not load flavor profile.' }))
+    } finally {
+      setDrawerLoading(false)
+    }
+  }
   const ingredientCount = result.ingredients?.length || 0
   const variationCount = result.variations?.length || 0
   const isFav = favorites.some(f => f.id === result._favId || f.recipeName === result.recipe_name)
@@ -453,7 +547,7 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
       {tab === 'ingredients' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {(result.ingredients || []).map((item, i) => (
-            <IngredientCard key={i} item={item} shoppingList={shoppingList} onAddToList={onAddToList} />
+            <IngredientCard key={i} item={item} shoppingList={shoppingList} onAddToList={onAddToList} onOpenDrawer={openDrawer} />
           ))}
         </div>
       )}
@@ -464,6 +558,17 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
             : (result.variations || []).map((v, i) => <VariationCard key={i} variation={v} />)
           }
         </div>
+      )}
+
+      {/* Ingredient drawer */}
+      {drawerItem && (
+        <IngredientDrawer
+          item={drawerItem}
+          flavorProfile={flavorCache[drawerItem.ingredient]}
+          loading={drawerLoading && flavorCache[drawerItem.ingredient] === undefined}
+          onClose={() => setDrawerItem(null)}
+          inventory={inventory}
+        />
       )}
 
       {/* Feedback */}
@@ -572,32 +677,73 @@ function ShoppingListScreen({ shoppingList, onRemove, onClear }) {
 
 // ─── Favorites Screen ─────────────────────────────────────────────────────────
 
-function FavoritesScreen({ favorites, onRemove, onView }) {
+function FavoriteCard({ fav, onRemove, onView, onUpdateNote }) {
+  const [editingNote, setEditingNote] = useState(false)
+  const [noteText, setNoteText] = useState(fav.note || '')
+
+  const saveNote = () => {
+    onUpdateNote(fav.id, noteText.trim())
+    setEditingNote(false)
+  }
+
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 16, color: C.gold, marginBottom: 4 }}>{fav.recipeName}</div>
+          {fav.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{fav.summary}</div>}
+        </div>
+        <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+          <button onClick={() => onView(fav)} style={{ background: C.gold, border: 'none', borderRadius: 7, color: '#0f0f0f', fontSize: 12, fontWeight: 700, padding: '6px 12px', cursor: 'pointer' }}>View</button>
+          <button onClick={() => onRemove(fav.id)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textFaint, fontSize: 18, padding: '2px 8px', cursor: 'pointer', lineHeight: 1 }}>×</button>
+        </div>
+      </div>
+
+      {fav.recipe && fav.recipe.length > 0 && (
+        <div style={{ marginTop: 8, fontSize: 12, color: C.textFaint }}>
+          {fav.recipe.slice(0, 3).map(r => r.ingredient).join(', ')}{fav.recipe.length > 3 ? ` +${fav.recipe.length - 3} more` : ''}
+        </div>
+      )}
+
+      {/* Notes */}
+      <div style={{ marginTop: 10, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
+        {editingNote ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <textarea
+              value={noteText}
+              onChange={(e) => setNoteText(e.target.value)}
+              placeholder="Add a note about this recipe…"
+              rows={3}
+              autoFocus
+              style={{ width: '100%', background: '#111', border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: '8px 10px', fontSize: 13, resize: 'vertical', outline: 'none', fontFamily: 'inherit' }}
+            />
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button onClick={saveNote} style={{ background: C.gold, border: 'none', borderRadius: 6, color: '#0f0f0f', fontSize: 12, fontWeight: 700, padding: '5px 12px', cursor: 'pointer' }}>Save</button>
+              <button onClick={() => { setNoteText(fav.note || ''); setEditingNote(false) }} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 6, color: C.textMuted, fontSize: 12, padding: '5px 10px', cursor: 'pointer' }}>Cancel</button>
+            </div>
+          </div>
+        ) : fav.note ? (
+          <p onClick={() => setEditingNote(true)} style={{ fontSize: 13, color: C.textMuted, fontStyle: 'italic', lineHeight: 1.55, cursor: 'pointer', margin: 0 }}>
+            {fav.note}
+          </p>
+        ) : (
+          <button onClick={() => setEditingNote(true)} style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0 }}>
+            + Add a note…
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function FavoritesScreen({ favorites, onRemove, onView, onUpdateNote }) {
   if (favorites.length === 0) {
     return <p style={{ color: C.textMuted, fontSize: 14 }}>No saved favorites yet. Analyze a recipe and tap ♡ Save to Favorites.</p>
   }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       {favorites.map(fav => (
-        <div key={fav.id} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
-          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontWeight: 700, fontSize: 16, color: C.gold, marginBottom: 4 }}>{fav.recipeName}</div>
-              {fav.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{fav.summary}</div>}
-            </div>
-            <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
-              <button onClick={() => onView(fav)} style={{ background: C.gold, border: 'none', borderRadius: 7, color: '#0f0f0f', fontSize: 12, fontWeight: 700, padding: '6px 12px', cursor: 'pointer' }}>
-                View
-              </button>
-              <button onClick={() => onRemove(fav.id)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textFaint, fontSize: 18, padding: '2px 8px', cursor: 'pointer', lineHeight: 1 }}>×</button>
-            </div>
-          </div>
-          {fav.recipe && fav.recipe.length > 0 && (
-            <div style={{ marginTop: 10, fontSize: 12, color: C.textFaint }}>
-              {fav.recipe.slice(0, 3).map(r => r.ingredient).join(', ')}{fav.recipe.length > 3 ? ` +${fav.recipe.length - 3} more` : ''}
-            </div>
-          )}
-        </div>
+        <FavoriteCard key={fav.id} fav={fav} onRemove={onRemove} onView={onView} onUpdateNote={onUpdateNote} />
       ))}
     </div>
   )
@@ -691,6 +837,7 @@ export default function App() {
   }
 
   const removeFavorite = (id) => setFavorites(prev => prev.filter(f => f.id !== id))
+  const updateFavoriteNote = (id, note) => setFavorites(prev => prev.map(f => f.id === id ? { ...f, note } : f))
 
   const viewFavorite = (fav) => {
     setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, ingredients: fav.ingredients, variations: fav.variations })
@@ -874,7 +1021,7 @@ export default function App() {
 
       {/* Screen: Favorites */}
       {screen === 'favorites' && (
-        <FavoritesScreen favorites={favorites} onRemove={removeFavorite} onView={viewFavorite} />
+        <FavoritesScreen favorites={favorites} onRemove={removeFavorite} onView={viewFavorite} onUpdateNote={updateFavoriteNote} />
       )}
 
       {/* Screen: Main */}
@@ -988,6 +1135,7 @@ export default function App() {
               onToggleFavorite={toggleFavorite}
               onFeedback={handleFeedback}
               feedbackLoading={feedbackLoading}
+              inventory={inventory}
             />
           )}
         </>
