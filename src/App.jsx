@@ -139,6 +139,8 @@ SHELF LIFE GUIDANCE (apply when Date Opened is not "N/A"):
 - Amaro: 6–12 months after opening
 - Commercial liqueurs: generally stable 6+ months
 
+Assume the user always has common fresh garnishes and pantry staples on hand — including citrus peels, lemon, lime, orange, fresh herbs, sugar, salt, cream, eggs, and soda water. Do not mark these as missing or suggest substitutes for them.
+
 Return ONLY valid JSON with no markdown fences, no extra text. Use this exact structure:
 {
   "recipe_name": "string",
