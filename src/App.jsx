@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
+import { supabase } from './supabase.js'
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -805,6 +806,12 @@ export default function App() {
   // Navigation
   const [screen, setScreen] = useState('main') // 'main' | 'inventory' | 'shopping' | 'favorites'
 
+  // Auth
+  const [user, setUser] = useState(null)
+  const [authLoading, setAuthLoading] = useState(true)
+  const dataLoadedForRef = useRef(null)
+  const shoppingListRef = useRef([])
+
   // Persisted state
   const [shoppingList, setShoppingList] = useState(() => {
     try { return JSON.parse(localStorage.getItem('bar-cart-shopping')) || [] } catch { return [] }
@@ -813,8 +820,73 @@ export default function App() {
     try { return JSON.parse(localStorage.getItem('bar-cart-favorites')) || [] } catch { return [] }
   })
 
-  useEffect(() => { localStorage.setItem('bar-cart-shopping', JSON.stringify(shoppingList)) }, [shoppingList])
-  useEffect(() => { localStorage.setItem('bar-cart-favorites', JSON.stringify(favorites)) }, [favorites])
+  useEffect(() => { shoppingListRef.current = shoppingList }, [shoppingList])
+  useEffect(() => { if (!user) localStorage.setItem('bar-cart-shopping', JSON.stringify(shoppingList)) }, [shoppingList, user])
+  useEffect(() => { if (!user) localStorage.setItem('bar-cart-favorites', JSON.stringify(favorites)) }, [favorites, user])
+
+  // DB helpers
+  const dbFavToLocal = (row) => ({
+    id: row.id,
+    recipeName: row.recipe_name,
+    summary: row.summary,
+    recipe: row.recipe || [],
+    ingredients: row.ingredients || [],
+    variations: row.variations || [],
+    note: row.notes || '',
+    mode: row.mode,
+    savedAt: row.saved_at,
+  })
+
+  const migrateAndLoadData = async (u) => {
+    const localFavs = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-favorites')) || [] } catch { return [] } })()
+    const localShopping = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-shopping')) || [] } catch { return [] } })()
+
+    if (localFavs.length > 0) {
+      const rows = localFavs.map(f => ({
+        user_id: u.id,
+        recipe_name: f.recipeName,
+        summary: f.summary || null,
+        recipe: f.recipe || [],
+        ingredients: f.ingredients || [],
+        variations: f.variations || [],
+        notes: f.note || null,
+        saved_at: f.savedAt || new Date().toISOString(),
+      }))
+      await supabase.from('favorites').upsert(rows, { onConflict: 'user_id,recipe_name', ignoreDuplicates: true })
+    }
+
+    if (localShopping.length > 0) {
+      const rows = localShopping.map(i => ({ user_id: u.id, name: i.name }))
+      await supabase.from('shopping_list').upsert(rows, { onConflict: 'user_id,name', ignoreDuplicates: true })
+    }
+
+    const [{ data: favData }, { data: shopData }] = await Promise.all([
+      supabase.from('favorites').select('*').eq('user_id', u.id).order('saved_at', { ascending: false }),
+      supabase.from('shopping_list').select('*').eq('user_id', u.id).order('created_at', { ascending: true }),
+    ])
+    if (favData) setFavorites(favData.map(dbFavToLocal))
+    if (shopData) setShoppingList(shopData.map(r => ({ id: r.id, name: r.name })))
+  }
+
+  // Auth effect
+  useEffect(() => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      const newUser = session?.user ?? null
+      setUser(newUser)
+      setAuthLoading(false)
+      if (newUser) {
+        if (dataLoadedForRef.current !== newUser.id) {
+          dataLoadedForRef.current = newUser.id
+          migrateAndLoadData(newUser)
+        }
+      } else if (event === 'SIGNED_OUT') {
+        dataLoadedForRef.current = null
+        try { setFavorites(JSON.parse(localStorage.getItem('bar-cart-favorites')) || []) } catch { setFavorites([]) }
+        try { setShoppingList(JSON.parse(localStorage.getItem('bar-cart-shopping')) || []) } catch { setShoppingList([]) }
+      }
+    })
+    return () => subscription.unsubscribe()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Input mode
   const [mode, setMode] = useState('photo')
@@ -879,27 +951,69 @@ export default function App() {
   const oosCount = inventory ? inventory.filter(i => i.oos).length : 0
 
   // Shopping list helpers
-  const addToShopping = useCallback((name) => {
-    setShoppingList(prev => {
-      if (prev.some(i => i.name.toLowerCase() === name.toLowerCase())) return prev
-      return [...prev, { id: Date.now() + Math.random(), name }]
-    })
-  }, [])
+  const addToShopping = useCallback(async (name) => {
+    if (shoppingListRef.current.some(i => i.name.toLowerCase() === name.toLowerCase())) return
+    if (user) {
+      const { data, error } = await supabase.from('shopping_list').insert({ user_id: user.id, name }).select().single()
+      if (!error && data) setShoppingList(prev => [...prev, { id: data.id, name: data.name }])
+    } else {
+      setShoppingList(prev => {
+        if (prev.some(i => i.name.toLowerCase() === name.toLowerCase())) return prev
+        return [...prev, { id: Date.now() + Math.random(), name }]
+      })
+    }
+  }, [user])
 
-  const removeFromShopping = (id) => setShoppingList(prev => prev.filter(i => i.id !== id))
-  const clearShopping = () => setShoppingList([])
-
-  // Favorites helpers
-  const toggleFavorite = (res) => {
-    setFavorites(prev => {
-      const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
-      if (existing >= 0) return prev.filter((_, i) => i !== existing)
-      return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, ingredients: res.ingredients, variations: res.variations, savedAt: new Date().toISOString() }, ...prev]
-    })
+  const removeFromShopping = async (id) => {
+    if (user) await supabase.from('shopping_list').delete().eq('id', id)
+    setShoppingList(prev => prev.filter(i => i.id !== id))
   }
 
-  const removeFavorite = (id) => setFavorites(prev => prev.filter(f => f.id !== id))
-  const updateFavoriteNote = (id, note) => setFavorites(prev => prev.map(f => f.id === id ? { ...f, note } : f))
+  const clearShopping = async () => {
+    if (user) await supabase.from('shopping_list').delete().eq('user_id', user.id)
+    setShoppingList([])
+  }
+
+  // Favorites helpers
+  const toggleFavorite = async (res) => {
+    if (user) {
+      const existing = favorites.find(f => f.recipeName === res.recipe_name)
+      if (existing) {
+        await supabase.from('favorites').delete().eq('id', existing.id)
+        setFavorites(prev => prev.filter(f => f.id !== existing.id))
+      } else {
+        const { data, error } = await supabase.from('favorites').insert({
+          user_id: user.id,
+          recipe_name: res.recipe_name,
+          summary: res.summary || null,
+          recipe: res.recipe || [],
+          ingredients: res.ingredients || [],
+          variations: res.variations || [],
+          saved_at: new Date().toISOString(),
+        }).select().single()
+        if (!error && data) setFavorites(prev => [dbFavToLocal(data), ...prev])
+      }
+    } else {
+      setFavorites(prev => {
+        const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
+        if (existing >= 0) return prev.filter((_, i) => i !== existing)
+        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, ingredients: res.ingredients, variations: res.variations, savedAt: new Date().toISOString() }, ...prev]
+      })
+    }
+  }
+
+  const removeFavorite = async (id) => {
+    if (user) await supabase.from('favorites').delete().eq('id', id)
+    setFavorites(prev => prev.filter(f => f.id !== id))
+  }
+
+  const updateFavoriteNote = async (id, note) => {
+    if (user) await supabase.from('favorites').update({ notes: note }).eq('id', id)
+    setFavorites(prev => prev.map(f => f.id === id ? { ...f, note } : f))
+  }
+
+  const signIn = () => supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: window.location.origin } })
+  const signOut = () => supabase.auth.signOut()
 
   const viewFavorite = (fav) => {
     setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, ingredients: fav.ingredients, variations: fav.variations })
@@ -1014,13 +1128,35 @@ export default function App() {
             <div onClick={() => setScreen('main')} style={{ fontSize: 24, fontWeight: 800, letterSpacing: '-0.04em', color: C.gold, cursor: 'pointer' }}>Bar Cart</div>
             <div style={{ fontSize: 13, color: C.textFaint, marginTop: 2 }}>home cocktail assistant</div>
           </div>
-          <button
-            onClick={() => toggleScreen('settings')}
-            title="Settings"
-            style={{ background: screen === 'settings' ? C.gold + '22' : 'none', border: `1px solid ${screen === 'settings' ? C.gold + '55' : 'transparent'}`, borderRadius: 8, color: screen === 'settings' ? C.gold : C.textMuted, fontSize: 20, lineHeight: 1, padding: '6px 8px', cursor: 'pointer', transition: 'color 0.15s, background 0.15s' }}
-          >
-            ⚙️
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {/* Auth UI */}
+            {!authLoading && (user ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {user.user_metadata?.avatar_url ? (
+                  <img src={user.user_metadata.avatar_url} alt="" style={{ width: 28, height: 28, borderRadius: '50%', border: `1px solid ${C.border}` }} />
+                ) : (
+                  <div style={{ width: 28, height: 28, borderRadius: '50%', background: C.gold + '33', border: `1px solid ${C.gold}55`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, color: C.gold }}>
+                    {(user.user_metadata?.full_name || user.email || '?')[0].toUpperCase()}
+                  </div>
+                )}
+                <button onClick={signOut} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textMuted, fontSize: 12, padding: '4px 8px', cursor: 'pointer' }}>
+                  Sign out
+                </button>
+              </div>
+            ) : (
+              <button onClick={signIn} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, fontSize: 12, fontWeight: 600, padding: '5px 9px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}>
+                <svg width="13" height="13" viewBox="0 0 18 18" style={{ flexShrink: 0 }}><path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z" fill="#4285F4"/><path d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.909-2.259c-.806.54-1.837.86-3.047.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 009 18z" fill="#34A853"/><path d="M3.964 10.71A5.41 5.41 0 013.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.996 8.996 0 000 9c0 1.452.348 2.827.957 4.042l3.007-2.332z" fill="#FBBC05"/><path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 00.957 4.958L3.964 6.29C4.672 4.163 6.656 3.58 9 3.58z" fill="#EA4335"/></svg>
+                Sign in
+              </button>
+            ))}
+            <button
+              onClick={() => toggleScreen('settings')}
+              title="Settings"
+              style={{ background: screen === 'settings' ? C.gold + '22' : 'none', border: `1px solid ${screen === 'settings' ? C.gold + '55' : 'transparent'}`, borderRadius: 8, color: screen === 'settings' ? C.gold : C.textMuted, fontSize: 20, lineHeight: 1, padding: '6px 8px', cursor: 'pointer', transition: 'color 0.15s, background 0.15s' }}
+            >
+              ⚙️
+            </button>
+          </div>
         </div>
 
         {/* Nav pills */}
