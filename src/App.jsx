@@ -838,34 +838,48 @@ export default function App() {
   })
 
   const migrateAndLoadData = async (u) => {
-    const localFavs = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-favorites')) || [] } catch { return [] } })()
-    const localShopping = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-shopping')) || [] } catch { return [] } })()
-
-    if (localFavs.length > 0) {
-      const rows = localFavs.map(f => ({
-        user_id: u.id,
-        recipe_name: f.recipeName,
-        summary: f.summary || null,
-        recipe: f.recipe || [],
-        ingredients: f.ingredients || [],
-        variations: f.variations || [],
-        notes: f.note || null,
-        saved_at: f.savedAt || new Date().toISOString(),
-      }))
-      await supabase.from('favorites').upsert(rows, { onConflict: 'user_id,recipe_name', ignoreDuplicates: true })
-    }
-
-    if (localShopping.length > 0) {
-      const rows = localShopping.map(i => ({ user_id: u.id, name: i.name }))
-      await supabase.from('shopping_list').upsert(rows, { onConflict: 'user_id,name', ignoreDuplicates: true })
-    }
-
+    // Always load from Supabase first — it is the source of truth
     const [{ data: favData }, { data: shopData }] = await Promise.all([
       supabase.from('favorites').select('*').eq('user_id', u.id).order('saved_at', { ascending: false }),
       supabase.from('shopping_list').select('*').eq('user_id', u.id).order('created_at', { ascending: true }),
     ])
-    if (favData) setFavorites(favData.map(dbFavToLocal))
-    if (shopData) setShoppingList(shopData.map(r => ({ id: r.id, name: r.name })))
+
+    const hasCloudData = (favData && favData.length > 0) || (shopData && shopData.length > 0)
+
+    if (!hasCloudData) {
+      // Supabase is empty — migrate from localStorage once
+      const localFavs = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-favorites')) || [] } catch { return [] } })()
+      const localShopping = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-shopping')) || [] } catch { return [] } })()
+
+      if (localFavs.length > 0) {
+        const rows = localFavs.map(f => ({
+          user_id: u.id,
+          recipe_name: f.recipeName,
+          summary: f.summary || null,
+          recipe: f.recipe || [],
+          ingredients: f.ingredients || [],
+          variations: f.variations || [],
+          notes: f.note || null,
+          saved_at: f.savedAt || new Date().toISOString(),
+        }))
+        const { data: inserted } = await supabase.from('favorites').upsert(rows, { onConflict: 'user_id,recipe_name', ignoreDuplicates: true }).select()
+        if (inserted) setFavorites(inserted.map(dbFavToLocal))
+      }
+
+      if (localShopping.length > 0) {
+        const rows = localShopping.map(i => ({ user_id: u.id, name: i.name }))
+        const { data: inserted } = await supabase.from('shopping_list').upsert(rows, { onConflict: 'user_id,name', ignoreDuplicates: true }).select()
+        if (inserted) setShoppingList(inserted.map(r => ({ id: r.id, name: r.name })))
+      }
+    } else {
+      // Supabase has data — use it directly, ignore localStorage
+      if (favData) setFavorites(favData.map(dbFavToLocal))
+      if (shopData) setShoppingList(shopData.map(r => ({ id: r.id, name: r.name })))
+    }
+
+    // Clear localStorage so stale local data can never overwrite cloud data
+    localStorage.removeItem('bar-cart-favorites')
+    localStorage.removeItem('bar-cart-shopping')
   }
 
   // Auth effect
