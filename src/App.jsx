@@ -174,6 +174,7 @@ Common fresh garnishes (orange peel, lemon twist, lime wheel, citrus peels, fres
 Return ONLY valid JSON with no markdown fences, no extra text. Use this exact structure:
 {
   "recipe_name": "string",
+  "glass_type": "coupe | rocks | tiki | collins | null",
   "recipe": [{ "ingredient": "string", "amount": "string" }],
   "instructions": "string",
   "summary": "1-2 sentence overall assessment of whether they can make this",
@@ -269,6 +270,34 @@ function Chip({ color, children }) {
       {children}
     </span>
   )
+}
+
+function GlassIcon({ type, size = 20 }) {
+  if (!type) return null
+  const s = { width: size, height: size, display: 'inline-block', verticalAlign: 'middle', flexShrink: 0 }
+  if (type === 'coupe') return (
+    <svg viewBox="0 0 20 20" style={s} fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 3 Q4 12 10 12 Q16 12 16 3Z" />
+      <line x1="10" y1="12" x2="10" y2="17" />
+      <line x1="7" y1="17" x2="13" y2="17" />
+    </svg>
+  )
+  if (type === 'rocks') return (
+    <svg viewBox="0 0 20 20" style={s} fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 4 L4 16 L16 16 L15 4 Z" />
+    </svg>
+  )
+  if (type === 'tiki') return (
+    <svg viewBox="0 0 20 20" style={s} fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M7 3 Q5 8 5 11 Q5 16 10 16 Q15 16 15 11 Q15 8 13 3 Z" />
+    </svg>
+  )
+  if (type === 'collins') return (
+    <svg viewBox="0 0 20 20" style={s} fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M7 2 L6 18 L14 18 L13 2 Z" />
+    </svg>
+  )
+  return null
 }
 
 function UploadZone({ file, onFile, onRemove }) {
@@ -494,8 +523,9 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
     <div style={{ marginTop: 36 }}>
       {/* Name + favorite */}
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, marginBottom: 10, flexWrap: 'wrap' }}>
-        <h2 style={{ flex: 1, fontSize: 26, fontWeight: 800, color: C.gold, letterSpacing: '-0.03em', lineHeight: 1.2, minWidth: 0 }}>
+        <h2 style={{ flex: 1, fontSize: 26, fontWeight: 800, color: C.gold, letterSpacing: '-0.03em', lineHeight: 1.2, minWidth: 0, display: 'flex', alignItems: 'center', gap: 10 }}>
           {result.recipe_name}
+          {result.glass_type && <GlassIcon type={result.glass_type} size={22} />}
         </h2>
         <button
           onClick={() => onToggleToMake(result)}
@@ -651,11 +681,39 @@ function SettingsScreen({ sheetUrlInput, setSheetUrlInput, onReload, inventoryLo
 
 // ─── Inventory Screen ─────────────────────────────────────────────────────────
 
+function calcExpiry(item) {
+  if (!item.dateOpened || item.dateOpened === 'N/A') return null
+  const parts = item.dateOpened.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/)
+  if (!parts) return null
+  const opened = new Date(+parts[3], +parts[1] - 1, +parts[2])
+  if (isNaN(opened)) return null
+  const cat = (item.category || '').toLowerCase()
+  let months = null
+  if (cat.includes('vermouth')) months = 3
+  else if (cat.includes('syrup')) months = 1
+  else if (cat.includes('amaro')) months = 9
+  else if (cat.includes('liqueur') || cat.includes('liquor') || cat.includes('bitters')) months = 6
+  if (months === null) return null
+  const expiry = new Date(opened)
+  expiry.setMonth(expiry.getMonth() + months)
+  return expiry
+}
+
 function InventoryScreen({ inventory, inStockCount, oosCount }) {
+  const [catFilter, setCatFilter] = useState('All')
+
   if (!inventory) return <p style={{ color: C.textMuted, fontSize: 14 }}>Inventory not loaded.</p>
 
+  const now = new Date(); now.setHours(0, 0, 0, 0)
+  const in30 = new Date(now); in30.setDate(in30.getDate() + 30)
+
+  const categories = ['All', ...Array.from(new Set(inventory.map(i => i.category).filter(Boolean))).sort()]
+  const filtered = catFilter === 'All' ? inventory : inventory.filter(i => i.category === catFilter)
+
+  const catCount = (cat) => cat === 'All' ? inventory.length : inventory.filter(i => i.category === cat).length
+
   const groups = {}
-  for (const item of inventory) {
+  for (const item of filtered) {
     const loc = item.location || 'Unknown'
     if (!groups[loc]) groups[loc] = []
     groups[loc].push(item)
@@ -664,23 +722,44 @@ function InventoryScreen({ inventory, inStockCount, oosCount }) {
 
   return (
     <div>
-      <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
         <span style={{ fontSize: 13, background: C.green + '22', color: C.green, border: `1px solid ${C.green}44`, borderRadius: 20, padding: '3px 10px', fontWeight: 600 }}>{inStockCount} in stock</span>
         {oosCount > 0 && <span style={{ fontSize: 13, background: C.amber + '22', color: C.amber, border: `1px solid ${C.amber}44`, borderRadius: 20, padding: '3px 10px', fontWeight: 600 }}>{oosCount} OOS</span>}
       </div>
+
+      {/* Category filter pills */}
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 20 }}>
+        {categories.map(cat => {
+          const active = catFilter === cat
+          return (
+            <button key={cat} onClick={() => setCatFilter(cat)} style={{ background: active ? C.gold + '22' : C.surface, border: `1px solid ${active ? C.gold + '55' : C.border}`, borderRadius: 20, color: active ? C.gold : C.textMuted, fontSize: 12, fontWeight: active ? 600 : 400, padding: '4px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, transition: 'background 0.15s, color 0.15s' }}>
+              {cat}
+              <span style={{ fontSize: 10, fontWeight: 700, background: (active ? C.gold : C.textFaint) + '33', color: active ? C.gold : C.textFaint, borderRadius: 8, padding: '1px 5px' }}>{catCount(cat)}</span>
+            </button>
+          )
+        })}
+      </div>
+
       {sortedLocs.map(loc => (
         <div key={loc} style={{ marginBottom: 24 }}>
           <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>{loc}</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-            {groups[loc].map((item, i) => (
-              <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', background: C.surface, borderRadius: 8, flexWrap: 'wrap' }}>
-                <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: item.oos ? C.amber : C.green, flexShrink: 0 }} />
-                <span style={{ fontSize: 14, flex: 1, minWidth: 120 }}>{item.spirit}</span>
-                {item.subLocation && <span style={{ fontSize: 12, color: C.textMuted }}>{item.subLocation}</span>}
-                {item.category && <span style={{ fontSize: 11, color: C.textFaint, background: C.border, borderRadius: 4, padding: '2px 6px' }}>{item.category}</span>}
-                {item.oos && <span style={{ fontSize: 11, fontWeight: 700, color: C.amber }}>OOS</span>}
-              </div>
-            ))}
+            {groups[loc].map((item, i) => {
+              const expiry = calcExpiry(item)
+              const isExpired = expiry && expiry < now
+              const expiringSoon = expiry && !isExpired && expiry <= in30
+              return (
+                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', background: C.surface, borderRadius: 8, flexWrap: 'wrap' }}>
+                  <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: item.oos ? C.amber : C.green, flexShrink: 0 }} />
+                  <span style={{ fontSize: 14, flex: 1, minWidth: 120 }}>{item.spirit}</span>
+                  {item.subLocation && <span style={{ fontSize: 12, color: C.textMuted }}>{item.subLocation}</span>}
+                  {item.category && <span style={{ fontSize: 11, color: C.textFaint, background: C.border, borderRadius: 4, padding: '2px 6px' }}>{item.category}</span>}
+                  {item.oos && <span style={{ fontSize: 11, fontWeight: 700, color: C.amber }}>OOS</span>}
+                  {isExpired && <span style={{ fontSize: 11, fontWeight: 700, color: C.red, background: C.red + '18', border: `1px solid ${C.red}44`, borderRadius: 4, padding: '2px 6px' }}>Exp {expiry.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' })}</span>}
+                  {expiringSoon && <span style={{ fontSize: 11, fontWeight: 700, color: C.amber, background: C.amber + '18', border: `1px solid ${C.amber}44`, borderRadius: 4, padding: '2px 6px' }}>Exp {expiry.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' })}</span>}
+                </div>
+              )
+            })}
           </div>
         </div>
       ))}
@@ -743,7 +822,7 @@ function FavoriteCard({ fav, onRemove, onView, onUpdateNote }) {
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontWeight: 700, fontSize: 16, color: C.gold, marginBottom: 4 }}>{fav.recipeName}</div>
+          <div style={{ fontWeight: 700, fontSize: 16, color: C.gold, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 7 }}>{fav.recipeName}{fav.glassType && <GlassIcon type={fav.glassType} size={15} />}</div>
           {fav.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{fav.summary}</div>}
         </div>
         <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
@@ -809,7 +888,7 @@ function ToMakeCard({ item, onRemove, onView }) {
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontWeight: 700, fontSize: 16, color: C.blue, marginBottom: 4 }}>{item.recipeName}</div>
+          <div style={{ fontWeight: 700, fontSize: 16, color: C.blue, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 7 }}>{item.recipeName}{item.glassType && <GlassIcon type={item.glassType} size={15} />}</div>
           {item.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{item.summary}</div>}
           {item.recipe && item.recipe.length > 0 && (
             <div style={{ marginTop: 8, fontSize: 12, color: C.textFaint }}>
@@ -880,8 +959,10 @@ export default function App() {
     recipeName: row.recipe_name,
     summary: row.summary,
     recipe: row.recipe || [],
+    instructions: row.instructions || null,
     ingredients: row.ingredients || [],
     variations: row.variations || [],
+    glassType: row.glass_type || null,
     note: row.notes || '',
     mode: row.mode,
     savedAt: row.saved_at,
@@ -892,8 +973,10 @@ export default function App() {
     recipeName: row.recipe_name,
     summary: row.summary,
     recipe: row.recipe || [],
+    instructions: row.instructions || null,
     ingredients: row.ingredients || [],
     variations: row.variations || [],
+    glassType: row.glass_type || null,
     mode: row.mode,
     savedAt: row.saved_at,
   })
@@ -920,8 +1003,10 @@ export default function App() {
           recipe_name: f.recipeName,
           summary: f.summary || null,
           recipe: f.recipe || [],
+          instructions: f.instructions || null,
           ingredients: f.ingredients || [],
           variations: f.variations || [],
+          glass_type: f.glassType || null,
           notes: f.note || null,
           saved_at: f.savedAt || new Date().toISOString(),
         }))
@@ -941,8 +1026,10 @@ export default function App() {
           recipe_name: f.recipeName,
           summary: f.summary || null,
           recipe: f.recipe || [],
+          instructions: f.instructions || null,
           ingredients: f.ingredients || [],
           variations: f.variations || [],
+          glass_type: f.glassType || null,
           saved_at: f.savedAt || new Date().toISOString(),
         }))
         const { data: inserted } = await supabase.from('to_make').upsert(rows, { onConflict: 'user_id,recipe_name', ignoreDuplicates: true }).select()
@@ -1081,8 +1168,10 @@ export default function App() {
           recipe_name: res.recipe_name,
           summary: res.summary || null,
           recipe: res.recipe || [],
+          instructions: res.instructions || null,
           ingredients: res.ingredients || [],
           variations: res.variations || [],
+          glass_type: res.glass_type || null,
           saved_at: new Date().toISOString(),
         }).select().single()
         if (!error && data) setFavorites(prev => [dbFavToLocal(data), ...prev])
@@ -1091,7 +1180,7 @@ export default function App() {
       setFavorites(prev => {
         const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
         if (existing >= 0) return prev.filter((_, i) => i !== existing)
-        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, ingredients: res.ingredients, variations: res.variations, savedAt: new Date().toISOString() }, ...prev]
+        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, savedAt: new Date().toISOString() }, ...prev]
       })
     }
   }
@@ -1119,8 +1208,10 @@ export default function App() {
           recipe_name: res.recipe_name,
           summary: res.summary || null,
           recipe: res.recipe || [],
+          instructions: res.instructions || null,
           ingredients: res.ingredients || [],
           variations: res.variations || [],
+          glass_type: res.glass_type || null,
           saved_at: new Date().toISOString(),
         }).select().single()
         if (!error && data) setToMake(prev => [dbToMakeToLocal(data), ...prev])
@@ -1129,7 +1220,7 @@ export default function App() {
       setToMake(prev => {
         const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
         if (existing >= 0) return prev.filter((_, i) => i !== existing)
-        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, ingredients: res.ingredients, variations: res.variations, savedAt: new Date().toISOString() }, ...prev]
+        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, savedAt: new Date().toISOString() }, ...prev]
       })
     }
   }
@@ -1140,7 +1231,7 @@ export default function App() {
   }
 
   const viewToMake = (item) => {
-    setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, ingredients: item.ingredients, variations: item.variations })
+    setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType })
     setScreen('main')
   }
 
@@ -1148,7 +1239,7 @@ export default function App() {
   const signOut = () => supabase.auth.signOut()
 
   const viewFavorite = (fav) => {
-    setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, ingredients: fav.ingredients, variations: fav.variations })
+    setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType })
     setScreen('main')
   }
 
