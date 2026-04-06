@@ -102,6 +102,7 @@ async function callClaudeText(body) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
+  if (res.status === 429) throw new Error('Too many requests — wait a moment and try again.')
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
     throw new Error(err.error || `HTTP ${res.status}`)
@@ -117,6 +118,7 @@ async function callClaude(body) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
+  if (res.status === 429) throw new Error('Too many requests — wait a moment and try again.')
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
     throw new Error(err.error || `HTTP ${res.status}`)
@@ -1212,7 +1214,6 @@ export default function App() {
       setLastRequestBody(response.body)
       setResult(processResult(response.data))
     } catch (err) {
-      console.error('Cocktail name error:', err, typeof err, JSON.stringify(err))
       setError(err.message || 'Something went wrong. Please try again.')
     } finally {
       setLoading(false)
@@ -1502,7 +1503,7 @@ export default function App() {
           {/* Error */}
           {error && (
             <div style={{ background: C.red + '15', border: `1px solid ${C.red}44`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: C.red, marginTop: 16 }}>
-              {typeof error === 'string' ? error : JSON.stringify(error)}
+              {error}
             </div>
           )}
 
