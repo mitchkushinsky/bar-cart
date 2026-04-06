@@ -443,7 +443,7 @@ function VariationCard({ variation }) {
 
 // ─── Results ──────────────────────────────────────────────────────────────────
 
-function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, onFeedback, feedbackLoading, inventory }) {
+function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, onFeedback, feedbackLoading, inventory }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
   const adjustmentNoteRef = useRef(null)
@@ -480,6 +480,7 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
   const ingredientCount = result.ingredients?.length || 0
   const variationCount = result.variations?.length || 0
   const isFav = favorites.some(f => f.id === result._favId || f.recipeName === result.recipe_name)
+  const isToMake = toMake.some(f => f.recipeName === result.recipe_name)
 
   const handleFeedbackSubmit = () => {
     if (!feedbackText.trim()) return
@@ -494,6 +495,12 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
         <h2 style={{ flex: 1, fontSize: 26, fontWeight: 800, color: C.gold, letterSpacing: '-0.03em', lineHeight: 1.2, minWidth: 0 }}>
           {result.recipe_name}
         </h2>
+        <button
+          onClick={() => onToggleToMake(result)}
+          style={{ background: 'none', border: `1px solid ${isToMake ? C.blue : C.border}`, borderRadius: 20, color: isToMake ? C.blue : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0, transition: 'color 0.15s, border-color 0.15s' }}
+        >
+          {isToMake ? '🍹 Saved to To Make' : '🍹 To Make'}
+        </button>
         <button
           onClick={() => onToggleFavorite(result)}
           style={{ background: 'none', border: `1px solid ${isFav ? C.gold : C.border}`, borderRadius: 20, color: isFav ? C.gold : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0, transition: 'color 0.15s, border-color 0.15s' }}
@@ -793,6 +800,43 @@ function FavoritesScreen({ favorites, onRemove, onView, onUpdateNote }) {
   )
 }
 
+// ─── To Make Screen ───────────────────────────────────────────────────────────
+
+function ToMakeCard({ item, onRemove, onView }) {
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 16, color: C.blue, marginBottom: 4 }}>{item.recipeName}</div>
+          {item.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{item.summary}</div>}
+          {item.recipe && item.recipe.length > 0 && (
+            <div style={{ marginTop: 8, fontSize: 12, color: C.textFaint }}>
+              {item.recipe.slice(0, 3).map(r => r.ingredient).join(', ')}{item.recipe.length > 3 ? ` +${item.recipe.length - 3} more` : ''}
+            </div>
+          )}
+        </div>
+        <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+          <button onClick={() => onView(item)} style={{ background: C.blue, border: 'none', borderRadius: 7, color: '#fff', fontSize: 12, fontWeight: 700, padding: '6px 12px', cursor: 'pointer' }}>View</button>
+          <button onClick={() => onRemove(item.id)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textFaint, fontSize: 18, padding: '2px 8px', cursor: 'pointer', lineHeight: 1 }}>×</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ToMakeScreen({ toMake, onRemove, onView }) {
+  if (toMake.length === 0) {
+    return <p style={{ color: C.textMuted, fontSize: 14 }}>No recipes in your To Make list yet. Analyze a recipe and tap 🍹 To Make.</p>
+  }
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {toMake.map(item => (
+        <ToMakeCard key={item.id} item={item} onRemove={onRemove} onView={onView} />
+      ))}
+    </div>
+  )
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -804,7 +848,7 @@ export default function App() {
   const [inventoryError, setInventoryError] = useState(null)
 
   // Navigation
-  const [screen, setScreen] = useState('main') // 'main' | 'inventory' | 'shopping' | 'favorites'
+  const [screen, setScreen] = useState('main') // 'main' | 'inventory' | 'shopping' | 'favorites' | 'to-make'
 
   // Auth
   const [user, setUser] = useState(null)
@@ -819,10 +863,14 @@ export default function App() {
   const [favorites, setFavorites] = useState(() => {
     try { return JSON.parse(localStorage.getItem('bar-cart-favorites')) || [] } catch { return [] }
   })
+  const [toMake, setToMake] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('bar-cart-to-make')) || [] } catch { return [] }
+  })
 
   useEffect(() => { shoppingListRef.current = shoppingList }, [shoppingList])
   useEffect(() => { if (!user) localStorage.setItem('bar-cart-shopping', JSON.stringify(shoppingList)) }, [shoppingList, user])
   useEffect(() => { if (!user) localStorage.setItem('bar-cart-favorites', JSON.stringify(favorites)) }, [favorites, user])
+  useEffect(() => { if (!user) localStorage.setItem('bar-cart-to-make', JSON.stringify(toMake)) }, [toMake, user])
 
   // DB helpers
   const dbFavToLocal = (row) => ({
@@ -837,19 +885,32 @@ export default function App() {
     savedAt: row.saved_at,
   })
 
+  const dbToMakeToLocal = (row) => ({
+    id: row.id,
+    recipeName: row.recipe_name,
+    summary: row.summary,
+    recipe: row.recipe || [],
+    ingredients: row.ingredients || [],
+    variations: row.variations || [],
+    mode: row.mode,
+    savedAt: row.saved_at,
+  })
+
   const migrateAndLoadData = async (u) => {
     // Always load from Supabase first — it is the source of truth
-    const [{ data: favData }, { data: shopData }] = await Promise.all([
+    const [{ data: favData }, { data: shopData }, { data: toMakeData }] = await Promise.all([
       supabase.from('favorites').select('*').eq('user_id', u.id).order('saved_at', { ascending: false }),
       supabase.from('shopping_list').select('*').eq('user_id', u.id).order('created_at', { ascending: true }),
+      supabase.from('to_make').select('*').eq('user_id', u.id).order('saved_at', { ascending: false }),
     ])
 
-    const hasCloudData = (favData && favData.length > 0) || (shopData && shopData.length > 0)
+    const hasCloudData = (favData && favData.length > 0) || (shopData && shopData.length > 0) || (toMakeData && toMakeData.length > 0)
 
     if (!hasCloudData) {
       // Supabase is empty — migrate from localStorage once
       const localFavs = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-favorites')) || [] } catch { return [] } })()
       const localShopping = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-shopping')) || [] } catch { return [] } })()
+      const localToMake = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-to-make')) || [] } catch { return [] } })()
 
       if (localFavs.length > 0) {
         const rows = localFavs.map(f => ({
@@ -871,15 +932,31 @@ export default function App() {
         const { data: inserted } = await supabase.from('shopping_list').upsert(rows, { onConflict: 'user_id,name', ignoreDuplicates: true }).select()
         if (inserted) setShoppingList(inserted.map(r => ({ id: r.id, name: r.name })))
       }
+
+      if (localToMake.length > 0) {
+        const rows = localToMake.map(f => ({
+          user_id: u.id,
+          recipe_name: f.recipeName,
+          summary: f.summary || null,
+          recipe: f.recipe || [],
+          ingredients: f.ingredients || [],
+          variations: f.variations || [],
+          saved_at: f.savedAt || new Date().toISOString(),
+        }))
+        const { data: inserted } = await supabase.from('to_make').upsert(rows, { onConflict: 'user_id,recipe_name', ignoreDuplicates: true }).select()
+        if (inserted) setToMake(inserted.map(dbToMakeToLocal))
+      }
     } else {
       // Supabase has data — use it directly, ignore localStorage
       if (favData) setFavorites(favData.map(dbFavToLocal))
       if (shopData) setShoppingList(shopData.map(r => ({ id: r.id, name: r.name })))
+      if (toMakeData) setToMake(toMakeData.map(dbToMakeToLocal))
     }
 
     // Clear localStorage so stale local data can never overwrite cloud data
     localStorage.removeItem('bar-cart-favorites')
     localStorage.removeItem('bar-cart-shopping')
+    localStorage.removeItem('bar-cart-to-make')
   }
 
   // Auth effect
@@ -897,6 +974,7 @@ export default function App() {
         dataLoadedForRef.current = null
         try { setFavorites(JSON.parse(localStorage.getItem('bar-cart-favorites')) || []) } catch { setFavorites([]) }
         try { setShoppingList(JSON.parse(localStorage.getItem('bar-cart-shopping')) || []) } catch { setShoppingList([]) }
+        try { setToMake(JSON.parse(localStorage.getItem('bar-cart-to-make')) || []) } catch { setToMake([]) }
       }
     })
     return () => subscription.unsubscribe()
@@ -1026,6 +1104,44 @@ export default function App() {
     setFavorites(prev => prev.map(f => f.id === id ? { ...f, note } : f))
   }
 
+  // To Make helpers
+  const toggleToMake = async (res) => {
+    if (user) {
+      const existing = toMake.find(f => f.recipeName === res.recipe_name)
+      if (existing) {
+        await supabase.from('to_make').delete().eq('id', existing.id)
+        setToMake(prev => prev.filter(f => f.id !== existing.id))
+      } else {
+        const { data, error } = await supabase.from('to_make').insert({
+          user_id: user.id,
+          recipe_name: res.recipe_name,
+          summary: res.summary || null,
+          recipe: res.recipe || [],
+          ingredients: res.ingredients || [],
+          variations: res.variations || [],
+          saved_at: new Date().toISOString(),
+        }).select().single()
+        if (!error && data) setToMake(prev => [dbToMakeToLocal(data), ...prev])
+      }
+    } else {
+      setToMake(prev => {
+        const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
+        if (existing >= 0) return prev.filter((_, i) => i !== existing)
+        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, ingredients: res.ingredients, variations: res.variations, savedAt: new Date().toISOString() }, ...prev]
+      })
+    }
+  }
+
+  const removeFromToMake = async (id) => {
+    if (user) await supabase.from('to_make').delete().eq('id', id)
+    setToMake(prev => prev.filter(f => f.id !== id))
+  }
+
+  const viewToMake = (item) => {
+    setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, ingredients: item.ingredients, variations: item.variations })
+    setScreen('main')
+  }
+
   const signIn = () => supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: window.location.origin } })
   const signOut = () => supabase.auth.signOut()
 
@@ -1128,6 +1244,7 @@ export default function App() {
     { id: 'inventory', label: 'Inventory', count: inStockCount, countColor: C.green },
     { id: 'shopping', label: 'Shopping List', count: shoppingList.length, countColor: C.amber },
     { id: 'favorites', label: 'Favorites', count: favorites.length, countColor: C.gold },
+    { id: 'to-make', label: 'To Make', count: toMake.length, countColor: C.blue },
   ]
 
   const toggleScreen = (s) => setScreen(prev => prev === s ? 'main' : s)
@@ -1279,6 +1396,11 @@ export default function App() {
         <FavoritesScreen favorites={favorites} onRemove={removeFavorite} onView={viewFavorite} onUpdateNote={updateFavoriteNote} />
       )}
 
+      {/* Screen: To Make */}
+      {screen === 'to-make' && (
+        <ToMakeScreen toMake={toMake} onRemove={removeFromToMake} onView={viewToMake} />
+      )}
+
       {/* Screen: Main */}
       {screen === 'main' && (
         <>
@@ -1388,6 +1510,8 @@ export default function App() {
               onAddToList={addToShopping}
               favorites={favorites}
               onToggleFavorite={toggleFavorite}
+              toMake={toMake}
+              onToggleToMake={toggleToMake}
               onFeedback={handleFeedback}
               feedbackLoading={feedbackLoading}
               inventory={inventory}
