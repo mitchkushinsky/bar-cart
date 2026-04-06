@@ -272,29 +272,34 @@ function Chip({ color, children }) {
   )
 }
 
-function GlassIcon({ type, size = 20 }) {
+function GlassIcon({ type }) {
   if (!type) return null
-  const s = { width: size, height: size, display: 'inline-block', verticalAlign: 'middle', flexShrink: 0 }
+  const common = { xmlns: 'http://www.w3.org/2000/svg', width: '24', height: '32', viewBox: '0 0 24 32', fill: 'none', stroke: '#c9a84c', strokeWidth: '2', strokeLinecap: 'round', strokeLinejoin: 'round', style: { display: 'inline-block', verticalAlign: 'middle', flexShrink: 0 } }
   if (type === 'coupe') return (
-    <svg viewBox="0 0 20 20" style={s} fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M4 3 Q4 12 10 12 Q16 12 16 3Z" />
-      <line x1="10" y1="12" x2="10" y2="17" />
-      <line x1="7" y1="17" x2="13" y2="17" />
+    // Wide V-bowl curving outward at top, thin stem, small base
+    <svg {...common}>
+      <path d="M3 3 Q3 18 12 18 Q21 18 21 3 Z" />
+      <line x1="12" y1="18" x2="12" y2="27" />
+      <line x1="8" y1="27" x2="16" y2="27" />
     </svg>
   )
   if (type === 'rocks') return (
-    <svg viewBox="0 0 20 20" style={s} fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M5 4 L4 16 L16 16 L15 4 Z" />
+    // Short wide cylinder, slightly tapered, thick-walled feel
+    <svg {...common}>
+      <path d="M4 8 L3 26 L21 26 L20 8 Z" />
     </svg>
   )
   if (type === 'tiki') return (
-    <svg viewBox="0 0 20 20" style={s} fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M7 3 Q5 8 5 11 Q5 16 10 16 Q15 16 15 11 Q15 8 13 3 Z" />
+    // Tall barrel-shaped mug with small handle on right
+    <svg {...common}>
+      <path d="M6 3 Q4 12 4 18 Q4 28 12 28 Q20 28 20 18 Q20 12 18 3 Z" />
+      <path d="M20 12 Q24 13 24 17 Q24 20 20 20" />
     </svg>
   )
   if (type === 'collins') return (
-    <svg viewBox="0 0 20 20" style={s} fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M7 2 L6 18 L14 18 L13 2 Z" />
+    // Tall narrow straight cylinder
+    <svg {...common}>
+      <path d="M7 2 L6 30 L18 30 L17 2 Z" />
     </svg>
   )
   return null
@@ -700,17 +705,25 @@ function calcExpiry(item) {
 }
 
 function InventoryScreen({ inventory, inStockCount, oosCount }) {
-  const [catFilter, setCatFilter] = useState('All')
+  const [selectedCats, setSelectedCats] = useState(new Set())
 
   if (!inventory) return <p style={{ color: C.textMuted, fontSize: 14 }}>Inventory not loaded.</p>
 
   const now = new Date(); now.setHours(0, 0, 0, 0)
   const in30 = new Date(now); in30.setDate(in30.getDate() + 30)
 
-  const categories = ['All', ...Array.from(new Set(inventory.map(i => i.category).filter(Boolean))).sort()]
-  const filtered = catFilter === 'All' ? inventory : inventory.filter(i => i.category === catFilter)
+  const categories = Array.from(new Set(inventory.map(i => i.category).filter(Boolean))).sort()
+  const anySelected = selectedCats.size > 0
+  const filtered = anySelected ? inventory.filter(i => selectedCats.has(i.category)) : inventory
 
-  const catCount = (cat) => cat === 'All' ? inventory.length : inventory.filter(i => i.category === cat).length
+  const toggleCat = (cat) => {
+    setSelectedCats(prev => {
+      const next = new Set(prev)
+      if (next.has(cat)) next.delete(cat)
+      else next.add(cat)
+      return next
+    })
+  }
 
   const groups = {}
   for (const item of filtered) {
@@ -729,12 +742,17 @@ function InventoryScreen({ inventory, inStockCount, oosCount }) {
 
       {/* Category filter pills */}
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 20 }}>
+        <button onClick={() => setSelectedCats(new Set())} style={{ background: !anySelected ? C.gold + '22' : C.surface, border: `1px solid ${!anySelected ? C.gold + '55' : C.border}`, borderRadius: 20, color: !anySelected ? C.gold : C.textMuted, fontSize: 12, fontWeight: !anySelected ? 600 : 400, padding: '4px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, transition: 'background 0.15s, color 0.15s' }}>
+          All
+          <span style={{ fontSize: 10, fontWeight: 700, background: (!anySelected ? C.gold : C.textFaint) + '33', color: !anySelected ? C.gold : C.textFaint, borderRadius: 8, padding: '1px 5px' }}>{inventory.length}</span>
+        </button>
         {categories.map(cat => {
-          const active = catFilter === cat
+          const active = selectedCats.has(cat)
+          const count = inventory.filter(i => i.category === cat).length
           return (
-            <button key={cat} onClick={() => setCatFilter(cat)} style={{ background: active ? C.gold + '22' : C.surface, border: `1px solid ${active ? C.gold + '55' : C.border}`, borderRadius: 20, color: active ? C.gold : C.textMuted, fontSize: 12, fontWeight: active ? 600 : 400, padding: '4px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, transition: 'background 0.15s, color 0.15s' }}>
+            <button key={cat} onClick={() => toggleCat(cat)} style={{ background: active ? C.gold + '22' : C.surface, border: `1px solid ${active ? C.gold + '55' : C.border}`, borderRadius: 20, color: active ? C.gold : C.textMuted, fontSize: 12, fontWeight: active ? 600 : 400, padding: '4px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, transition: 'background 0.15s, color 0.15s' }}>
               {cat}
-              <span style={{ fontSize: 10, fontWeight: 700, background: (active ? C.gold : C.textFaint) + '33', color: active ? C.gold : C.textFaint, borderRadius: 8, padding: '1px 5px' }}>{catCount(cat)}</span>
+              <span style={{ fontSize: 10, fontWeight: 700, background: (active ? C.gold : C.textFaint) + '33', color: active ? C.gold : C.textFaint, borderRadius: 8, padding: '1px 5px' }}>{count}</span>
             </button>
           )
         })}
