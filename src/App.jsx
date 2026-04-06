@@ -1199,7 +1199,7 @@ export default function App() {
       setLastRequestBody(response.body)
       setResult(processResult(response.data))
     } catch (err) {
-      setError(err.message)
+      setError(err.message || 'Something went wrong. Please try again.')
     } finally {
       setLoading(false)
     }
@@ -1223,7 +1223,7 @@ export default function App() {
       setAdjustmentNote(revised.adjustment_note || null)
       setResult(processResult(revised))
     } catch (err) {
-      setError(err.message)
+      setError(err.message || 'Something went wrong. Please try again.')
     } finally {
       setFeedbackLoading(false)
     }
