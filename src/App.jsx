@@ -499,7 +499,7 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
           onClick={() => onToggleToMake(result)}
           style={{ background: 'none', border: `1px solid ${isToMake ? C.blue : C.border}`, borderRadius: 20, color: isToMake ? C.blue : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0, transition: 'color 0.15s, border-color 0.15s' }}
         >
-          {isToMake ? '🍹 Saved to To Make' : '🍹 To Make'}
+          {isToMake ? '🍹 Saved to On Deck' : '🍹 On Deck'}
         </button>
         <button
           onClick={() => onToggleFavorite(result)}
@@ -826,7 +826,7 @@ function ToMakeCard({ item, onRemove, onView }) {
 
 function ToMakeScreen({ toMake, onRemove, onView }) {
   if (toMake.length === 0) {
-    return <p style={{ color: C.textMuted, fontSize: 14 }}>No recipes in your To Make list yet. Analyze a recipe and tap 🍹 To Make.</p>
+    return <p style={{ color: C.textMuted, fontSize: 14 }}>No recipes on deck yet. Analyze a recipe and tap 🍹 On Deck.</p>
   }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -1241,7 +1241,7 @@ export default function App() {
   ]
 
   const NAV_PILLS = [
-    { id: 'to-make', label: 'To Make', count: toMake.length, countColor: C.blue },
+    { id: 'to-make', label: 'On Deck', count: toMake.length, countColor: C.blue },
     { id: 'favorites', label: 'Favorites', count: favorites.length, countColor: C.gold },
     { id: 'shopping', label: 'Shopping List', count: shoppingList.length, countColor: C.amber },
     { id: 'inventory', label: 'Inventory', count: inStockCount, countColor: C.green },
@@ -1304,7 +1304,7 @@ export default function App() {
                   border: `1px solid ${active ? countColor + '55' : C.border}`,
                   borderRadius: 20, color: active ? countColor : C.textMuted,
                   fontSize: 13, fontWeight: active ? 600 : 400,
-                  padding: '5px 12px', cursor: 'pointer',
+                  padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
                   transition: 'background 0.15s, color 0.15s, border-color 0.15s',
                 }}
               >
