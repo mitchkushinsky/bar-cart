@@ -1241,10 +1241,10 @@ export default function App() {
   ]
 
   const NAV_PILLS = [
-    { id: 'inventory', label: 'Inventory', count: inStockCount, countColor: C.green },
-    { id: 'shopping', label: 'Shopping List', count: shoppingList.length, countColor: C.amber },
-    { id: 'favorites', label: 'Favorites', count: favorites.length, countColor: C.gold },
     { id: 'to-make', label: 'To Make', count: toMake.length, countColor: C.blue },
+    { id: 'favorites', label: 'Favorites', count: favorites.length, countColor: C.gold },
+    { id: 'shopping', label: 'Shopping List', count: shoppingList.length, countColor: C.amber },
+    { id: 'inventory', label: 'Inventory', count: inStockCount, countColor: C.green },
   ]
 
   const toggleScreen = (s) => setScreen(prev => prev === s ? 'main' : s)
@@ -1291,7 +1291,7 @@ export default function App() {
         </div>
 
         {/* Nav pills */}
-        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'nowrap', overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
           {NAV_PILLS.map(({ id, label, count, countColor }) => {
             const active = screen === id
             return (
