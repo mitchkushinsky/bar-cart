@@ -1193,9 +1193,22 @@ export default function App() {
       }
       const inventoryText = inventoryToText(inventory)
       let response
-      if (mode === 'photo') response = await analyzeRecipePhoto(recipePhoto, inventoryText)
-      else if (mode === 'name') response = await analyzeCocktailName(cocktailName.trim(), inventoryText)
-      else response = await analyzeBarMenu(menuPhoto, menuSelectedCocktail, inventoryText, menuCocktailPhoto)
+      if (mode === 'photo') {
+        response = await analyzeRecipePhoto(recipePhoto, inventoryText)
+      } else if (mode === 'name') {
+        const timeout = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('The search took too long. Try again or check if the cocktail name is spelled correctly.')), 30000)
+        )
+        const attempt = () => Promise.race([analyzeCocktailName(cocktailName.trim(), inventoryText), timeout])
+        try {
+          response = await attempt()
+        } catch (firstErr) {
+          if (firstErr.message.includes('took too long')) throw firstErr
+          response = await attempt()
+        }
+      } else {
+        response = await analyzeBarMenu(menuPhoto, menuSelectedCocktail, inventoryText, menuCocktailPhoto)
+      }
       setLastRequestBody(response.body)
       setResult(processResult(response.data))
     } catch (err) {
