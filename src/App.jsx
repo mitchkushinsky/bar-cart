@@ -1317,7 +1317,7 @@ export default function App() {
     if (!canAnalyze()) return
     setLoading(true); setError(null); setResult(null); setAdjustmentNote(null)
     const menuParseStep = mode === 'menu' && menuStep === 'upload'
-    setLoadingMsg(menuParseStep ? 'Reading menu…' : mode === 'photo' ? 'Analyzing recipe…' : mode === 'name' ? 'Looking up cocktail…' : 'Analyzing cocktail…')
+    setLoadingMsg(menuParseStep ? 'Reading menu…' : mode === 'photo' ? 'Analyzing screenshot…' : mode === 'name' ? 'Looking up cocktail…' : 'Analyzing cocktail…')
 
     try {
       if (menuParseStep) {
@@ -1394,7 +1394,7 @@ export default function App() {
   }
 
   const MODES = [
-    { id: 'photo', label: '📷 Recipe Photo' },
+    { id: 'photo', label: '📷 Recipe Screenshot' },
     { id: 'name', label: '⌨️ Cocktail Name' },
     { id: 'menu', label: '🍹 Bar Menu' },
   ]
@@ -1500,7 +1500,7 @@ export default function App() {
             >
               <span style={{ fontSize: 32, lineHeight: 1 }}>📷</span>
               <div>
-                <div>Recipe</div>
+                <div>Recipe Screenshot</div>
                 <div style={{ fontSize: 13, fontWeight: 400, color: C.textMuted, marginTop: 3 }}>A screenshot or photo of a cocktail recipe</div>
               </div>
             </button>
