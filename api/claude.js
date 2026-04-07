@@ -24,6 +24,10 @@ export default async function handler(req, res) {
   }
 
   try {
+    console.log('Request body keys:', Object.keys(req.body));
+    console.log('Tools:', JSON.stringify(req.body.tools));
+    console.log('Model:', req.body.model);
+
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers,
@@ -31,7 +35,9 @@ export default async function handler(req, res) {
     });
 
     if (!response.ok) {
-      throw new Error(`API error: ${response.status} ${response.statusText}`);
+      const errorBody = await response.text();
+      console.error('Anthropic error:', errorBody);
+      throw new Error(`API error: ${response.status} - ${errorBody}`);
     }
     const data = await response.json();
     res.status(response.status).json(data);
