@@ -1097,8 +1097,10 @@ export default function App() {
           dataLoadedForRef.current = newUser.id
           migrateAndLoadData(newUser)
         }
-      } else if (event === 'SIGNED_OUT') {
+      } else if (event === 'SIGNED_OUT' || (!newUser && event === 'TOKEN_REFRESHED')) {
         dataLoadedForRef.current = null
+        setUser(null)
+        supabase.auth.signOut().catch(() => {})
         try { setFavorites(JSON.parse(localStorage.getItem('bar-cart-favorites')) || []) } catch { setFavorites([]) }
         try { setShoppingList(JSON.parse(localStorage.getItem('bar-cart-shopping')) || []) } catch { setShoppingList([]) }
         try { setToMake(JSON.parse(localStorage.getItem('bar-cart-to-make')) || []) } catch { setToMake([]) }
