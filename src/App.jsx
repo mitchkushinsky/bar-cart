@@ -274,32 +274,35 @@ function Chip({ color, children }) {
 
 function GlassIcon({ type }) {
   if (!type) return null
-  const common = { xmlns: 'http://www.w3.org/2000/svg', width: '24', height: '32', viewBox: '0 0 24 32', fill: 'none', stroke: '#c9a84c', strokeWidth: '2', strokeLinecap: 'round', strokeLinejoin: 'round', style: { display: 'inline-block', verticalAlign: 'middle', flexShrink: 0 } }
+  const base = { xmlns: 'http://www.w3.org/2000/svg', width: '24', height: '32', viewBox: '0 0 24 32', style: { display: 'inline-block', verticalAlign: 'middle', flexShrink: 0 } }
   if (type === 'coupe') return (
-    // Wide V-bowl curving outward at top, thin stem, small base
-    <svg {...common}>
-      <path d="M3 3 Q3 18 12 18 Q21 18 21 3 Z" />
-      <line x1="12" y1="18" x2="12" y2="27" />
-      <line x1="8" y1="27" x2="16" y2="27" />
+    <svg {...base}>
+      {/* Bowl: wide curved triangle */}
+      <path d="M2 2 L12 20 L22 2 Z" fill="#c9a84c" />
+      {/* Stem */}
+      <rect x="11" y="20" width="2" height="7" fill="#c9a84c" />
+      {/* Base */}
+      <rect x="7" y="27" width="10" height="3" rx="1" fill="#c9a84c" />
     </svg>
   )
   if (type === 'rocks') return (
-    // Short wide cylinder, slightly tapered, thick-walled feel
-    <svg {...common}>
-      <path d="M4 8 L3 26 L21 26 L20 8 Z" />
+    <svg {...base}>
+      {/* Short wide trapezoid, slightly wider at top */}
+      <path d="M2 8 L4 28 L20 28 L22 8 Z" fill="#c9a84c" />
     </svg>
   )
   if (type === 'tiki') return (
-    // Tall barrel-shaped mug with small handle on right
-    <svg {...common}>
-      <path d="M6 3 Q4 12 4 18 Q4 28 12 28 Q20 28 20 18 Q20 12 18 3 Z" />
-      <path d="M20 12 Q24 13 24 17 Q24 20 20 20" />
+    <svg {...base}>
+      {/* Barrel body, wider in middle */}
+      <path d="M7 2 Q4 10 4 16 Q4 24 7 30 L17 30 Q20 24 20 16 Q20 10 17 2 Z" fill="#c9a84c" />
+      {/* Handle bump on right */}
+      <path d="M20 13 Q25 14 25 18 Q25 22 20 22 Z" fill="#c9a84c" />
     </svg>
   )
   if (type === 'collins') return (
-    // Tall narrow straight cylinder
-    <svg {...common}>
-      <path d="M7 2 L6 30 L18 30 L17 2 Z" />
+    <svg {...base}>
+      {/* Tall narrow rectangle */}
+      <rect x="7" y="2" width="10" height="28" rx="1" fill="#c9a84c" />
     </svg>
   )
   return null
