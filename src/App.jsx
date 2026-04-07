@@ -227,6 +227,20 @@ async function analyzeCocktailName(name, inventoryText) {
   return { data: await callClaude(body), body }
 }
 
+async function analyzeCocktailNameTrainingOnly(name, inventoryText) {
+  const body = {
+    model: MODEL,
+    max_tokens: MAX_TOKENS,
+    messages: [{
+      role: 'user',
+      content: `Look up the canonical recipe for the cocktail "${name}" using your training knowledge. Then check each ingredient against the bar inventory and provide a full analysis.\n\n${sharedPromptSuffix(inventoryText)}`,
+    }],
+  }
+  const data = await callClaude(body)
+  data._trainingDataFallback = true
+  return { data, body }
+}
+
 async function parseMenuCocktails(imageFile) {
   const { base64, mediaType } = await fileToBase64(imageFile)
   return callClaude({
@@ -550,9 +564,12 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
       </div>
 
       {result.summary && (
-        <p style={{ color: C.textMuted, fontSize: 15, marginBottom: 24, lineHeight: 1.65, maxWidth: 600 }}>
+        <p style={{ color: C.textMuted, fontSize: 15, marginBottom: result._trainingDataFallback ? 10 : 24, lineHeight: 1.65, maxWidth: 600 }}>
           {result.summary}
         </p>
+      )}
+      {result._trainingDataFallback && (
+        <p style={{ fontSize: 12, color: C.textFaint, marginBottom: 20 }}>Recipe sourced from training data — web search unavailable.</p>
       )}
 
       {/* Adjustment note */}
@@ -1310,15 +1327,22 @@ export default function App() {
       if (mode === 'photo') {
         response = await analyzeRecipePhoto(recipePhoto, inventoryText)
       } else if (mode === 'name') {
-        const timeout = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('The search took too long. Try again or check if the cocktail name is spelled correctly.')), 30000)
+        const name = cocktailName.trim()
+        const makeTimeout = () => new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('__timeout__')), 60000)
         )
-        const attempt = () => Promise.race([analyzeCocktailName(cocktailName.trim(), inventoryText), timeout])
         try {
-          response = await attempt()
+          response = await Promise.race([analyzeCocktailName(name, inventoryText), makeTimeout()])
         } catch (firstErr) {
-          if (firstErr.message.includes('took too long')) throw firstErr
-          response = await attempt()
+          // On timeout or any failure, fall back to training data (no web search)
+          try {
+            response = await analyzeCocktailNameTrainingOnly(name, inventoryText)
+          } catch (fallbackErr) {
+            // If even the fallback fails, surface the original error
+            throw firstErr.message === '__timeout__'
+              ? new Error('The search took too long. Try again or check if the cocktail name is spelled correctly.')
+              : firstErr
+          }
         }
       } else {
         response = await analyzeBarMenu(menuPhoto, menuSelectedCocktail, inventoryText, menuCocktailPhoto)
