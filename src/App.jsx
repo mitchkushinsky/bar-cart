@@ -1334,14 +1334,17 @@ export default function App() {
         try {
           response = await Promise.race([analyzeCocktailName(name, inventoryText), makeTimeout()])
         } catch (firstErr) {
+          console.error('Error details:', firstErr, typeof firstErr)
           // On timeout or any failure, fall back to training data (no web search)
           try {
             response = await analyzeCocktailNameTrainingOnly(name, inventoryText)
           } catch (fallbackErr) {
-            // If even the fallback fails, surface the original error
-            throw firstErr.message === '__timeout__'
-              ? new Error('The search took too long. Try again or check if the cocktail name is spelled correctly.')
-              : firstErr
+            console.error('Error details:', fallbackErr, typeof fallbackErr)
+            // If even the fallback fails, surface a clean error message
+            const isTimeout = firstErr?.message === '__timeout__'
+            throw new Error(isTimeout
+              ? 'The search took too long. Try again or check if the cocktail name is spelled correctly.'
+              : (firstErr?.message || 'Something went wrong. Please try again.'))
           }
         }
       } else {
