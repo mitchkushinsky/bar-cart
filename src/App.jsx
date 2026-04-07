@@ -543,21 +543,24 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
 
   return (
     <div style={{ marginTop: 36 }}>
-      {/* Name + favorite */}
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, marginBottom: 10, flexWrap: 'wrap' }}>
-        <h2 style={{ flex: 1, fontSize: 26, fontWeight: 800, color: C.gold, letterSpacing: '-0.03em', lineHeight: 1.2, minWidth: 0, display: 'flex', alignItems: 'center', gap: 10 }}>
+      {/* Name */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <h2 style={{ fontSize: 26, fontWeight: 800, color: C.gold, letterSpacing: '-0.03em', lineHeight: 1.2, margin: 0 }}>
           {result.recipe_name}
-          {result.glass_type && <GlassIcon type={result.glass_type} size={22} />}
         </h2>
+        {result.glass_type && <GlassIcon type={result.glass_type} size={22} />}
+      </div>
+      {/* Action buttons */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
         <button
           onClick={() => onToggleToMake(result)}
-          style={{ background: 'none', border: `1px solid ${isToMake ? C.blue : C.border}`, borderRadius: 20, color: isToMake ? C.blue : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0, transition: 'color 0.15s, border-color 0.15s' }}
+          style={{ background: 'none', border: `1px solid ${isToMake ? C.blue : C.border}`, borderRadius: 20, color: isToMake ? C.blue : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
         >
           {isToMake ? '🍹 Saved to On Deck' : '🍹 On Deck'}
         </button>
         <button
           onClick={() => onToggleFavorite(result)}
-          style={{ background: 'none', border: `1px solid ${isFav ? C.gold : C.border}`, borderRadius: 20, color: isFav ? C.gold : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0, transition: 'color 0.15s, border-color 0.15s' }}
+          style={{ background: 'none', border: `1px solid ${isFav ? C.gold : C.border}`, borderRadius: 20, color: isFav ? C.gold : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
         >
           {isFav ? '♥ Saved' : '♡ Save to Favorites'}
         </button>
