@@ -1274,6 +1274,7 @@ export default function App() {
   }
 
   const viewToMake = (item) => {
+    setError(null)
     setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType })
     setScreen('main')
   }
@@ -1282,6 +1283,7 @@ export default function App() {
   const signOut = () => supabase.auth.signOut()
 
   const viewFavorite = (fav) => {
+    setError(null)
     setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType })
     setScreen('main')
   }
@@ -1364,6 +1366,21 @@ export default function App() {
     }
   }
 
+  const stripInventoryFromMessages = (messages) =>
+    messages.map((msg, i) => {
+      if (i !== 0 || msg.role !== 'user') return msg
+      const strip = (text) => text.replace(
+        /(BAR INVENTORY:\n)[\s\S]*?(\n\nSHELF LIFE GUIDANCE)/,
+        '$1[Inventory data omitted for brevity — use the analysis already provided]$2'
+      )
+      if (typeof msg.content === 'string') return { ...msg, content: strip(msg.content) }
+      if (Array.isArray(msg.content)) return {
+        ...msg,
+        content: msg.content.map(part => part.type === 'text' ? { ...part, text: strip(part.text) } : part),
+      }
+      return msg
+    })
+
   const handleFeedback = async (feedbackText) => {
     if (!lastRequestBody || !result) return
     setFeedbackLoading(true); setError(null)
@@ -1372,7 +1389,7 @@ export default function App() {
         model: MODEL,
         max_tokens: MAX_TOKENS,
         messages: [
-          ...lastRequestBody.messages,
+          ...stripInventoryFromMessages(lastRequestBody.messages),
           { role: 'assistant', content: JSON.stringify(result) },
           { role: 'user', content: `The user reviewed this analysis and provided this feedback: ${feedbackText}. Please revise your response accordingly and return the same JSON structure, with one additional field at the top level: "adjustment_note" — a 1-2 sentence plain English explanation of what specifically changed and why (e.g. "Scaled all amounts to a 4 oz total while maintaining the 1:1:1 Negroni ratio."). Do not include adjustment_note if nothing meaningful changed.` },
         ],
@@ -1380,6 +1397,7 @@ export default function App() {
       const revised = await callClaude(feedbackBody)
       setLastRequestBody(feedbackBody)
       setAdjustmentNote(revised.adjustment_note || null)
+      setError(null)
       setResult(processResult(revised))
     } catch (err) {
       setError(err.message || 'Something went wrong. Please try again.')
