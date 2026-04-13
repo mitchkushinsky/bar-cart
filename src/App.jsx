@@ -141,6 +141,31 @@ function fileToBase64(file) {
   })
 }
 
+function compressImage(base64string) {
+  return new Promise((resolve) => {
+    const img = new Image()
+    img.onload = () => {
+      const MAX = 1024
+      let { width, height } = img
+      if (width > MAX || height > MAX) {
+        if (width >= height) {
+          height = Math.round((height * MAX) / width)
+          width = MAX
+        } else {
+          width = Math.round((width * MAX) / height)
+          height = MAX
+        }
+      }
+      const canvas = document.createElement('canvas')
+      canvas.width = width
+      canvas.height = height
+      canvas.getContext('2d').drawImage(img, 0, 0, width, height)
+      resolve(canvas.toDataURL('image/jpeg', 0.85).split(',')[1])
+    }
+    img.src = `data:image/jpeg;base64,${base64string}`
+  })
+}
+
 function applyGarnishFilter(data) {
   if (Array.isArray(data.ingredients)) {
     data.ingredients = data.ingredients.filter(item =>
@@ -199,7 +224,9 @@ Return ONLY valid JSON with no markdown fences, no extra text. Use this exact st
 }
 
 async function analyzeRecipePhoto(imageFile, inventoryText) {
-  const { base64, mediaType } = await fileToBase64(imageFile)
+  const { base64: rawBase64 } = await fileToBase64(imageFile)
+  const base64 = await compressImage(rawBase64)
+  const mediaType = 'image/jpeg'
   const body = {
     model: MODEL,
     max_tokens: MAX_TOKENS,
@@ -242,7 +269,9 @@ async function analyzeCocktailNameTrainingOnly(name, inventoryText) {
 }
 
 async function parseMenuCocktails(imageFile) {
-  const { base64, mediaType } = await fileToBase64(imageFile)
+  const { base64: rawBase64 } = await fileToBase64(imageFile)
+  const base64 = await compressImage(rawBase64)
+  const mediaType = 'image/jpeg'
   return callClaude({
     model: MODEL,
     max_tokens: 800,
@@ -257,11 +286,13 @@ async function parseMenuCocktails(imageFile) {
 }
 
 async function analyzeBarMenu(menuFile, cocktailName, inventoryText, cocktailPhotoFile) {
-  const { base64, mediaType } = await fileToBase64(menuFile)
-  const content = [{ type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } }]
+  const { base64: rawBase64 } = await fileToBase64(menuFile)
+  const base64 = await compressImage(rawBase64)
+  const content = [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64 } }]
   if (cocktailPhotoFile) {
-    const { base64: b2, mediaType: mt2 } = await fileToBase64(cocktailPhotoFile)
-    content.push({ type: 'image', source: { type: 'base64', media_type: mt2, data: b2 } })
+    const { base64: rawB2 } = await fileToBase64(cocktailPhotoFile)
+    const b2 = await compressImage(rawB2)
+    content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b2 } })
     content.push({ type: 'text', text: 'The second image is a photo of the actual cocktail as served — use it to help infer ingredients, color, garnish, and glassware.' })
   }
   content.push({
