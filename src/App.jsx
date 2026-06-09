@@ -1161,6 +1161,8 @@ export default function App() {
   const [lastRequestBody, setLastRequestBody] = useState(null)
   const [feedbackLoading, setFeedbackLoading] = useState(false)
   const [adjustmentNote, setAdjustmentNote] = useState(null)
+  const [resultSource, setResultSource] = useState(null) // 'ondeck' | 'favorites' | null
+  const sourceScrollRef = useRef(0)
   const [sharedImage, setSharedImage] = useState(null) // pending share-target file awaiting mode selection
 
   // Inventory loading
@@ -1305,8 +1307,10 @@ export default function App() {
   }
 
   const viewToMake = (item) => {
+    sourceScrollRef.current = window.scrollY
     setError(null)
     setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType })
+    setResultSource('ondeck')
     setScreen('main')
   }
 
@@ -1314,8 +1318,10 @@ export default function App() {
   const signOut = () => supabase.auth.signOut()
 
   const viewFavorite = (fav) => {
+    sourceScrollRef.current = window.scrollY
     setError(null)
     setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType })
+    setResultSource('favorites')
     setScreen('main')
   }
 
@@ -1348,7 +1354,7 @@ export default function App() {
 
   const handleAnalyze = async () => {
     if (!canAnalyze()) return
-    setLoading(true); setError(null); setResult(null); setAdjustmentNote(null)
+    setLoading(true); setError(null); setResult(null); setAdjustmentNote(null); setResultSource(null)
     const menuParseStep = mode === 'menu' && menuStep === 'upload'
     setLoadingMsg(menuParseStep ? 'Reading menu…' : mode === 'photo' ? 'Analyzing screenshot…' : mode === 'name' ? 'Looking up cocktail…' : 'Analyzing cocktail…')
 
@@ -1438,8 +1444,17 @@ export default function App() {
   }
 
   const changeMode = (m) => {
-    setMode(m); setResult(null); setError(null); setLastRequestBody(null)
+    setMode(m); setResult(null); setError(null); setLastRequestBody(null); setResultSource(null)
     setMenuPhoto(null); setMenuStep('upload'); setMenuCocktails([]); setMenuSelectedCocktail(''); setMenuCocktailPhoto(null)
+  }
+
+  const handleBackToSource = () => {
+    const src = resultSource
+    const savedScroll = sourceScrollRef.current
+    setResultSource(null)
+    setResult(null)
+    setScreen(src === 'ondeck' ? 'to-make' : 'favorites')
+    requestAnimationFrame(() => window.scrollTo(0, savedScroll))
   }
 
   const MODES = [
@@ -1711,19 +1726,29 @@ export default function App() {
 
           {/* Results */}
           {result && !loading && (
-            <Results
-              result={result}
-              adjustmentNote={adjustmentNote}
-              shoppingList={shoppingList}
-              onAddToList={addToShopping}
-              favorites={favorites}
-              onToggleFavorite={toggleFavorite}
-              toMake={toMake}
-              onToggleToMake={toggleToMake}
-              onFeedback={handleFeedback}
-              feedbackLoading={feedbackLoading}
-              inventory={inventory}
-            />
+            <>
+              {resultSource && (
+                <button
+                  onClick={handleBackToSource}
+                  style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0 0', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5 }}
+                >
+                  ← Back to {resultSource === 'ondeck' ? 'On Deck' : 'Favorites'}
+                </button>
+              )}
+              <Results
+                result={result}
+                adjustmentNote={adjustmentNote}
+                shoppingList={shoppingList}
+                onAddToList={addToShopping}
+                favorites={favorites}
+                onToggleFavorite={toggleFavorite}
+                toMake={toMake}
+                onToggleToMake={toggleToMake}
+                onFeedback={handleFeedback}
+                feedbackLoading={feedbackLoading}
+                inventory={inventory}
+              />
+            </>
           )}
         </>
       )}
