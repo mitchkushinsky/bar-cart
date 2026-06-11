@@ -1,3 +1,39 @@
+// SUPABASE MIGRATION REQUIRED (run in Supabase SQL editor):
+// alter table favorites add column if not exists source text default 'manual';
+// alter table favorites add column if not exists origin_flag text;
+// alter table favorites add column if not exists difficulty text;
+// alter table favorites add column if not exists status text default 'favorite';
+// alter table favorites add column if not exists primary_ingredients jsonb default '[]';
+//
+// alter table to_make add column if not exists source text default 'manual';
+// alter table to_make add column if not exists origin_flag text;
+// alter table to_make add column if not exists difficulty text;
+// alter table to_make add column if not exists status text default 'ondeck';
+// alter table to_make add column if not exists primary_ingredients jsonb default '[]';
+//
+// create table if not exists in_the_lab (
+//   id uuid default gen_random_uuid() primary key,
+//   user_id uuid references auth.users not null,
+//   recipe_name text not null,
+//   summary text,
+//   recipe jsonb default '[]',
+//   instructions text,
+//   ingredients jsonb default '[]',
+//   variations jsonb default '[]',
+//   notes text,
+//   glass_type text,
+//   mode text,
+//   source text default 'Exploration',
+//   origin_flag text,
+//   difficulty text,
+//   status text default 'inthelab',
+//   primary_ingredients jsonb default '[]',
+//   saved_at timestamptz default now(),
+//   unique(user_id, recipe_name)
+// );
+// alter table in_the_lab enable row level security;
+// create policy "Users own their lab" on in_the_lab for all using (auth.uid() = user_id);
+
 import { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
 import { supabase } from './supabase.js'
@@ -303,6 +339,69 @@ async function analyzeBarMenu(menuFile, cocktailName, inventoryText, cocktailPho
   return { data: await callClaude(body), body }
 }
 
+async function analyzeExplorations(ingredients, style, flavors, lowABV, inventoryText) {
+  const body = {
+    model: MODEL,
+    max_tokens: 3000,
+    tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+    messages: [{
+      role: 'user',
+      content: `You are an expert craft bartender helping someone explore cocktail possibilities.
+
+Today's date is ${TODAY}.
+
+FEATURED INGREDIENTS: ${ingredients.join(' and ')}
+COCKTAIL STYLE: ${style}
+FLAVOR PREFERENCES: ${flavors.length > 0 ? flavors.join(', ') : 'No specific preference'}
+LOW ALCOHOL: ${lowABV ? 'Yes — prioritize lower ABV options' : 'No preference'}
+
+BAR INVENTORY:
+${inventoryText}
+
+SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated. Simple syrup — 2–4 weeks room temp. Amaro — 6–12 months. Commercial liqueurs — 6+ months.
+
+Use web search to find published cocktail recipes featuring the featured ingredients, and also invent original cocktails that showcase them well. Think like a creative craft bartender — suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate.
+
+First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
+
+Otherwise suggest 3–5 cocktails. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
+
+Return ONLY valid JSON with no markdown fences:
+{
+  "incompatible": false,
+  "incompatibility_reason": null,
+  "flavor_profile_note": "1-2 sentences on why these ingredients work together",
+  "suggestions": [
+    {
+      "recipe_name": "string",
+      "origin_flag": "from_recipe | original",
+      "difficulty": "easy | medium | hard",
+      "difficulty_note": "One sentence explaining difficulty",
+      "can_make_now": true,
+      "missing_ingredients": [],
+      "summary": "1-2 sentence description",
+      "recipe": [{ "ingredient": "string", "amount": "string" }],
+      "instructions": "string",
+      "glass_type": "coupe | rocks | tiki | collins | null",
+      "ingredients": [
+        {
+          "ingredient": "string",
+          "status": "found | substitute | missing",
+          "location": "string or null",
+          "substitute": "string or null",
+          "substitute_location": "string or null",
+          "flavor_impact": "string or null"
+        }
+      ],
+      "technique_notes": "string or null"
+    }
+  ]
+}`,
+    }],
+  }
+  return callClaude(body)
+}
+
 // ─── Shared small components ──────────────────────────────────────────────────
 
 function Chip({ color, children }) {
@@ -525,9 +624,32 @@ function VariationCard({ variation }) {
   )
 }
 
+// ─── Badge helpers ────────────────────────────────────────────────────────────
+
+function OriginBadge({ originFlag }) {
+  if (!originFlag) return null
+  return (
+    <span style={{ fontSize: 11, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, padding: '2px 7px', color: C.textMuted }}>
+      {originFlag === 'from_recipe' ? '📖 From a recipe' : '✨ Original'}
+    </span>
+  )
+}
+
+function DifficultyBadge({ difficulty }) {
+  if (!difficulty) return null
+  const color = difficulty === 'easy' ? C.green : difficulty === 'medium' ? C.amber : C.red
+  const emoji = difficulty === 'easy' ? '🟢' : difficulty === 'medium' ? '🟡' : '🔴'
+  const label = difficulty.charAt(0).toUpperCase() + difficulty.slice(1)
+  return (
+    <span style={{ fontSize: 11, color, background: color + '15', border: `1px solid ${color}33`, borderRadius: 4, padding: '2px 7px' }}>
+      {emoji} {label}
+    </span>
+  )
+}
+
 // ─── Results ──────────────────────────────────────────────────────────────────
 
-function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, onFeedback, feedbackLoading, inventory }) {
+function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, inTheLabList, onToggleInTheLab, onFeedback, feedbackLoading, inventory, isInLab }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
   const adjustmentNoteRef = useRef(null)
@@ -563,8 +685,9 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
   }
   const ingredientCount = result.ingredients?.length || 0
   const variationCount = result.variations?.length || 0
-  const isFav = favorites.some(f => f.id === result._favId || f.recipeName === result.recipe_name)
+  const isFav = favorites.some(f => f.recipeName === result.recipe_name)
   const isToMake = toMake.some(f => f.recipeName === result.recipe_name)
+  const isInLabSaved = (inTheLabList || []).some(f => f.recipeName === result.recipe_name)
 
   const handleFeedbackSubmit = () => {
     if (!feedbackText.trim()) return
@@ -588,6 +711,12 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
           style={{ background: 'none', border: `1px solid ${isToMake ? C.blue : C.border}`, borderRadius: 20, color: isToMake ? C.blue : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
         >
           {isToMake ? '🍹 Saved to On Deck' : '🍹 On Deck'}
+        </button>
+        <button
+          onClick={() => onToggleInTheLab(result)}
+          style={{ background: 'none', border: `1px solid ${isInLabSaved ? C.amber : C.border}`, borderRadius: 20, color: isInLabSaved ? C.amber : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
+        >
+          {isInLabSaved ? '🧪 In the Lab ✓' : '🧪 In the Lab'}
         </button>
         <button
           onClick={() => onToggleFavorite(result)}
@@ -690,7 +819,7 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
             disabled={!feedbackText.trim() || feedbackLoading}
             style={{ background: feedbackText.trim() && !feedbackLoading ? C.gold : C.surface, border: `1px solid ${feedbackText.trim() && !feedbackLoading ? C.gold : C.border}`, borderRadius: 8, color: feedbackText.trim() && !feedbackLoading ? '#0f0f0f' : C.textFaint, fontSize: 13, fontWeight: 600, padding: '9px 14px', cursor: feedbackText.trim() && !feedbackLoading ? 'pointer' : 'default', whiteSpace: 'nowrap', transition: 'background 0.15s, color 0.15s' }}
           >
-            {feedbackLoading ? 'Adjusting…' : 'Something Off? Adjust'}
+            {feedbackLoading ? 'Adjusting…' : isInLab ? 'Tweak & Improve' : 'Something Off? Adjust'}
           </button>
         </div>
       </div>
@@ -895,6 +1024,12 @@ function FavoriteCard({ fav, onRemove, onView, onUpdateNote }) {
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 16, color: C.gold, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 7 }}>{fav.recipeName}{fav.glassType && <GlassIcon type={fav.glassType} size={15} />}</div>
+          {fav.source === 'Exploration' && (
+            <div style={{ display: 'flex', gap: 6, marginBottom: 6, flexWrap: 'wrap' }}>
+              <OriginBadge originFlag={fav.originFlag} />
+              <DifficultyBadge difficulty={fav.difficulty} />
+            </div>
+          )}
           {fav.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{fav.summary}</div>}
         </div>
         <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
@@ -961,6 +1096,12 @@ function ToMakeCard({ item, onRemove, onView }) {
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 16, color: C.blue, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 7 }}>{item.recipeName}{item.glassType && <GlassIcon type={item.glassType} size={15} />}</div>
+          {item.source === 'Exploration' && (
+            <div style={{ display: 'flex', gap: 6, marginBottom: 6, flexWrap: 'wrap' }}>
+              <OriginBadge originFlag={item.originFlag} />
+              <DifficultyBadge difficulty={item.difficulty} />
+            </div>
+          )}
           {item.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{item.summary}</div>}
           {item.recipe && item.recipe.length > 0 && (
             <div style={{ marginTop: 8, fontSize: 12, color: C.textFaint }}>
@@ -977,15 +1118,475 @@ function ToMakeCard({ item, onRemove, onView }) {
   )
 }
 
-function ToMakeScreen({ toMake, onRemove, onView }) {
-  if (toMake.length === 0) {
-    return <p style={{ color: C.textMuted, fontSize: 14 }}>No recipes on deck yet. Analyze a recipe and tap 🍹 On Deck.</p>
-  }
+// ─── In the Lab Card ──────────────────────────────────────────────────────────
+
+function InTheLabCard({ item, onRemove, onView }) {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {toMake.map(item => (
-        <ToMakeCard key={item.id} item={item} onRemove={onRemove} onView={onView} />
-      ))}
+    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 16, color: C.amber, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 7 }}>
+            {item.recipeName}{item.glassType && <GlassIcon type={item.glassType} size={15} />}
+          </div>
+          {item.source === 'Exploration' && (
+            <div style={{ display: 'flex', gap: 6, marginBottom: 6, flexWrap: 'wrap' }}>
+              <OriginBadge originFlag={item.originFlag} />
+              <DifficultyBadge difficulty={item.difficulty} />
+            </div>
+          )}
+          {item.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{item.summary}</div>}
+          {item.recipe && item.recipe.length > 0 && (
+            <div style={{ marginTop: 8, fontSize: 12, color: C.textFaint }}>
+              {item.recipe.slice(0, 3).map(r => r.ingredient).join(', ')}{item.recipe.length > 3 ? ` +${item.recipe.length - 3} more` : ''}
+            </div>
+          )}
+        </div>
+        <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+          <button onClick={() => onView(item)} style={{ background: C.amber, border: 'none', borderRadius: 7, color: '#0f0f0f', fontSize: 12, fontWeight: 700, padding: '6px 12px', cursor: 'pointer' }}>View</button>
+          <button onClick={() => onRemove(item.id)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textFaint, fontSize: 18, padding: '2px 8px', cursor: 'pointer', lineHeight: 1 }}>×</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Saved Screen ─────────────────────────────────────────────────────────────
+
+const SOURCE_OPTIONS = ['All', 'Recipe Screenshot', 'Bar Menu', 'Cocktail Name', 'Exploration']
+
+function SavedScreen({ savedSubTab, setSavedSubTab, toMake, inTheLabList, favorites, onRemoveToMake, onRemoveInTheLab, onRemoveFavorite, onViewToMake, onViewInTheLab, onViewFavorite, onUpdateNote }) {
+  const [sourceFilter, setSourceFilter] = useState('All')
+  const [ingredientFilter, setIngredientFilter] = useState(null)
+
+  const SUB_TABS = [
+    { id: 'ondeck',   label: 'On Deck',    count: toMake.length,        color: C.blue },
+    { id: 'inthelab', label: 'In the Lab', count: inTheLabList.length,  color: C.amber },
+    { id: 'favorites',label: 'Favorites',  count: favorites.length,     color: C.gold },
+  ]
+
+  const currentList = savedSubTab === 'ondeck' ? toMake : savedSubTab === 'inthelab' ? inTheLabList : favorites
+
+  let filteredList = sourceFilter === 'All' ? currentList : currentList.filter(i => (i.source || 'manual') === sourceFilter)
+  if (sourceFilter === 'Exploration' && ingredientFilter) {
+    filteredList = filteredList.filter(i => (i.primaryIngredients || []).includes(ingredientFilter))
+  }
+
+  const uniqueIngredients = [...new Set(
+    currentList.filter(i => i.source === 'Exploration').flatMap(i => i.primaryIngredients || [])
+  )]
+
+  const emptyMsg = currentList.length === 0
+    ? savedSubTab === 'ondeck' ? 'No recipes on deck yet. Analyze a recipe and tap 🍹 On Deck.'
+      : savedSubTab === 'inthelab' ? 'Nothing in the lab yet. Save a recipe with 🧪 In the Lab.'
+      : 'No saved favorites yet. Analyze a recipe and tap ♡ Save to Favorites.'
+    : 'No items match the current filter.'
+
+  return (
+    <div>
+      {/* Sub-tabs */}
+      <div style={{ display: 'flex', borderBottom: `1px solid ${C.border}`, marginBottom: 16 }}>
+        {SUB_TABS.map(({ id, label, count, color }) => {
+          const active = savedSubTab === id
+          return (
+            <button key={id} onClick={() => { setSavedSubTab(id); setSourceFilter('All'); setIngredientFilter(null) }}
+              style={{ flex: 1, background: 'none', border: 'none', borderBottom: active ? `2px solid ${color}` : '2px solid transparent', color: active ? color : C.textMuted, fontSize: 13, fontWeight: active ? 600 : 400, padding: '10px 4px', cursor: 'pointer', marginBottom: -1, transition: 'color 0.15s', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 5 }}>
+              {label}
+              <span style={{ fontSize: 10, fontWeight: 700, background: color + '33', color, borderRadius: 10, padding: '1px 5px' }}>{count}</span>
+            </button>
+          )
+        })}
+      </div>
+
+      {/* Source filter */}
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
+        {SOURCE_OPTIONS.map(opt => {
+          const active = sourceFilter === opt
+          return (
+            <button key={opt} onClick={() => { setSourceFilter(opt); setIngredientFilter(null) }}
+              style={{ background: active ? C.gold + '22' : C.surface, border: `1px solid ${active ? C.gold + '55' : C.border}`, borderRadius: 20, color: active ? C.gold : C.textMuted, fontSize: 11, fontWeight: active ? 600 : 400, padding: '3px 10px', cursor: 'pointer', transition: 'background 0.15s, color 0.15s' }}>
+              {opt}
+            </button>
+          )
+        })}
+      </div>
+
+      {/* Primary ingredient pills */}
+      {sourceFilter === 'Exploration' && uniqueIngredients.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 14 }}>
+          {uniqueIngredients.map(ing => {
+            const active = ingredientFilter === ing
+            return (
+              <button key={ing} onClick={() => setIngredientFilter(active ? null : ing)}
+                style={{ background: active ? C.amber + '22' : C.surface, border: `1px solid ${active ? C.amber + '55' : C.border}`, borderRadius: 20, color: active ? C.amber : C.textFaint, fontSize: 11, fontWeight: active ? 600 : 400, padding: '3px 10px', cursor: 'pointer' }}>
+                {ing}
+              </button>
+            )
+          })}
+        </div>
+      )}
+
+      {filteredList.length === 0 ? (
+        <p style={{ color: C.textMuted, fontSize: 14 }}>{emptyMsg}</p>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {filteredList.map(item => {
+            if (savedSubTab === 'favorites') return <FavoriteCard key={item.id} fav={item} onRemove={onRemoveFavorite} onView={onViewFavorite} onUpdateNote={onUpdateNote} />
+            if (savedSubTab === 'inthelab') return <InTheLabCard key={item.id} item={item} onRemove={onRemoveInTheLab} onView={onViewInTheLab} />
+            return <ToMakeCard key={item.id} item={item} onRemove={onRemoveToMake} onView={onViewToMake} />
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Explorations ─────────────────────────────────────────────────────────────
+
+function IngredientSearch({ inventory, selected, onSelect, onRemove }) {
+  const [query, setQuery] = useState('')
+  const [suggestions, setSuggestions] = useState([])
+
+  useEffect(() => {
+    if (!query.trim()) { setSuggestions([]); return }
+    const q = query.toLowerCase()
+    setSuggestions((inventory || []).filter(i => i.spirit.toLowerCase().includes(q)).slice(0, 8))
+  }, [query, inventory])
+
+  const pick = (name) => {
+    if (selected.length >= 2 || selected.includes(name)) return
+    onSelect(name); setQuery(''); setSuggestions([])
+  }
+
+  const showDropdown = query.trim().length > 0 && (suggestions.length > 0 || true)
+  const exactMatch = suggestions.some(s => s.spirit.toLowerCase() === query.toLowerCase())
+
+  return (
+    <div style={{ position: 'relative' }}>
+      {selected.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
+          {selected.map(ing => (
+            <span key={ing} style={{ display: 'flex', alignItems: 'center', gap: 5, background: C.gold + '22', border: `1px solid ${C.gold}55`, borderRadius: 20, color: C.gold, fontSize: 13, padding: '4px 10px 4px 12px', fontWeight: 500 }}>
+              {ing}
+              <button onClick={() => onRemove(ing)} style={{ background: 'none', border: 'none', color: C.gold, cursor: 'pointer', fontSize: 15, lineHeight: 1, padding: '0 0 0 2px' }}>×</button>
+            </span>
+          ))}
+        </div>
+      )}
+      {selected.length < 2 && (
+        <>
+          <input
+            type="text"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && query.trim() && pick(query.trim())}
+            placeholder={selected.length === 0 ? 'Search or type an ingredient…' : 'Add a second ingredient…'}
+            style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, padding: '12px 14px', fontSize: 14, outline: 'none', boxSizing: 'border-box' }}
+          />
+          {showDropdown && (suggestions.length > 0 || query.trim()) && (
+            <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#1c1c1c', border: `1px solid ${C.border}`, borderRadius: 8, zIndex: 20, overflow: 'hidden', marginTop: 4 }}>
+              {suggestions.map(item => (
+                <div key={item.spirit} onClick={() => pick(item.spirit)}
+                  style={{ padding: '10px 14px', cursor: 'pointer', fontSize: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                  onMouseEnter={e => e.currentTarget.style.background = C.border}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                  <span>{item.spirit}</span>
+                  {item.category && <span style={{ fontSize: 11, color: C.textFaint }}>{item.category}</span>}
+                </div>
+              ))}
+              {!exactMatch && query.trim() && (
+                <div onClick={() => pick(query.trim())}
+                  style={{ padding: '10px 14px', cursor: 'pointer', fontSize: 14, color: C.textMuted, borderTop: suggestions.length ? `1px solid ${C.border}` : 'none' }}
+                  onMouseEnter={e => e.currentTarget.style.background = C.border}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                  Use "{query.trim()}" →
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      )}
+      <div style={{ fontSize: 12, color: C.textFaint, marginTop: 8 }}>Don't have it yet? Type any ingredient to explore.</div>
+    </div>
+  )
+}
+
+function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, onSaveInTheLab }) {
+  const [expanded, setExpanded] = useState(false)
+  const [savedTo, setSavedTo] = useState(null) // null | 'ondeck' | 'inthelab'
+
+  const diffColor = suggestion.difficulty === 'easy' ? C.green : suggestion.difficulty === 'medium' ? C.amber : C.red
+
+  const handleOnDeck = () => {
+    onSaveOnDeck(suggestion, primaryIngredients)
+    setSavedTo('ondeck')
+  }
+  const handleInLab = () => {
+    onSaveInTheLab(suggestion, primaryIngredients)
+    setSavedTo('inthelab')
+  }
+
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 5 }}>
+          <span style={{ fontWeight: 700, fontSize: 16, color: C.gold }}>{suggestion.recipe_name}</span>
+          {suggestion.glass_type && <GlassIcon type={suggestion.glass_type} />}
+        </div>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 4 }}>
+          <OriginBadge originFlag={suggestion.origin_flag} />
+          <DifficultyBadge difficulty={suggestion.difficulty} />
+        </div>
+        {suggestion.difficulty_note && <div style={{ fontSize: 12, color: C.textFaint, marginTop: 2 }}>{suggestion.difficulty_note}</div>}
+      </div>
+
+      {suggestion.summary && <p style={{ fontSize: 14, color: C.textMuted, lineHeight: 1.55, marginBottom: 10 }}>{suggestion.summary}</p>}
+
+      <button onClick={() => setExpanded(e => !e)}
+        style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0, marginBottom: expanded ? 12 : 0 }}>
+        {expanded ? '▲ Hide recipe' : '▼ Show recipe & ingredients'}
+      </button>
+
+      {expanded && (
+        <div>
+          {suggestion.recipe && suggestion.recipe.length > 0 && (
+            <div style={{ background: C.bg, borderRadius: 8, padding: '12px 14px', marginBottom: 10 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>Recipe</div>
+              <ul style={{ listStyle: 'none' }}>
+                {suggestion.recipe.map((r, i) => (
+                  <li key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', borderBottom: i < suggestion.recipe.length - 1 ? `1px solid ${C.border}` : 'none', gap: 12 }}>
+                    <span style={{ fontSize: 14 }}>{r.ingredient}</span>
+                    <span style={{ fontSize: 13, color: C.gold, fontWeight: 500, whiteSpace: 'nowrap' }}>{r.amount}</span>
+                  </li>
+                ))}
+              </ul>
+              {suggestion.instructions && (
+                <p style={{ fontSize: 13, color: C.textMuted, marginTop: 10, lineHeight: 1.6, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>{suggestion.instructions}</p>
+              )}
+            </div>
+          )}
+          {suggestion.technique_notes && (
+            <div style={{ fontSize: 13, color: C.amber, background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 8, padding: '8px 12px', marginBottom: 10 }}>
+              🔧 {suggestion.technique_notes}
+            </div>
+          )}
+          {suggestion.ingredients && suggestion.ingredients.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+              {suggestion.ingredients.map((ing, i) => (
+                <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13 }}>
+                  <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: ing.status === 'found' ? C.green : ing.status === 'substitute' ? C.amber : C.red, flexShrink: 0, marginTop: 4 }} />
+                  <div>
+                    <span style={{ color: C.text }}>{ing.ingredient}</span>
+                    {ing.location && <span style={{ color: C.textMuted }}> · 📍 {ing.location}</span>}
+                    {ing.substitute && <div style={{ color: C.textFaint, fontStyle: 'italic', marginTop: 2 }}>Sub: {ing.substitute}{ing.flavor_impact ? ` — ${ing.flavor_impact}` : ''}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {savedTo ? (
+        <div style={{ marginTop: 12, fontSize: 13, color: C.textFaint, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span>✓ Saved to {savedTo === 'ondeck' ? 'On Deck' : 'In the Lab'}</span>
+          <button onClick={savedTo === 'ondeck' ? handleInLab : handleOnDeck}
+            style={{ background: 'none', border: 'none', color: C.gold, fontSize: 13, cursor: 'pointer', padding: 0, textDecoration: 'underline' }}>
+            Move to {savedTo === 'ondeck' ? 'In the Lab' : 'On Deck'} instead?
+          </button>
+        </div>
+      ) : (
+        <div style={{ display: 'flex', gap: 6, marginTop: 12, flexWrap: 'wrap' }}>
+          <button onClick={handleOnDeck} style={{ background: 'none', border: `1px solid ${C.blue}`, borderRadius: 20, color: C.blue, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>🍹 On Deck</button>
+          <button onClick={handleInLab} style={{ background: 'none', border: `1px solid ${C.amber}`, borderRadius: 20, color: C.amber, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>🧪 In the Lab</button>
+          <button style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textFaint, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>👎 Archive</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTheLab }) {
+  const [step, setStep] = useState('ingredients')
+  const [selected, setSelected] = useState([])
+  const [style, setStyle] = useState(null)
+  const [flavors, setFlavors] = useState([])
+  const [lowABV, setLowABV] = useState(false)
+  const [result, setResult] = useState(null)
+  const [error, setError] = useState(null)
+
+  const STYLES = [
+    { id: 'Stirred', emoji: '🥃' }, { id: 'On the Rocks', emoji: '🧊' },
+    { id: 'Shaken / Sours', emoji: '🍋' }, { id: 'Highball', emoji: '🫧' },
+    { id: 'Tiki / Swizzle', emoji: '🌺' }, { id: 'Warm Drink', emoji: '☕' },
+  ]
+  const FLAVORS = [
+    { id: 'Bright & Citrusy', emoji: '🍋' }, { id: 'Bitter / Herbal', emoji: '🌿' },
+    { id: 'Spirit Forward / Dry', emoji: '🥃' }, { id: 'Earthy / Smoky', emoji: '🍂' },
+    { id: 'Fruity / Sweet', emoji: '🍓' },
+  ]
+
+  const toggleFlavor = id => setFlavors(prev => prev.includes(id) ? prev.filter(f => f !== id) : prev.length < 3 ? [...prev, id] : prev)
+
+  const handleExplore = async () => {
+    setStep('loading')
+    try {
+      const data = await analyzeExplorations(selected, style, flavors, lowABV, inventoryText)
+      setResult(data); setStep('results')
+    } catch (err) {
+      setError(err.message || 'Something went wrong. Please try again.'); setStep('error')
+    }
+  }
+
+  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null) }
+
+  if (step === 'ingredients') return (
+    <div>
+      <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 4 }}>Explorations</div>
+      <div style={{ fontSize: 14, color: C.textMuted, marginBottom: 24, lineHeight: 1.55 }}>Pick up to 2 ingredients and we'll suggest cocktails you can make — or inspire you to try something new.</div>
+      <IngredientSearch inventory={inventory} selected={selected} onSelect={ing => setSelected(p => [...p, ing])} onRemove={ing => setSelected(p => p.filter(i => i !== ing))} />
+      {selected.length > 0 && (
+        <button onClick={() => setStep('prefs')} style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: 'pointer', marginTop: 24 }}>
+          Next →
+        </button>
+      )}
+    </div>
+  )
+
+  if (step === 'prefs') return (
+    <div>
+      <button onClick={() => setStep('ingredients')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+      <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Style & Preferences</div>
+      <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 24 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
+
+      <div style={{ marginBottom: 24 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 12 }}>Cocktail Style</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+          {STYLES.map(s => (
+            <button key={s.id} onClick={() => setStyle(s.id)}
+              style={{ background: style === s.id ? C.gold + '22' : C.surface, border: `1px solid ${style === s.id ? C.gold + '66' : C.border}`, borderRadius: 10, color: style === s.id ? C.gold : C.text, fontSize: 14, fontWeight: style === s.id ? 600 : 400, padding: '12px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 8, transition: 'background 0.15s, color 0.15s' }}>
+              <span>{s.emoji}</span><span>{s.id}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 24 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 4 }}>Flavor Profile</div>
+        <div style={{ fontSize: 12, color: C.textFaint, marginBottom: 12 }}>Pick 1–3</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {FLAVORS.map(f => {
+            const active = flavors.includes(f.id)
+            return (
+              <button key={f.id} onClick={() => toggleFlavor(f.id)}
+                style={{ background: active ? C.gold + '22' : C.surface, border: `1px solid ${active ? C.gold + '66' : C.border}`, borderRadius: 10, color: active ? C.gold : C.text, fontSize: 14, fontWeight: active ? 600 : 400, padding: '12px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 10, transition: 'background 0.15s, color 0.15s' }}>
+                <span>{f.emoji}</span><span style={{ flex: 1 }}>{f.id}</span>{active && <span style={{ fontSize: 12 }}>✓</span>}
+              </button>
+            )
+          })}
+        </div>
+      </div>
+
+      <label style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 24 }}>
+        <input type="checkbox" checked={lowABV} onChange={e => setLowABV(e.target.checked)} style={{ width: 18, height: 18, accentColor: C.gold, cursor: 'pointer', flexShrink: 0 }} />
+        <div>
+          <div style={{ fontSize: 14, color: C.text }}>Keep it low ABV</div>
+          <div style={{ fontSize: 12, color: C.textFaint, marginTop: 2 }}>Prefer lighter, lower-alcohol options</div>
+        </div>
+      </label>
+
+      <button onClick={handleExplore} disabled={!style}
+        style={{ width: '100%', background: style ? C.gold : C.surface, border: `1px solid ${style ? C.gold : C.border}`, borderRadius: 10, color: style ? '#0f0f0f' : C.textFaint, fontWeight: 700, fontSize: 15, padding: '13px', cursor: style ? 'pointer' : 'default', transition: 'background 0.15s, color 0.15s' }}>
+        ✨ Explore
+      </button>
+    </div>
+  )
+
+  if (step === 'loading') return (
+    <div style={{ textAlign: 'center', padding: '60px 0' }}>
+      <style>{`@keyframes bcspin2 { to { transform: rotate(360deg); } }`}</style>
+      <div style={{ display: 'inline-block', width: 34, height: 34, border: `3px solid ${C.border}`, borderTopColor: C.gold, borderRadius: '50%', animation: 'bcspin2 0.75s linear infinite', marginBottom: 16 }} />
+      <div style={{ color: C.textMuted, fontSize: 15 }}>Exploring cocktail possibilities…</div>
+      <div style={{ color: C.textFaint, fontSize: 13, marginTop: 6 }}>Searching for recipes and crafting originals</div>
+    </div>
+  )
+
+  if (step === 'error') return (
+    <div>
+      <div style={{ background: C.red + '15', border: `1px solid ${C.red}44`, borderRadius: 10, padding: '14px 16px', fontSize: 14, color: C.red, marginBottom: 16 }}>{error}</div>
+      <button onClick={reset} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.textMuted, fontSize: 13, padding: '8px 16px', cursor: 'pointer' }}>Try again</button>
+    </div>
+  )
+
+  if (step === 'results' && result) {
+    if (result.incompatible) return (
+      <div>
+        <div style={{ background: C.amber + '15', border: `1px solid ${C.amber}44`, borderRadius: 10, padding: '20px', marginBottom: 20 }}>
+          <div style={{ fontSize: 18, fontWeight: 700, color: C.amber, marginBottom: 8 }}>These don't quite mix…</div>
+          <div style={{ fontSize: 14, color: C.text, lineHeight: 1.6 }}>{result.incompatibility_reason}</div>
+        </div>
+        <button onClick={reset} style={{ background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 14, padding: '12px 20px', cursor: 'pointer' }}>Try different ingredients</button>
+      </div>
+    )
+
+    const canMake = (result.suggestions || []).filter(s => s.can_make_now)
+    const worthBuying = (result.suggestions || []).filter(s => !s.can_make_now)
+
+    return (
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+          <div style={{ flex: 1, fontSize: 18, fontWeight: 700, color: C.text }}>{selected.join(' + ')}</div>
+          <button onClick={reset} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap' }}>Start over</button>
+        </div>
+        {result.flavor_profile_note && (
+          <div style={{ background: C.gold + '12', border: `1px solid ${C.gold}33`, borderRadius: 10, padding: '12px 16px', marginBottom: 24, fontSize: 14, color: C.text, lineHeight: 1.6 }}>
+            ✨ {result.flavor_profile_note}
+          </div>
+        )}
+        {canMake.length > 0 && (
+          <div style={{ marginBottom: 28 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {canMake.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} />)}
+            </div>
+          </div>
+        )}
+        {worthBuying.length > 0 && (
+          <div>
+            <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Worth Buying For ({worthBuying.length})</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} />)}
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  return null
+}
+
+// ─── Bottom Tab Bar ───────────────────────────────────────────────────────────
+
+function BottomTabBar({ screen, onTab }) {
+  const tabs = [
+    { id: 'analyze',      icon: '🔍', label: 'Analyze' },
+    { id: 'explorations', icon: '✨', label: 'Explorations' },
+    { id: 'saved',        icon: '🍸', label: 'Saved' },
+    { id: 'inventory',    icon: '📦', label: 'Inventory' },
+    { id: 'shopping',     icon: '🛒', label: 'Shopping' },
+  ]
+  return (
+    <div style={{ position: 'fixed', bottom: 0, left: 0, right: 0, background: C.bg, borderTop: `1px solid ${C.border}`, display: 'flex', zIndex: 50, paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}>
+      {tabs.map(({ id, icon, label }) => {
+        const active = screen === id
+        return (
+          <button key={id} onClick={() => onTab(id)}
+            style={{ flex: 1, background: 'none', border: 'none', color: active ? C.gold : C.textMuted, padding: '10px 4px 12px', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, transition: 'color 0.15s' }}>
+            <span style={{ fontSize: 20, lineHeight: 1 }}>{icon}</span>
+            <span style={{ fontSize: 10, fontWeight: active ? 700 : 400, letterSpacing: '0.02em' }}>{label}</span>
+          </button>
+        )
+      })}
     </div>
   )
 }
@@ -1001,7 +1602,8 @@ export default function App() {
   const [inventoryError, setInventoryError] = useState(null)
 
   // Navigation
-  const [screen, setScreen] = useState('main') // 'main' | 'inventory' | 'shopping' | 'favorites' | 'to-make'
+  const [screen, setScreen] = useState('analyze')
+  const [savedSubTab, setSavedSubTab] = useState('ondeck')
 
   // Auth
   const [user, setUser] = useState(null)
@@ -1019,105 +1621,101 @@ export default function App() {
   const [toMake, setToMake] = useState(() => {
     try { return JSON.parse(localStorage.getItem('bar-cart-to-make')) || [] } catch { return [] }
   })
+  const [inTheLabList, setInTheLabList] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('bar-cart-in-the-lab')) || [] } catch { return [] }
+  })
 
   useEffect(() => { shoppingListRef.current = shoppingList }, [shoppingList])
   useEffect(() => { if (!user) localStorage.setItem('bar-cart-shopping', JSON.stringify(shoppingList)) }, [shoppingList, user])
   useEffect(() => { if (!user) localStorage.setItem('bar-cart-favorites', JSON.stringify(favorites)) }, [favorites, user])
   useEffect(() => { if (!user) localStorage.setItem('bar-cart-to-make', JSON.stringify(toMake)) }, [toMake, user])
+  useEffect(() => { if (!user) localStorage.setItem('bar-cart-in-the-lab', JSON.stringify(inTheLabList)) }, [inTheLabList, user])
 
   // DB helpers
   const dbFavToLocal = (row) => ({
-    id: row.id,
-    recipeName: row.recipe_name,
-    summary: row.summary,
-    recipe: row.recipe || [],
-    instructions: row.instructions || null,
-    ingredients: row.ingredients || [],
-    variations: row.variations || [],
-    glassType: row.glass_type || null,
-    note: row.notes || '',
-    mode: row.mode,
+    id: row.id, recipeName: row.recipe_name, summary: row.summary,
+    recipe: row.recipe || [], instructions: row.instructions || null,
+    ingredients: row.ingredients || [], variations: row.variations || [],
+    glassType: row.glass_type || null, note: row.notes || '', mode: row.mode,
+    source: row.source || 'manual', originFlag: row.origin_flag || null,
+    difficulty: row.difficulty || null, primaryIngredients: row.primary_ingredients || [],
     savedAt: row.saved_at,
   })
 
   const dbToMakeToLocal = (row) => ({
-    id: row.id,
-    recipeName: row.recipe_name,
-    summary: row.summary,
-    recipe: row.recipe || [],
-    instructions: row.instructions || null,
-    ingredients: row.ingredients || [],
-    variations: row.variations || [],
-    glassType: row.glass_type || null,
-    mode: row.mode,
+    id: row.id, recipeName: row.recipe_name, summary: row.summary,
+    recipe: row.recipe || [], instructions: row.instructions || null,
+    ingredients: row.ingredients || [], variations: row.variations || [],
+    glassType: row.glass_type || null, mode: row.mode,
+    source: row.source || 'manual', originFlag: row.origin_flag || null,
+    difficulty: row.difficulty || null, primaryIngredients: row.primary_ingredients || [],
+    savedAt: row.saved_at,
+  })
+
+  const dbInTheLabToLocal = (row) => ({
+    id: row.id, recipeName: row.recipe_name, summary: row.summary,
+    recipe: row.recipe || [], instructions: row.instructions || null,
+    ingredients: row.ingredients || [], variations: row.variations || [],
+    glassType: row.glass_type || null, note: row.notes || '', mode: row.mode,
+    source: row.source || 'Exploration', originFlag: row.origin_flag || null,
+    difficulty: row.difficulty || null, primaryIngredients: row.primary_ingredients || [],
     savedAt: row.saved_at,
   })
 
   const migrateAndLoadData = async (u) => {
-    // Always load from Supabase first — it is the source of truth
     const [{ data: favData }, { data: shopData }, { data: toMakeData }] = await Promise.all([
       supabase.from('favorites').select('*').eq('user_id', u.id).order('saved_at', { ascending: false }),
       supabase.from('shopping_list').select('*').eq('user_id', u.id).order('created_at', { ascending: true }),
       supabase.from('to_make').select('*').eq('user_id', u.id).order('saved_at', { ascending: false }),
     ])
 
-    const hasCloudData = (favData && favData.length > 0) || (shopData && shopData.length > 0) || (toMakeData && toMakeData.length > 0)
+    let labData = null
+    try {
+      const { data, error } = await supabase.from('in_the_lab').select('*').eq('user_id', u.id).order('saved_at', { ascending: false })
+      if (!error) labData = data
+    } catch (_) {}
+
+    const hasCloudData = (favData?.length > 0) || (shopData?.length > 0) || (toMakeData?.length > 0) || (labData?.length > 0)
 
     if (!hasCloudData) {
-      // Supabase is empty — migrate from localStorage once
       const localFavs = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-favorites')) || [] } catch { return [] } })()
       const localShopping = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-shopping')) || [] } catch { return [] } })()
       const localToMake = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-to-make')) || [] } catch { return [] } })()
+      const localLab = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-in-the-lab')) || [] } catch { return [] } })()
 
       if (localFavs.length > 0) {
-        const rows = localFavs.map(f => ({
-          user_id: u.id,
-          recipe_name: f.recipeName,
-          summary: f.summary || null,
-          recipe: f.recipe || [],
-          instructions: f.instructions || null,
-          ingredients: f.ingredients || [],
-          variations: f.variations || [],
-          glass_type: f.glassType || null,
-          notes: f.note || null,
-          saved_at: f.savedAt || new Date().toISOString(),
-        }))
+        const rows = localFavs.map(f => ({ user_id: u.id, recipe_name: f.recipeName, summary: f.summary || null, recipe: f.recipe || [], instructions: f.instructions || null, ingredients: f.ingredients || [], variations: f.variations || [], glass_type: f.glassType || null, notes: f.note || null, saved_at: f.savedAt || new Date().toISOString() }))
         const { data: inserted } = await supabase.from('favorites').upsert(rows, { onConflict: 'user_id,recipe_name', ignoreDuplicates: true }).select()
         if (inserted) setFavorites(inserted.map(dbFavToLocal))
       }
-
       if (localShopping.length > 0) {
         const rows = localShopping.map(i => ({ user_id: u.id, name: i.name }))
         const { data: inserted } = await supabase.from('shopping_list').upsert(rows, { onConflict: 'user_id,name', ignoreDuplicates: true }).select()
         if (inserted) setShoppingList(inserted.map(r => ({ id: r.id, name: r.name })))
       }
-
       if (localToMake.length > 0) {
-        const rows = localToMake.map(f => ({
-          user_id: u.id,
-          recipe_name: f.recipeName,
-          summary: f.summary || null,
-          recipe: f.recipe || [],
-          instructions: f.instructions || null,
-          ingredients: f.ingredients || [],
-          variations: f.variations || [],
-          glass_type: f.glassType || null,
-          saved_at: f.savedAt || new Date().toISOString(),
-        }))
+        const rows = localToMake.map(f => ({ user_id: u.id, recipe_name: f.recipeName, summary: f.summary || null, recipe: f.recipe || [], instructions: f.instructions || null, ingredients: f.ingredients || [], variations: f.variations || [], glass_type: f.glassType || null, saved_at: f.savedAt || new Date().toISOString() }))
         const { data: inserted } = await supabase.from('to_make').upsert(rows, { onConflict: 'user_id,recipe_name', ignoreDuplicates: true }).select()
         if (inserted) setToMake(inserted.map(dbToMakeToLocal))
       }
+      if (localLab.length > 0) {
+        try {
+          const rows = localLab.map(f => ({ user_id: u.id, recipe_name: f.recipeName, summary: f.summary || null, recipe: f.recipe || [], instructions: f.instructions || null, ingredients: f.ingredients || [], variations: f.variations || [], glass_type: f.glassType || null, source: f.source || 'Exploration', origin_flag: f.originFlag || null, difficulty: f.difficulty || null, primary_ingredients: f.primaryIngredients || [], saved_at: f.savedAt || new Date().toISOString() }))
+          const { data: inserted } = await supabase.from('in_the_lab').upsert(rows, { onConflict: 'user_id,recipe_name', ignoreDuplicates: true }).select()
+          if (inserted) setInTheLabList(inserted.map(dbInTheLabToLocal))
+        } catch (_) {}
+      }
     } else {
-      // Supabase has data — use it directly, ignore localStorage
       if (favData) setFavorites(favData.map(dbFavToLocal))
       if (shopData) setShoppingList(shopData.map(r => ({ id: r.id, name: r.name })))
       if (toMakeData) setToMake(toMakeData.map(dbToMakeToLocal))
+      if (labData) setInTheLabList(labData.map(dbInTheLabToLocal))
     }
 
-    // Clear localStorage so stale local data can never overwrite cloud data
     localStorage.removeItem('bar-cart-favorites')
     localStorage.removeItem('bar-cart-shopping')
     localStorage.removeItem('bar-cart-to-make')
+    localStorage.removeItem('bar-cart-in-the-lab')
   }
 
   // Auth effect
@@ -1138,6 +1736,7 @@ export default function App() {
         try { setFavorites(JSON.parse(localStorage.getItem('bar-cart-favorites')) || []) } catch { setFavorites([]) }
         try { setShoppingList(JSON.parse(localStorage.getItem('bar-cart-shopping')) || []) } catch { setShoppingList([]) }
         try { setToMake(JSON.parse(localStorage.getItem('bar-cart-to-make')) || []) } catch { setToMake([]) }
+        try { setInTheLabList(JSON.parse(localStorage.getItem('bar-cart-in-the-lab')) || []) } catch { setInTheLabList([]) }
       }
     })
     return () => subscription.unsubscribe()
@@ -1232,7 +1831,8 @@ export default function App() {
   }
 
   // Favorites helpers
-  const toggleFavorite = async (res) => {
+  const toggleFavorite = async (res, extras = {}) => {
+    const { source = 'manual', originFlag = null, difficulty = null, primaryIngredients = [] } = extras
     if (user) {
       const existing = favorites.find(f => f.recipeName === res.recipe_name)
       if (existing) {
@@ -1240,15 +1840,11 @@ export default function App() {
         setFavorites(prev => prev.filter(f => f.id !== existing.id))
       } else {
         const { data, error } = await supabase.from('favorites').insert({
-          user_id: user.id,
-          recipe_name: res.recipe_name,
-          summary: res.summary || null,
-          recipe: res.recipe || [],
-          instructions: res.instructions || null,
-          ingredients: res.ingredients || [],
-          variations: res.variations || [],
-          glass_type: res.glass_type || null,
-          saved_at: new Date().toISOString(),
+          user_id: user.id, recipe_name: res.recipe_name, summary: res.summary || null,
+          recipe: res.recipe || [], instructions: res.instructions || null,
+          ingredients: res.ingredients || [], variations: res.variations || [],
+          glass_type: res.glass_type || null, source, origin_flag: originFlag,
+          difficulty, primary_ingredients: primaryIngredients, saved_at: new Date().toISOString(),
         }).select().single()
         if (!error && data) setFavorites(prev => [dbFavToLocal(data), ...prev])
       }
@@ -1256,7 +1852,7 @@ export default function App() {
       setFavorites(prev => {
         const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
         if (existing >= 0) return prev.filter((_, i) => i !== existing)
-        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, savedAt: new Date().toISOString() }, ...prev]
+        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, note: '', source, originFlag, difficulty, primaryIngredients, savedAt: new Date().toISOString() }, ...prev]
       })
     }
   }
@@ -1272,7 +1868,8 @@ export default function App() {
   }
 
   // To Make helpers
-  const toggleToMake = async (res) => {
+  const toggleToMake = async (res, extras = {}) => {
+    const { source = 'manual', originFlag = null, difficulty = null, primaryIngredients = [] } = extras
     if (user) {
       const existing = toMake.find(f => f.recipeName === res.recipe_name)
       if (existing) {
@@ -1280,15 +1877,11 @@ export default function App() {
         setToMake(prev => prev.filter(f => f.id !== existing.id))
       } else {
         const { data, error } = await supabase.from('to_make').insert({
-          user_id: user.id,
-          recipe_name: res.recipe_name,
-          summary: res.summary || null,
-          recipe: res.recipe || [],
-          instructions: res.instructions || null,
-          ingredients: res.ingredients || [],
-          variations: res.variations || [],
-          glass_type: res.glass_type || null,
-          saved_at: new Date().toISOString(),
+          user_id: user.id, recipe_name: res.recipe_name, summary: res.summary || null,
+          recipe: res.recipe || [], instructions: res.instructions || null,
+          ingredients: res.ingredients || [], variations: res.variations || [],
+          glass_type: res.glass_type || null, source, origin_flag: originFlag,
+          difficulty, primary_ingredients: primaryIngredients, saved_at: new Date().toISOString(),
         }).select().single()
         if (!error && data) setToMake(prev => [dbToMakeToLocal(data), ...prev])
       }
@@ -1296,7 +1889,7 @@ export default function App() {
       setToMake(prev => {
         const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
         if (existing >= 0) return prev.filter((_, i) => i !== existing)
-        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, savedAt: new Date().toISOString() }, ...prev]
+        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, source, originFlag, difficulty, primaryIngredients, savedAt: new Date().toISOString() }, ...prev]
       })
     }
   }
@@ -1306,24 +1899,66 @@ export default function App() {
     setToMake(prev => prev.filter(f => f.id !== id))
   }
 
+  // In the Lab helpers
+  const toggleInTheLab = async (res, extras = {}) => {
+    const { source = 'manual', originFlag = null, difficulty = null, primaryIngredients = [] } = extras
+    if (user) {
+      const existing = inTheLabList.find(f => f.recipeName === res.recipe_name)
+      if (existing) {
+        await supabase.from('in_the_lab').delete().eq('id', existing.id)
+        setInTheLabList(prev => prev.filter(f => f.id !== existing.id))
+      } else {
+        try {
+          const { data, error } = await supabase.from('in_the_lab').insert({
+            user_id: user.id, recipe_name: res.recipe_name, summary: res.summary || null,
+            recipe: res.recipe || [], instructions: res.instructions || null,
+            ingredients: res.ingredients || [], variations: res.variations || [],
+            glass_type: res.glass_type || null, source, origin_flag: originFlag,
+            difficulty, primary_ingredients: primaryIngredients, saved_at: new Date().toISOString(),
+          }).select().single()
+          if (!error && data) setInTheLabList(prev => [dbInTheLabToLocal(data), ...prev])
+        } catch (_) {}
+      }
+    } else {
+      setInTheLabList(prev => {
+        const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
+        if (existing >= 0) return prev.filter((_, i) => i !== existing)
+        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, source, originFlag, difficulty, primaryIngredients, savedAt: new Date().toISOString() }, ...prev]
+      })
+    }
+  }
+
+  const removeFromInTheLab = async (id) => {
+    if (user) { try { await supabase.from('in_the_lab').delete().eq('id', id) } catch (_) {} }
+    setInTheLabList(prev => prev.filter(f => f.id !== id))
+  }
+
   const viewToMake = (item) => {
     sourceScrollRef.current = window.scrollY
-    setError(null)
+    setError(null); setAdjustmentNote(null)
     setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType })
     setResultSource('ondeck')
-    setScreen('main')
+    setScreen('analyze')
+  }
+
+  const viewFavorite = (fav) => {
+    sourceScrollRef.current = window.scrollY
+    setError(null); setAdjustmentNote(null)
+    setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType })
+    setResultSource('favorites')
+    setScreen('analyze')
+  }
+
+  const viewInTheLab = (item) => {
+    sourceScrollRef.current = window.scrollY
+    setError(null); setAdjustmentNote(null)
+    setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType })
+    setResultSource('inthelab')
+    setScreen('analyze')
   }
 
   const signIn = () => supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: window.location.origin } })
   const signOut = () => supabase.auth.signOut()
-
-  const viewFavorite = (fav) => {
-    sourceScrollRef.current = window.scrollY
-    setError(null)
-    setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType })
-    setResultSource('favorites')
-    setScreen('main')
-  }
 
   // Analyze
   const canAnalyze = () => {
@@ -1366,7 +2001,6 @@ export default function App() {
         setLoading(false)
         return
       }
-      const inventoryText = inventoryToText(inventory)
       let response
       if (mode === 'photo') {
         response = await analyzeRecipePhoto(recipePhoto, inventoryText)
@@ -1453,7 +2087,8 @@ export default function App() {
     const savedScroll = sourceScrollRef.current
     setResultSource(null)
     setResult(null)
-    setScreen(src === 'ondeck' ? 'to-make' : 'favorites')
+    setSavedSubTab(src) // 'ondeck' | 'inthelab' | 'favorites'
+    setScreen('saved')
     requestAnimationFrame(() => window.scrollTo(0, savedScroll))
   }
 
@@ -1463,27 +2098,29 @@ export default function App() {
     { id: 'menu', label: '🍹 Bar Menu' },
   ]
 
-  const NAV_PILLS = [
-    { id: 'to-make', label: 'On Deck', count: toMake.length, countColor: C.blue },
-    { id: 'favorites', label: 'Favorites', count: favorites.length, countColor: C.gold },
-    { id: 'shopping', label: 'Shopping List', count: shoppingList.length, countColor: C.amber },
-    { id: 'inventory', label: 'Inventory', count: inStockCount, countColor: C.green },
-  ]
+  const analysisModeSource = mode === 'photo' ? 'Recipe Screenshot' : mode === 'name' ? 'Cocktail Name' : 'Bar Menu'
 
-  const toggleScreen = (s) => setScreen(prev => prev === s ? 'main' : s)
+  const inventoryText = inventory ? inventoryToText(inventory) : ''
+
+  const handleSaveOnDeckFromExploration = (suggestion, primaryIngredients) => {
+    toggleToMake({ recipe_name: suggestion.recipe_name, summary: suggestion.summary, recipe: suggestion.recipe, instructions: suggestion.instructions, ingredients: suggestion.ingredients, variations: suggestion.variations || [], glass_type: suggestion.glass_type }, { source: 'Exploration', originFlag: suggestion.origin_flag, difficulty: suggestion.difficulty, primaryIngredients })
+  }
+
+  const handleSaveInTheLabFromExploration = (suggestion, primaryIngredients) => {
+    toggleInTheLab({ recipe_name: suggestion.recipe_name, summary: suggestion.summary, recipe: suggestion.recipe, instructions: suggestion.instructions, ingredients: suggestion.ingredients, variations: suggestion.variations || [], glass_type: suggestion.glass_type }, { source: 'Exploration', originFlag: suggestion.origin_flag, difficulty: suggestion.difficulty, primaryIngredients })
+  }
 
   return (
-    <div style={{ maxWidth: 700, margin: '0 auto', padding: '0 20px 80px' }}>
+    <div style={{ maxWidth: 700, margin: '0 auto', padding: '0 20px 110px' }}>
 
       {/* Header */}
       <div style={{ padding: '24px 0 18px', borderBottom: `1px solid ${C.border}`, marginBottom: 20 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
           <div>
-            <div onClick={() => setScreen('main')} style={{ fontSize: 24, fontWeight: 800, letterSpacing: '-0.04em', color: C.gold, cursor: 'pointer' }}>Bar Cart</div>
+            <div onClick={() => setScreen('analyze')} style={{ fontSize: 24, fontWeight: 800, letterSpacing: '-0.04em', color: C.gold, cursor: 'pointer' }}>Bar Cart</div>
             <div style={{ fontSize: 13, color: C.textFaint, marginTop: 2 }}>home cocktail assistant</div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            {/* Auth UI */}
             {!authLoading && (user ? (
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 {user.user_metadata?.avatar_url ? (
@@ -1493,9 +2130,7 @@ export default function App() {
                     {(user.user_metadata?.full_name || user.email || '?')[0].toUpperCase()}
                   </div>
                 )}
-                <button onClick={signOut} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textMuted, fontSize: 12, padding: '4px 8px', cursor: 'pointer' }}>
-                  Sign out
-                </button>
+                <button onClick={signOut} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textMuted, fontSize: 12, padding: '4px 8px', cursor: 'pointer' }}>Sign out</button>
               </div>
             ) : (
               <button onClick={signIn} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, fontSize: 12, fontWeight: 600, padding: '5px 9px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}>
@@ -1503,88 +2138,33 @@ export default function App() {
                 Sign in
               </button>
             ))}
-            <button
-              onClick={() => toggleScreen('settings')}
-              title="Settings"
-              style={{ background: screen === 'settings' ? C.gold + '22' : 'none', border: `1px solid ${screen === 'settings' ? C.gold + '55' : 'transparent'}`, borderRadius: 8, color: screen === 'settings' ? C.gold : C.textMuted, fontSize: 20, lineHeight: 1, padding: '6px 8px', cursor: 'pointer', transition: 'color 0.15s, background 0.15s' }}
-            >
+            <button onClick={() => setScreen(s => s === 'settings' ? 'analyze' : 'settings')} title="Settings"
+              style={{ background: screen === 'settings' ? C.gold + '22' : 'none', border: `1px solid ${screen === 'settings' ? C.gold + '55' : 'transparent'}`, borderRadius: 8, color: screen === 'settings' ? C.gold : C.textMuted, fontSize: 20, lineHeight: 1, padding: '6px 8px', cursor: 'pointer', transition: 'color 0.15s, background 0.15s' }}>
               ⚙️
             </button>
           </div>
-        </div>
-
-        {/* Nav pills */}
-        <div style={{ display: 'flex', gap: 6, flexWrap: 'nowrap', overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
-          {NAV_PILLS.map(({ id, label, count, countColor }) => {
-            const active = screen === id
-            return (
-              <button
-                key={id}
-                onClick={() => toggleScreen(id)}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 6,
-                  background: active ? countColor + '22' : C.surface,
-                  border: `1px solid ${active ? countColor + '55' : C.border}`,
-                  borderRadius: 20, color: active ? countColor : C.textMuted,
-                  fontSize: 13, fontWeight: active ? 600 : 400,
-                  padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
-                  transition: 'background 0.15s, color 0.15s, border-color 0.15s',
-                }}
-              >
-                {label}
-                <span style={{ fontSize: 11, fontWeight: 700, background: countColor + '33', color: countColor, borderRadius: 10, padding: '1px 6px' }}>
-                  {count}
-                </span>
-              </button>
-            )
-          })}
         </div>
       </div>
 
       {/* Share target mode prompt */}
       {sharedImage && (
         <div style={{ marginTop: 16 }}>
-          <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 6 }}>
-            What is this a photo of?
-          </div>
-          <div style={{ fontSize: 14, color: C.textMuted, marginBottom: 24 }}>
-            Choose how to use this image:
-          </div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 6 }}>What is this a photo of?</div>
+          <div style={{ fontSize: 14, color: C.textMuted, marginBottom: 24 }}>Choose how to use this image:</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <button
-              onClick={() => {
-                setMode('photo')
-                setRecipePhoto(sharedImage)
-                setSharedImage(null)
-                setScreen('main')
-              }}
-              style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, color: C.text, padding: '20px 16px', fontSize: 17, fontWeight: 600, cursor: 'pointer', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 14, transition: 'border-color 0.15s, background 0.15s' }}
+            <button onClick={() => { setMode('photo'); setRecipePhoto(sharedImage); setSharedImage(null); setScreen('analyze') }}
+              style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, color: C.text, padding: '20px 16px', fontSize: 17, fontWeight: 600, cursor: 'pointer', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 14 }}
               onMouseEnter={e => { e.currentTarget.style.borderColor = C.gold; e.currentTarget.style.background = C.gold + '12' }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.background = C.surface }}
-            >
+              onMouseLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.background = C.surface }}>
               <span style={{ fontSize: 32, lineHeight: 1 }}>📷</span>
-              <div>
-                <div>Recipe Screenshot</div>
-                <div style={{ fontSize: 13, fontWeight: 400, color: C.textMuted, marginTop: 3 }}>A screenshot or photo of a cocktail recipe</div>
-              </div>
+              <div><div>Recipe Screenshot</div><div style={{ fontSize: 13, fontWeight: 400, color: C.textMuted, marginTop: 3 }}>A screenshot or photo of a cocktail recipe</div></div>
             </button>
-            <button
-              onClick={() => {
-                setMode('menu')
-                setMenuPhoto(sharedImage)
-                setMenuStep('upload')
-                setSharedImage(null)
-                setScreen('main')
-              }}
-              style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, color: C.text, padding: '20px 16px', fontSize: 17, fontWeight: 600, cursor: 'pointer', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 14, transition: 'border-color 0.15s, background 0.15s' }}
+            <button onClick={() => { setMode('menu'); setMenuPhoto(sharedImage); setMenuStep('upload'); setSharedImage(null); setScreen('analyze') }}
+              style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, color: C.text, padding: '20px 16px', fontSize: 17, fontWeight: 600, cursor: 'pointer', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 14 }}
               onMouseEnter={e => { e.currentTarget.style.borderColor = C.gold; e.currentTarget.style.background = C.gold + '12' }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.background = C.surface }}
-            >
+              onMouseLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.background = C.surface }}>
               <span style={{ fontSize: 32, lineHeight: 1 }}>🍹</span>
-              <div>
-                <div>Bar Menu</div>
-                <div style={{ fontSize: 13, fontWeight: 400, color: C.textMuted, marginTop: 3 }}>A photo of a cocktail menu at a bar or restaurant</div>
-              </div>
+              <div><div>Bar Menu</div><div style={{ fontSize: 13, fontWeight: 400, color: C.textMuted, marginTop: 3 }}>A photo of a cocktail menu at a bar or restaurant</div></div>
             </button>
           </div>
         </div>
@@ -1592,16 +2172,7 @@ export default function App() {
 
       {/* Screen: Settings */}
       {screen === 'settings' && (
-        <SettingsScreen
-          sheetUrlInput={sheetUrlInput}
-          setSheetUrlInput={setSheetUrlInput}
-          onReload={handleReload}
-          inventoryLoading={inventoryLoading}
-          inventoryError={inventoryError}
-          inventory={inventory}
-          inStockCount={inStockCount}
-          oosCount={oosCount}
-        />
+        <SettingsScreen sheetUrlInput={sheetUrlInput} setSheetUrlInput={setSheetUrlInput} onReload={handleReload} inventoryLoading={inventoryLoading} inventoryError={inventoryError} inventory={inventory} inStockCount={inStockCount} oosCount={oosCount} />
       )}
 
       {/* Screen: Inventory */}
@@ -1609,23 +2180,34 @@ export default function App() {
         <InventoryScreen inventory={inventory} inStockCount={inStockCount} oosCount={oosCount} />
       )}
 
-      {/* Screen: Shopping List */}
+      {/* Screen: Shopping */}
       {screen === 'shopping' && (
         <ShoppingListScreen shoppingList={shoppingList} onRemove={removeFromShopping} onClear={clearShopping} />
       )}
 
-      {/* Screen: Favorites */}
-      {screen === 'favorites' && (
-        <FavoritesScreen favorites={favorites} onRemove={removeFavorite} onView={viewFavorite} onUpdateNote={updateFavoriteNote} />
+      {/* Screen: Saved */}
+      {screen === 'saved' && (
+        <SavedScreen
+          savedSubTab={savedSubTab} setSavedSubTab={setSavedSubTab}
+          toMake={toMake} inTheLabList={inTheLabList} favorites={favorites}
+          onRemoveToMake={removeFromToMake} onRemoveInTheLab={removeFromInTheLab} onRemoveFavorite={removeFavorite}
+          onViewToMake={viewToMake} onViewInTheLab={viewInTheLab} onViewFavorite={viewFavorite}
+          onUpdateNote={updateFavoriteNote}
+        />
       )}
 
-      {/* Screen: To Make */}
-      {screen === 'to-make' && (
-        <ToMakeScreen toMake={toMake} onRemove={removeFromToMake} onView={viewToMake} />
+      {/* Screen: Explorations */}
+      {screen === 'explorations' && (
+        <ExplorationsScreen
+          inventory={inventory}
+          inventoryText={inventoryText}
+          onSaveOnDeck={handleSaveOnDeckFromExploration}
+          onSaveInTheLab={handleSaveInTheLabFromExploration}
+        />
       )}
 
-      {/* Screen: Main */}
-      {screen === 'main' && (
+      {/* Screen: Analyze */}
+      {screen === 'analyze' && (
         <>
           {/* Mode tabs */}
           <div style={{ display: 'flex', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: 4, gap: 4, marginBottom: 20 }}>
@@ -1638,25 +2220,14 @@ export default function App() {
 
           {/* Mode content */}
           <div style={{ marginBottom: 16 }}>
-            {mode === 'photo' && (
-              <UploadZone file={recipePhoto} onFile={setRecipePhoto} onRemove={() => setRecipePhoto(null)} />
-            )}
+            {mode === 'photo' && <UploadZone file={recipePhoto} onFile={setRecipePhoto} onRemove={() => setRecipePhoto(null)} />}
             {mode === 'name' && (
-              <input
-                type="text"
-                value={cocktailName}
-                onChange={(e) => setCocktailName(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && canAnalyze() && handleAnalyze()}
-                placeholder="e.g. Naked and Famous"
-                autoFocus
-                style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, padding: '14px 16px', fontSize: 16, outline: 'none' }}
-              />
+              <input type="text" value={cocktailName} onChange={e => setCocktailName(e.target.value)} onKeyDown={e => e.key === 'Enter' && canAnalyze() && handleAnalyze()} placeholder="e.g. Naked and Famous" autoFocus
+                style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, padding: '14px 16px', fontSize: 16, outline: 'none' }} />
             )}
             {mode === 'menu' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                {menuStep === 'upload' && (
-                  <UploadZone file={menuPhoto} onFile={setMenuPhoto} onRemove={() => setMenuPhoto(null)} />
-                )}
+                {menuStep === 'upload' && <UploadZone file={menuPhoto} onFile={setMenuPhoto} onRemove={() => setMenuPhoto(null)} />}
                 {(menuStep === 'selecting' || menuStep === 'ready') && (
                   <>
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
@@ -1665,12 +2236,8 @@ export default function App() {
                     </div>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                       {menuCocktails.map(name => {
-                        const selected = name === menuSelectedCocktail
-                        return (
-                          <button key={name} onClick={() => { setMenuSelectedCocktail(name); setMenuStep('ready'); setResult(null); setError(null) }} style={{ background: selected ? C.gold : C.surface, border: `1px solid ${selected ? C.gold : C.border}`, borderRadius: 20, color: selected ? '#0f0f0f' : C.text, fontSize: 13, fontWeight: selected ? 700 : 400, padding: '6px 14px', cursor: 'pointer', transition: 'background 0.15s, color 0.15s, border-color 0.15s' }}>
-                            {name}
-                          </button>
-                        )
+                        const sel = name === menuSelectedCocktail
+                        return <button key={name} onClick={() => { setMenuSelectedCocktail(name); setMenuStep('ready'); setResult(null); setError(null) }} style={{ background: sel ? C.gold : C.surface, border: `1px solid ${sel ? C.gold : C.border}`, borderRadius: 20, color: sel ? '#0f0f0f' : C.text, fontSize: 13, fontWeight: sel ? 700 : 400, padding: '6px 14px', cursor: 'pointer', transition: 'background 0.15s, color 0.15s' }}>{name}</button>
                       })}
                     </div>
                     {menuStep === 'ready' && (
@@ -1685,9 +2252,8 @@ export default function App() {
                             </div>
                           ) : (
                             <label style={{ display: 'flex', alignItems: 'center', gap: 8, border: `1px dashed ${C.border}`, borderRadius: 8, padding: '10px 14px', cursor: 'pointer', color: C.textMuted, fontSize: 13 }}>
-                              <input type="file" accept="image/*" style={{ display: 'none' }} onChange={(e) => { if (e.target.files[0]) setMenuCocktailPhoto(e.target.files[0]) }} />
-                              <span style={{ fontSize: 18 }}>🍸</span>
-                              Click to add cocktail photo
+                              <input type="file" accept="image/*" style={{ display: 'none' }} onChange={e => { if (e.target.files[0]) setMenuCocktailPhoto(e.target.files[0]) }} />
+                              <span style={{ fontSize: 18 }}>🍸</span>Click to add cocktail photo
                             </label>
                           )}
                         </div>
@@ -1699,23 +2265,13 @@ export default function App() {
             )}
           </div>
 
-          {/* Analyze button */}
-          <button
-            onClick={handleAnalyze}
-            disabled={!canAnalyze()}
-            style={{ width: '100%', background: canAnalyze() ? C.gold : C.surface, border: `1px solid ${canAnalyze() ? C.gold : C.border}`, borderRadius: 10, color: canAnalyze() ? '#0f0f0f' : C.textFaint, fontWeight: 700, fontSize: 15, padding: '13px', cursor: canAnalyze() ? 'pointer' : 'default', transition: 'background 0.15s, color 0.15s, border-color 0.15s' }}
-          >
+          <button onClick={handleAnalyze} disabled={!canAnalyze()}
+            style={{ width: '100%', background: canAnalyze() ? C.gold : C.surface, border: `1px solid ${canAnalyze() ? C.gold : C.border}`, borderRadius: 10, color: canAnalyze() ? '#0f0f0f' : C.textFaint, fontWeight: 700, fontSize: 15, padding: '13px', cursor: canAnalyze() ? 'pointer' : 'default', transition: 'background 0.15s, color 0.15s, border-color 0.15s' }}>
             {loading ? loadingMsg : 'Analyze'}
           </button>
 
-          {/* Error */}
-          {error && (
-            <div style={{ background: C.red + '15', border: `1px solid ${C.red}44`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: C.red, marginTop: 16 }}>
-              {error}
-            </div>
-          )}
+          {error && <div style={{ background: C.red + '15', border: `1px solid ${C.red}44`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: C.red, marginTop: 16 }}>{error}</div>}
 
-          {/* Loading spinner */}
           {loading && (
             <div style={{ textAlign: 'center', color: C.textMuted, fontSize: 14, marginTop: 32, padding: '24px 0' }}>
               <style>{`@keyframes bcspin { to { transform: rotate(360deg); } }`}</style>
@@ -1724,15 +2280,11 @@ export default function App() {
             </div>
           )}
 
-          {/* Results */}
           {result && !loading && (
             <>
               {resultSource && (
-                <button
-                  onClick={handleBackToSource}
-                  style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0 0', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5 }}
-                >
-                  ← Back to {resultSource === 'ondeck' ? 'On Deck' : 'Favorites'}
+                <button onClick={handleBackToSource} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0 0', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5 }}>
+                  ← Back to {resultSource === 'ondeck' ? 'On Deck' : resultSource === 'inthelab' ? 'In the Lab' : 'Favorites'}
                 </button>
               )}
               <Results
@@ -1741,17 +2293,22 @@ export default function App() {
                 shoppingList={shoppingList}
                 onAddToList={addToShopping}
                 favorites={favorites}
-                onToggleFavorite={toggleFavorite}
+                onToggleFavorite={res => toggleFavorite(res, { source: analysisModeSource })}
                 toMake={toMake}
-                onToggleToMake={toggleToMake}
+                onToggleToMake={res => toggleToMake(res, { source: analysisModeSource })}
+                inTheLabList={inTheLabList}
+                onToggleInTheLab={res => toggleInTheLab(res, { source: analysisModeSource })}
                 onFeedback={handleFeedback}
                 feedbackLoading={feedbackLoading}
                 inventory={inventory}
+                isInLab={resultSource === 'inthelab'}
               />
             </>
           )}
         </>
       )}
+
+      <BottomTabBar screen={screen} onTab={setScreen} />
     </div>
   )
 }
