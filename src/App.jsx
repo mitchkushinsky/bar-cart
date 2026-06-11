@@ -154,12 +154,16 @@ async function callClaude(body) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
+  console.log('Fetch completed, status:', res.status)
+  const rawText = await res.text()
+  console.log('Raw response:', rawText)
   if (res.status === 429) throw new Error('Too many requests — wait a moment and try again.')
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
+    let err = { error: res.statusText }
+    try { err = JSON.parse(rawText) } catch (_) {}
     throw new Error(err.error || `HTTP ${res.status}`)
   }
-  const data = await res.json()
+  const data = JSON.parse(rawText)
   const textBlock = (data.content || []).filter((b) => b.type === 'text').pop()
   if (!textBlock) throw new Error('No text content in Claude response')
   return extractJSON(textBlock.text)
@@ -1428,6 +1432,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   const toggleFlavor = id => setFlavors(prev => prev.includes(id) ? prev.filter(f => f !== id) : prev.length < 3 ? [...prev, id] : prev)
 
   const handleExplore = async () => {
+    console.log('Explorations handler started')
     setStep('loading')
     try {
       const data = await analyzeExplorations(selected, style, flavors, lowABV, inventoryText)
