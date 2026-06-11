@@ -154,22 +154,15 @@ async function callClaude(body) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
-  console.log('Fetch completed, status:', res.status)
-  const rawText = await res.text()
-  console.log('Raw response:', rawText)
   if (res.status === 429) throw new Error('Too many requests — wait a moment and try again.')
   if (!res.ok) {
-    let err = { error: res.statusText }
-    try { err = JSON.parse(rawText) } catch (_) {}
+    const err = await res.json().catch(() => ({ error: res.statusText }))
     throw new Error(err.error || `HTTP ${res.status}`)
   }
-  const data = JSON.parse(rawText)
+  const data = await res.json()
   const textBlock = (data.content || []).filter((b) => b.type === 'text').pop()
-  console.log('Text block found:', textBlock)
-  const text = textBlock?.text || ''
-  console.log('Raw text:', text)
   if (!textBlock) throw new Error('No text content in Claude response')
-  return extractJSON(text)
+  return extractJSON(textBlock.text)
 }
 
 function fileToBase64(file) {
@@ -406,10 +399,7 @@ Return ONLY valid JSON with no markdown fences:
 }`,
     }],
   }
-  const result = await callClaude(body)
-  console.log('callClaude returned:', result)
-  console.log('Result type:', typeof result)
-  return result
+  return callClaude(body)
 }
 
 // ─── Shared small components ──────────────────────────────────────────────────
@@ -1438,7 +1428,6 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   const toggleFlavor = id => setFlavors(prev => prev.includes(id) ? prev.filter(f => f !== id) : prev.length < 3 ? [...prev, id] : prev)
 
   const handleExplore = async () => {
-    console.log('Explorations handler started')
     setStep('loading')
     try {
       const data = await analyzeExplorations(selected, style, flavors, lowABV, inventoryText)
