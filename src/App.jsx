@@ -165,8 +165,11 @@ async function callClaude(body) {
   }
   const data = JSON.parse(rawText)
   const textBlock = (data.content || []).filter((b) => b.type === 'text').pop()
+  console.log('Text block found:', textBlock)
+  const text = textBlock?.text || ''
+  console.log('Raw text:', text)
   if (!textBlock) throw new Error('No text content in Claude response')
-  return extractJSON(textBlock.text)
+  return extractJSON(text)
 }
 
 function fileToBase64(file) {
@@ -403,7 +406,10 @@ Return ONLY valid JSON with no markdown fences:
 }`,
     }],
   }
-  return callClaude(body)
+  const result = await callClaude(body)
+  console.log('callClaude returned:', result)
+  console.log('Result type:', typeof result)
+  return result
 }
 
 // ─── Shared small components ──────────────────────────────────────────────────
