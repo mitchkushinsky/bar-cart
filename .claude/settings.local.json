@@ -9,7 +9,10 @@
       "Bash(git branch:*)",
       "Bash(git push:*)",
       "Bash(ls:*)",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Bash(git -C /Users/mitchellkushinsky/bar-cart log --all --oneline --grep=\"fitbit\\\\|vitamin\\\\|nutrition\\\\|food\\\\|nutrient\" -i)",
+      "Bash(git -C /Users/mitchellkushinsky/bar-cart log --all --oneline)",
+      "Bash(git *)"
     ]
   }
 }

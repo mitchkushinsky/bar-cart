@@ -399,7 +399,25 @@ Return ONLY valid JSON with no markdown fences:
 }`,
     }],
   }
-  return callClaude(body)
+  const firstText = await callClaudeText(body)
+  try {
+    return extractJSON(firstText)
+  } catch (_) {
+    const retryText = await callClaudeText({
+      model: MODEL,
+      max_tokens: 3000,
+      messages: [
+        body.messages[0],
+        { role: 'assistant', content: firstText },
+        { role: 'user', content: 'Your previous response was cut off or invalid JSON. Please return ONLY the complete valid JSON object, no other text.' },
+      ],
+    })
+    try {
+      return extractJSON(retryText)
+    } catch (_) {
+      throw new Error('The response was too large to process. Try selecting fewer flavor profile options or a single ingredient.')
+    }
+  }
 }
 
 // ─── Shared small components ──────────────────────────────────────────────────
