@@ -1901,8 +1901,6 @@ export default function App() {
 
   // In the Lab helpers
   const toggleInTheLab = async (res, extras = {}) => {
-    console.log('Saving to lab:', res)
-    console.log('User:', user)
     const { source = 'manual', originFlag = null, difficulty = null, primaryIngredients = [] } = extras
     if (user) {
       const existing = inTheLabList.find(f => f.recipeName === res.recipe_name)
@@ -1918,9 +1916,8 @@ export default function App() {
             glass_type: res.glass_type || null, source, origin_flag: originFlag,
             difficulty, primary_ingredients: primaryIngredients, saved_at: new Date().toISOString(),
           }).select().single()
-          console.log('Insert result:', data, 'Error:', error)
           if (!error && data) setInTheLabList(prev => [dbInTheLabToLocal(data), ...prev])
-        } catch (e) { console.log('Insert threw:', e) }
+        } catch (_) {}
       }
     } else {
       setInTheLabList(prev => {
