@@ -366,12 +366,16 @@ First check if the featured ingredients fundamentally clash in cocktail contexts
 
 Otherwise suggest 3–5 cocktails. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
 
+Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false (something worth buying an ingredient for), unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists.
+
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+
 Return ONLY valid JSON with no markdown fences:
 {
   "incompatible": false,
   "incompatibility_reason": null,
   "flavor_profile_note": "1-2 sentences on why these ingredients work together",
-  "pairs_well_with": "Brief note on flavor categories and ingredient types that complement the selected ingredient(s) — e.g. citrus, stone fruit, herbal bitters, floral spirits, smoky/peaty notes",
+  "pairs_well_with": "2-3 strongest flavor affinities only — one short sentence, not an exhaustive list",
   "suggestions": [
     {
       "recipe_name": "string",
@@ -445,13 +449,41 @@ Previous suggestions shown to the user: ${previousNames.join(', ')}
 
 The user provided feedback on the previous suggestions: "${feedbackText}". Based on this feedback, return a revised set of suggestions. If the feedback asks for 'more' or 'additional' results, include new suggestions not previously shown. If the feedback asks for something 'different' or describes a change to a specific recipe, revise accordingly. Return the same JSON structure as before, including updated flavor_profile_note and pairs_well_with if relevant.
 
+Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false, unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists.
+
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+
 Return ONLY valid JSON with no markdown fences:
 {
   "incompatible": false,
   "incompatibility_reason": null,
-  "flavor_profile_note": "...",
-  "pairs_well_with": "...",
-  "suggestions": [ ... same schema as original ... ]
+  "flavor_profile_note": "1-2 sentences on why these ingredients work together",
+  "pairs_well_with": "2-3 strongest flavor affinities only — one short sentence, not an exhaustive list",
+  "suggestions": [
+    {
+      "recipe_name": "string",
+      "origin_flag": "from_recipe | original",
+      "difficulty": "easy | medium | hard",
+      "difficulty_note": "One sentence explaining difficulty",
+      "can_make_now": true,
+      "missing_ingredients": [],
+      "summary": "1-2 sentence description",
+      "recipe": [{ "ingredient": "string", "amount": "string" }],
+      "instructions": "string",
+      "glass_type": "coupe | rocks | tiki | collins | null",
+      "ingredients": [
+        {
+          "ingredient": "string",
+          "status": "found | substitute | missing",
+          "location": "string or null",
+          "substitute": "string or null",
+          "substitute_location": "string or null",
+          "flavor_impact": "string or null"
+        }
+      ],
+      "technique_notes": "string or null"
+    }
+  ]
 }`,
     }],
   }
@@ -1454,11 +1486,13 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
     }
   }
 
+  console.log('Rendering suggestion:', JSON.stringify(suggestion))
+
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
       <div style={{ marginBottom: 8 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 5 }}>
-          <span style={{ fontWeight: 700, fontSize: 16, color: C.gold }}>{displayed.recipe_name}</span>
+          <span style={{ fontWeight: 700, fontSize: 16, color: C.gold }}>{displayed.recipe_name || 'Untitled suggestion'}</span>
           {displayed.glass_type && <GlassIcon type={displayed.glass_type} />}
         </div>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 4 }}>
@@ -1500,7 +1534,7 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
           )}
           {displayed.ingredients && displayed.ingredients.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-              {displayed.ingredients.map((ing, i) => (
+              {displayed.ingredients.filter(ing => ing.ingredient).map((ing, i) => (
                 <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13 }}>
                   <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: ing.status === 'found' ? C.green : ing.status === 'substitute' ? C.amber : C.red, flexShrink: 0, marginTop: 4 }} />
                   <div>
