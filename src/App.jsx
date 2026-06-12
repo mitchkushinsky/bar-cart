@@ -371,6 +371,7 @@ Return ONLY valid JSON with no markdown fences:
   "incompatible": false,
   "incompatibility_reason": null,
   "flavor_profile_note": "1-2 sentences on why these ingredients work together",
+  "pairs_well_with": "Brief note on flavor categories and ingredient types that complement the selected ingredient(s) — e.g. citrus, stone fruit, herbal bitters, floral spirits, smoky/peaty notes",
   "suggestions": [
     {
       "recipe_name": "string",
@@ -417,6 +418,94 @@ Return ONLY valid JSON with no markdown fences:
     } catch (_) {
       throw new Error('The response was too large to process. Try selecting fewer flavor profile options or a single ingredient.')
     }
+  }
+}
+
+async function refineExplorations(ingredients, style, flavors, lowABV, inventoryText, previousNames, feedbackText) {
+  const body = {
+    model: MODEL,
+    max_tokens: 3000,
+    messages: [{
+      role: 'user',
+      content: `You are an expert craft bartender helping someone explore cocktail possibilities.
+
+Today's date is ${TODAY}.
+
+FEATURED INGREDIENTS: ${ingredients.join(' and ')}
+COCKTAIL STYLE: ${style}
+FLAVOR PREFERENCES: ${flavors.length > 0 ? flavors.join(', ') : 'No specific preference'}
+LOW ALCOHOL: ${lowABV ? 'Yes — prioritize lower ABV options' : 'No preference'}
+
+BAR INVENTORY:
+${inventoryText}
+
+SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated. Simple syrup — 2–4 weeks room temp. Amaro — 6–12 months. Commercial liqueurs — 6+ months.
+
+Previous suggestions shown to the user: ${previousNames.join(', ')}
+
+The user provided feedback on the previous suggestions: "${feedbackText}". Based on this feedback, return a revised set of suggestions. If the feedback asks for 'more' or 'additional' results, include new suggestions not previously shown. If the feedback asks for something 'different' or describes a change to a specific recipe, revise accordingly. Return the same JSON structure as before, including updated flavor_profile_note and pairs_well_with if relevant.
+
+Return ONLY valid JSON with no markdown fences:
+{
+  "incompatible": false,
+  "incompatibility_reason": null,
+  "flavor_profile_note": "...",
+  "pairs_well_with": "...",
+  "suggestions": [ ... same schema as original ... ]
+}`,
+    }],
+  }
+  const firstText = await callClaudeText(body)
+  try {
+    return extractJSON(firstText)
+  } catch (_) {
+    const retryText = await callClaudeText({
+      model: MODEL,
+      max_tokens: 3000,
+      messages: [
+        body.messages[0],
+        { role: 'assistant', content: firstText },
+        { role: 'user', content: 'Your previous response was cut off or invalid JSON. Please return ONLY the complete valid JSON object, no other text.' },
+      ],
+    })
+    try {
+      return extractJSON(retryText)
+    } catch (_) {
+      throw new Error('The response was too large to process. Try selecting fewer flavor profile options or a single ingredient.')
+    }
+  }
+}
+
+async function tweakSingleSuggestion(suggestion, feedbackText) {
+  const body = {
+    model: MODEL,
+    max_tokens: 1500,
+    messages: [{
+      role: 'user',
+      content: `You are an expert craft bartender. The user wants this specific cocktail suggestion adjusted.
+
+Current suggestion:
+${JSON.stringify(suggestion, null, 2)}
+
+The user's feedback: "${feedbackText}"
+
+Return a revised version of just this one suggestion in the same JSON structure as a single suggestion object. Return ONLY valid JSON with no markdown fences — a single object, not an array.`,
+    }],
+  }
+  const firstText = await callClaudeText(body)
+  try {
+    return extractJSON(firstText)
+  } catch (_) {
+    const retryText = await callClaudeText({
+      model: MODEL,
+      max_tokens: 1500,
+      messages: [
+        body.messages[0],
+        { role: 'assistant', content: firstText },
+        { role: 'user', content: 'Your previous response was cut off or invalid JSON. Please return ONLY the complete valid JSON object for the single suggestion, no other text.' },
+      ],
+    })
+    return extractJSON(retryText)
   }
 }
 
@@ -1331,33 +1420,55 @@ function IngredientSearch({ inventory, selected, onSelect, onRemove }) {
 function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, onSaveInTheLab }) {
   const [expanded, setExpanded] = useState(false)
   const [savedTo, setSavedTo] = useState(null) // null | 'ondeck' | 'inthelab'
+  const [tweakedSuggestion, setTweakedSuggestion] = useState(null)
+  const [isTweaking, setIsTweaking] = useState(false)
+  const [tweakText, setTweakText] = useState('')
+  const [isTweakLoading, setIsTweakLoading] = useState(false)
+  const [tweakDone, setTweakDone] = useState(false)
+  const [tweakError, setTweakError] = useState(null)
 
-  const diffColor = suggestion.difficulty === 'easy' ? C.green : suggestion.difficulty === 'medium' ? C.amber : C.red
+  const displayed = tweakedSuggestion || suggestion
 
   const handleOnDeck = () => {
-    onSaveOnDeck(suggestion, primaryIngredients)
+    onSaveOnDeck(displayed, primaryIngredients)
     setSavedTo('ondeck')
   }
   const handleInLab = () => {
-    onSaveInTheLab(suggestion, primaryIngredients)
+    onSaveInTheLab(displayed, primaryIngredients)
     setSavedTo('inthelab')
+  }
+  const handleTweakSubmit = async () => {
+    if (!tweakText.trim() || isTweakLoading) return
+    setIsTweakLoading(true)
+    setTweakError(null)
+    try {
+      const revised = await tweakSingleSuggestion(displayed, tweakText.trim())
+      setTweakedSuggestion(revised)
+      setTweakDone(true)
+      setIsTweaking(false)
+      setTweakText('')
+    } catch (err) {
+      setTweakError(err.message || 'Could not tweak this suggestion. Please try again.')
+    } finally {
+      setIsTweakLoading(false)
+    }
   }
 
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
       <div style={{ marginBottom: 8 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 5 }}>
-          <span style={{ fontWeight: 700, fontSize: 16, color: C.gold }}>{suggestion.recipe_name}</span>
-          {suggestion.glass_type && <GlassIcon type={suggestion.glass_type} />}
+          <span style={{ fontWeight: 700, fontSize: 16, color: C.gold }}>{displayed.recipe_name}</span>
+          {displayed.glass_type && <GlassIcon type={displayed.glass_type} />}
         </div>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 4 }}>
-          <OriginBadge originFlag={suggestion.origin_flag} />
-          <DifficultyBadge difficulty={suggestion.difficulty} />
+          <OriginBadge originFlag={displayed.origin_flag} />
+          <DifficultyBadge difficulty={displayed.difficulty} />
         </div>
-        {suggestion.difficulty_note && <div style={{ fontSize: 12, color: C.textFaint, marginTop: 2 }}>{suggestion.difficulty_note}</div>}
+        {displayed.difficulty_note && <div style={{ fontSize: 12, color: C.textFaint, marginTop: 2 }}>{displayed.difficulty_note}</div>}
       </div>
 
-      {suggestion.summary && <p style={{ fontSize: 14, color: C.textMuted, lineHeight: 1.55, marginBottom: 10 }}>{suggestion.summary}</p>}
+      {displayed.summary && <p style={{ fontSize: 14, color: C.textMuted, lineHeight: 1.55, marginBottom: 10 }}>{displayed.summary}</p>}
 
       <button onClick={() => setExpanded(e => !e)}
         style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0, marginBottom: expanded ? 12 : 0 }}>
@@ -1366,30 +1477,30 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
 
       {expanded && (
         <div>
-          {suggestion.recipe && suggestion.recipe.length > 0 && (
+          {displayed.recipe && displayed.recipe.length > 0 && (
             <div style={{ background: C.bg, borderRadius: 8, padding: '12px 14px', marginBottom: 10 }}>
               <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>Recipe</div>
               <ul style={{ listStyle: 'none' }}>
-                {suggestion.recipe.map((r, i) => (
-                  <li key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', borderBottom: i < suggestion.recipe.length - 1 ? `1px solid ${C.border}` : 'none', gap: 12 }}>
+                {displayed.recipe.map((r, i) => (
+                  <li key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', borderBottom: i < displayed.recipe.length - 1 ? `1px solid ${C.border}` : 'none', gap: 12 }}>
                     <span style={{ fontSize: 14 }}>{r.ingredient}</span>
                     <span style={{ fontSize: 13, color: C.gold, fontWeight: 500, whiteSpace: 'nowrap' }}>{r.amount}</span>
                   </li>
                 ))}
               </ul>
-              {suggestion.instructions && (
-                <p style={{ fontSize: 13, color: C.textMuted, marginTop: 10, lineHeight: 1.6, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>{suggestion.instructions}</p>
+              {displayed.instructions && (
+                <p style={{ fontSize: 13, color: C.textMuted, marginTop: 10, lineHeight: 1.6, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>{displayed.instructions}</p>
               )}
             </div>
           )}
-          {suggestion.technique_notes && (
+          {displayed.technique_notes && (
             <div style={{ fontSize: 13, color: C.amber, background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 8, padding: '8px 12px', marginBottom: 10 }}>
-              🔧 {suggestion.technique_notes}
+              🔧 {displayed.technique_notes}
             </div>
           )}
-          {suggestion.ingredients && suggestion.ingredients.length > 0 && (
+          {displayed.ingredients && displayed.ingredients.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-              {suggestion.ingredients.map((ing, i) => (
+              {displayed.ingredients.map((ing, i) => (
                 <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13 }}>
                   <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: ing.status === 'found' ? C.green : ing.status === 'substitute' ? C.amber : C.red, flexShrink: 0, marginTop: 4 }} />
                   <div>
@@ -1419,6 +1530,46 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
           <button style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textFaint, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>👎 Archive</button>
         </div>
       )}
+
+      <div style={{ marginTop: 10, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
+        {tweakDone && !isTweaking && (
+          <div style={{ fontSize: 12, color: C.green, marginBottom: 6 }}>✓ Tweaked</div>
+        )}
+        {!isTweaking ? (
+          <button onClick={() => { setIsTweaking(true); setTweakDone(false) }}
+            style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0 }}>
+            ✏️ Tweak this
+          </button>
+        ) : (
+          <div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <input
+                type="text"
+                value={tweakText}
+                onChange={e => setTweakText(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && handleTweakSubmit()}
+                placeholder="e.g. make it less sweet, use bourbon instead"
+                disabled={isTweakLoading}
+                autoFocus
+                style={{ flex: 1, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 12, padding: '7px 10px', outline: 'none', opacity: isTweakLoading ? 0.5 : 1 }}
+              />
+              <button
+                onClick={handleTweakSubmit}
+                disabled={!tweakText.trim() || isTweakLoading}
+                style={{ background: tweakText.trim() && !isTweakLoading ? C.gold : C.surface, border: `1px solid ${tweakText.trim() && !isTweakLoading ? C.gold : C.border}`, borderRadius: 6, color: tweakText.trim() && !isTweakLoading ? '#0f0f0f' : C.textFaint, fontSize: 12, fontWeight: 600, padding: '7px 12px', cursor: tweakText.trim() && !isTweakLoading ? 'pointer' : 'default', transition: 'background 0.15s, color 0.15s', whiteSpace: 'nowrap' }}>
+                {isTweakLoading ? '…' : 'Tweak'}
+              </button>
+              <button
+                onClick={() => { setIsTweaking(false); setTweakText(''); setTweakError(null) }}
+                disabled={isTweakLoading}
+                style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 6, color: C.textFaint, fontSize: 12, padding: '7px 10px', cursor: isTweakLoading ? 'default' : 'pointer' }}>
+                ✕
+              </button>
+            </div>
+            {tweakError && <div style={{ fontSize: 12, color: C.red, marginTop: 6 }}>{tweakError}</div>}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -1431,6 +1582,11 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   const [lowABV, setLowABV] = useState(false)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
+  const [feedback, setFeedback] = useState('')
+  const [isFeedbackLoading, setIsFeedbackLoading] = useState(false)
+  const [feedbackError, setFeedbackError] = useState(null)
+  const [feedbackBanner, setFeedbackBanner] = useState(false)
+  const feedbackBannerRef = useRef(null)
 
   const STYLES = [
     { id: 'Stirred', emoji: '🥃' }, { id: 'On the Rocks', emoji: '🧊' },
@@ -1455,7 +1611,26 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     }
   }
 
-  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null) }
+  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false) }
+
+  const handleFeedback = async () => {
+    if (!feedback.trim() || isFeedbackLoading) return
+    setIsFeedbackLoading(true)
+    setFeedbackError(null)
+    try {
+      const previousNames = (result?.suggestions || []).map(s => s.recipe_name)
+      const data = await refineExplorations(selected, style, flavors, lowABV, inventoryText, previousNames, feedback.trim())
+      setResult(data)
+      setFeedback('')
+      setFeedbackBanner(true)
+      setTimeout(() => feedbackBannerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50)
+      setTimeout(() => setFeedbackBanner(false), 4000)
+    } catch (err) {
+      setFeedbackError(err.message || 'Something went wrong. Please try again.')
+    } finally {
+      setIsFeedbackLoading(false)
+    }
+  }
 
   if (step === 'ingredients') return (
     <div>
@@ -1556,8 +1731,14 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
           <button onClick={reset} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap' }}>Start over</button>
         </div>
         {result.flavor_profile_note && (
-          <div style={{ background: C.gold + '12', border: `1px solid ${C.gold}33`, borderRadius: 10, padding: '12px 16px', marginBottom: 24, fontSize: 14, color: C.text, lineHeight: 1.6 }}>
+          <div style={{ background: C.gold + '12', border: `1px solid ${C.gold}33`, borderRadius: 10, padding: '12px 16px', marginBottom: result.pairs_well_with ? 8 : 24, fontSize: 14, color: C.text, lineHeight: 1.6 }}>
             ✨ {result.flavor_profile_note}
+          </div>
+        )}
+        {result.pairs_well_with && (
+          <div style={{ background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 10, padding: '12px 16px', marginBottom: 24, fontSize: 14, color: C.text, lineHeight: 1.6 }}>
+            <div style={{ fontWeight: 600, color: C.amber, marginBottom: 4 }}>🔗 Pairs Well With</div>
+            {result.pairs_well_with}
           </div>
         )}
         {canMake.length > 0 && (
@@ -1569,13 +1750,41 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
           </div>
         )}
         {worthBuying.length > 0 && (
-          <div>
+          <div style={{ marginBottom: 28 }}>
             <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Worth Buying For ({worthBuying.length})</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} />)}
             </div>
           </div>
         )}
+        <div ref={feedbackBannerRef}>
+          {feedbackBanner && (
+            <div style={{ background: C.green + '15', border: `1px solid ${C.green}44`, borderRadius: 10, padding: '10px 16px', marginBottom: 16, fontSize: 14, color: C.green }}>
+              ✓ Updated based on your feedback
+            </div>
+          )}
+        </div>
+        <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 20 }}>
+          <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 10 }}>Want different results? Tell us what you're looking for:</div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input
+              type="text"
+              value={feedback}
+              onChange={e => setFeedback(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && handleFeedback()}
+              placeholder="e.g. more stone fruit, less sweet, something with mezcal instead"
+              disabled={isFeedbackLoading}
+              style={{ flex: 1, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 13, padding: '10px 14px', outline: 'none', opacity: isFeedbackLoading ? 0.5 : 1 }}
+            />
+            <button
+              onClick={handleFeedback}
+              disabled={!feedback.trim() || isFeedbackLoading}
+              style={{ background: feedback.trim() && !isFeedbackLoading ? C.gold : C.surface, border: `1px solid ${feedback.trim() && !isFeedbackLoading ? C.gold : C.border}`, borderRadius: 8, color: feedback.trim() && !isFeedbackLoading ? '#0f0f0f' : C.textFaint, fontSize: 13, fontWeight: 600, padding: '10px 16px', cursor: feedback.trim() && !isFeedbackLoading ? 'pointer' : 'default', whiteSpace: 'nowrap', transition: 'background 0.15s, color 0.15s' }}>
+              {isFeedbackLoading ? '…' : 'Refine'}
+            </button>
+          </div>
+          {feedbackError && <div style={{ fontSize: 13, color: C.red, marginTop: 8 }}>{feedbackError}</div>}
+        </div>
       </div>
     )
   }
