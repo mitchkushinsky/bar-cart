@@ -1,4 +1,19 @@
 // SUPABASE MIGRATION REQUIRED (run in Supabase SQL editor):
+// create table if not exists explorations_history (
+//   id uuid default gen_random_uuid() primary key,
+//   user_id uuid references auth.users not null,
+//   search_key text not null,
+//   primary_ingredients text[] not null default '{}',
+//   cocktail_style text not null,
+//   flavor_profile text[] not null default '{}',
+//   low_abv boolean not null default false,
+//   result jsonb not null,
+//   updated_at timestamptz default now(),
+//   unique(user_id, search_key)
+// );
+// alter table explorations_history enable row level security;
+// create policy "Users own their explorations history" on explorations_history for all using (auth.uid() = user_id);
+//
 // alter table favorites add column if not exists source text default 'manual';
 // alter table favorites add column if not exists origin_flag text;
 // alter table favorites add column if not exists difficulty text;
@@ -1449,6 +1464,60 @@ function IngredientSearch({ inventory, selected, onSelect, onRemove }) {
   )
 }
 
+// ─── Exploration history helpers ─────────────────────────────────────────────
+
+const EXPLORATION_LS_KEY = 'bar-cart-explorations-history'
+const EXPLORATION_HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
+
+const EXPLORATION_STYLE_EMOJI = {
+  'Stirred': '🥃', 'On the Rocks': '🧊', 'Shaken / Sours': '🍋',
+  'Highball': '🫧', 'Tiki / Swizzle': '🌺', 'Warm Drink': '☕',
+}
+
+function makeExplorationKey(ingredients, style, flavors, lowABV) {
+  return [[...ingredients].sort().join(','), style, [...flavors].sort().join(','), String(lowABV)].join('|')
+}
+
+function relativeTime(iso) {
+  const diff = Date.now() - new Date(iso).getTime()
+  const mins = Math.floor(diff / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days === 1) return 'yesterday'
+  return `${days} days ago`
+}
+
+function loadLocalExplorationHistory() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(EXPLORATION_LS_KEY)) || []
+    const cutoff = Date.now() - EXPLORATION_HISTORY_MAX_AGE_MS
+    return raw.filter(e => new Date(e.updated_at).getTime() > cutoff)
+  } catch { return [] }
+}
+
+function saveLocalExplorationHistory(entries) {
+  try { localStorage.setItem(EXPLORATION_LS_KEY, JSON.stringify(entries)) } catch {}
+}
+
+function upsertLocalExplorationHistory(entry) {
+  let entries = loadLocalExplorationHistory()
+  const idx = entries.findIndex(e => e.search_key === entry.search_key)
+  if (idx >= 0) { entries[idx] = entry } else { entries.unshift(entry) }
+  entries.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
+  const pruned = entries.slice(0, 20)
+  saveLocalExplorationHistory(pruned)
+  return pruned
+}
+
+function removeLocalExplorationHistory(searchKey) {
+  const entries = loadLocalExplorationHistory().filter(e => e.search_key !== searchKey)
+  saveLocalExplorationHistory(entries)
+  return entries
+}
+
 function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, onSaveInTheLab }) {
   const [expanded, setExpanded] = useState(false)
   const [savedTo, setSavedTo] = useState(null) // null | 'ondeck' | 'inthelab'
@@ -1608,7 +1677,7 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
   )
 }
 
-function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTheLab }) {
+function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTheLab, user }) {
   const [step, setStep] = useState('ingredients')
   const [selected, setSelected] = useState([])
   const [style, setStyle] = useState(null)
@@ -1621,6 +1690,74 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   const [feedbackError, setFeedbackError] = useState(null)
   const [feedbackBanner, setFeedbackBanner] = useState(false)
   const feedbackBannerRef = useRef(null)
+  const [history, setHistory] = useState([])
+
+  useEffect(() => {
+    const load = async () => {
+      if (user) {
+        const cutoff = new Date(Date.now() - EXPLORATION_HISTORY_MAX_AGE_MS).toISOString()
+        await supabase.from('explorations_history').delete().eq('user_id', user.id).lt('updated_at', cutoff)
+        const { data } = await supabase
+          .from('explorations_history')
+          .select('search_key,primary_ingredients,cocktail_style,flavor_profile,low_abv,result,updated_at')
+          .eq('user_id', user.id)
+          .order('updated_at', { ascending: false })
+          .limit(20)
+        if (data) setHistory(data)
+      } else {
+        setHistory(loadLocalExplorationHistory())
+      }
+    }
+    load()
+  }, [user?.id])
+
+  const upsertHistory = (ingredients, searchStyle, searchFlavors, searchLowABV, searchResult) => {
+    const entry = {
+      search_key: makeExplorationKey(ingredients, searchStyle, searchFlavors, searchLowABV),
+      primary_ingredients: [...ingredients].sort(),
+      cocktail_style: searchStyle,
+      flavor_profile: [...searchFlavors].sort(),
+      low_abv: searchLowABV,
+      result: searchResult,
+      updated_at: new Date().toISOString(),
+    }
+    if (user) {
+      supabase.from('explorations_history').upsert(
+        { user_id: user.id, ...entry },
+        { onConflict: 'user_id,search_key' }
+      ).then()
+    }
+    setHistory(prev => {
+      const filtered = prev.filter(e => e.search_key !== entry.search_key)
+      const updated = [entry, ...filtered].sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at)).slice(0, 20)
+      if (!user) saveLocalExplorationHistory(updated)
+      return updated
+    })
+  }
+
+  const handleRemoveHistory = (searchKey) => {
+    if (user) {
+      supabase.from('explorations_history').delete().eq('user_id', user.id).eq('search_key', searchKey).then()
+    }
+    setHistory(prev => {
+      const updated = prev.filter(e => e.search_key !== searchKey)
+      if (!user) saveLocalExplorationHistory(updated)
+      return updated
+    })
+  }
+
+  const restoreFromHistory = (entry) => {
+    setSelected(entry.primary_ingredients)
+    setStyle(entry.cocktail_style)
+    setFlavors(entry.flavor_profile)
+    setLowABV(entry.low_abv)
+    setResult(entry.result)
+    setError(null)
+    setFeedback('')
+    setFeedbackError(null)
+    setFeedbackBanner(false)
+    setStep('results')
+  }
 
   const STYLES = [
     { id: 'Stirred', emoji: '🥃' }, { id: 'On the Rocks', emoji: '🧊' },
@@ -1639,9 +1776,12 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     setStep('loading')
     try {
       const data = await analyzeExplorations(selected, style, flavors, lowABV, inventoryText)
-      setResult(data); setStep('results')
+      setResult(data)
+      setStep('results')
+      if (!data.incompatible) upsertHistory(selected, style, flavors, lowABV, data)
     } catch (err) {
-      setError(err.message || 'Something went wrong. Please try again.'); setStep('error')
+      setError(err.message || 'Something went wrong. Please try again.')
+      setStep('error')
     }
   }
 
@@ -1659,6 +1799,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
       setFeedbackBanner(true)
       setTimeout(() => feedbackBannerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50)
       setTimeout(() => setFeedbackBanner(false), 4000)
+      upsertHistory(selected, style, flavors, lowABV, data)
     } catch (err) {
       setFeedbackError(err.message || 'Something went wrong. Please try again.')
     } finally {
@@ -1670,6 +1811,29 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     <div>
       <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 4 }}>Explorations</div>
       <div style={{ fontSize: 14, color: C.textMuted, marginBottom: 24, lineHeight: 1.55 }}>Pick up to 2 ingredients and we'll suggest cocktails you can make — or inspire you to try something new.</div>
+      {history.length > 0 && (
+        <div style={{ marginBottom: 24 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>Recent Searches</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {history.map((entry, i) => (
+              <div key={entry.search_key || i}
+                style={{ display: 'flex', alignItems: 'center', gap: 10, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', cursor: 'pointer' }}
+                onClick={() => restoreFromHistory(entry)}>
+                <span style={{ fontSize: 18, flexShrink: 0 }}>{EXPLORATION_STYLE_EMOJI[entry.cocktail_style] || '✨'}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.primary_ingredients.join(' + ')}</div>
+                  <div style={{ fontSize: 11, color: C.textFaint, marginTop: 1 }}>{entry.cocktail_style} · {relativeTime(entry.updated_at)}</div>
+                </div>
+                <button
+                  onClick={e => { e.stopPropagation(); handleRemoveHistory(entry.search_key) }}
+                  style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 14, cursor: 'pointer', padding: '2px 6px', flexShrink: 0 }}>
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <IngredientSearch inventory={inventory} selected={selected} onSelect={ing => setSelected(p => [...p, ing])} onRemove={ing => setSelected(p => p.filter(i => i !== ing))} />
       {selected.length > 0 && (
         <button onClick={() => setStep('prefs')} style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: 'pointer', marginTop: 24 }}>
@@ -2464,6 +2628,7 @@ export default function App() {
           inventoryText={inventoryText}
           onSaveOnDeck={handleSaveOnDeckFromExploration}
           onSaveInTheLab={handleSaveInTheLabFromExploration}
+          user={user}
         />
       )}
 
