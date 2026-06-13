@@ -861,7 +861,7 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
       {/* Action buttons */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
         <button
-          onClick={() => onToggleToMake(result)}
+          onClick={() => { console.log('On Deck clicked', result); onToggleToMake(result) }}
           style={{ background: 'none', border: `1px solid ${isToMake ? C.blue : C.border}`, borderRadius: 20, color: isToMake ? C.blue : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
         >
           {isToMake ? '🍹 Saved to On Deck' : '🍹 On Deck'}
