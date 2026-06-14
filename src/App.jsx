@@ -137,6 +137,17 @@ function inventoryToText(items) {
 
 // ─── Claude API ───────────────────────────────────────────────────────────────
 
+function stripCiteTags(val) {
+  if (typeof val === 'string') return val.replace(/<cite[^>]*>(.*?)<\/cite>/gs, '$1')
+  if (Array.isArray(val)) return val.map(stripCiteTags)
+  if (val && typeof val === 'object') {
+    const out = {}
+    for (const k of Object.keys(val)) out[k] = stripCiteTags(val[k])
+    return out
+  }
+  return val
+}
+
 function extractJSON(text) {
   const t = text.trim()
   try { return JSON.parse(t) } catch (_) { /* fall through */ }
@@ -440,6 +451,8 @@ async function analyzeExplorationsOriginals(ingredients, style, flavors, lowABV,
       role: 'user',
       content: `You are an expert craft bartender inventing ORIGINAL creative cocktails. Do NOT look up or reference published recipes — these should be entirely your own creative inventions. Set origin_flag: "original" for ALL suggestions. Think like a creative craft bartender — suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate.
 
+The primary ingredient(s) for this exploration are: ${ingredients.join(', ')}. Use these exact names when referencing them in your response.
+
 Today's date is ${TODAY}.
 
 FEATURED INGREDIENTS: ${ingredients.join(' and ')}
@@ -539,25 +552,25 @@ async function analyzeExplorations(ingredients, style, flavors, lowABV, inventor
 
   if (allSuggestions.length === 0) {
     return {
-      result: {
+      result: stripCiteTags({
         incompatible: true,
         incompatibility_reason: primaryData.incompatibility_reason,
         flavor_profile_note: null,
         pairs_well_with: null,
         suggestions: [],
-      },
+      }),
       partialSource,
     }
   }
 
   return {
-    result: {
+    result: stripCiteTags({
       incompatible: false,
       incompatibility_reason: null,
       flavor_profile_note: recipeData?.flavor_profile_note || originalData?.flavor_profile_note || null,
       pairs_well_with: recipeData?.pairs_well_with || originalData?.pairs_well_with || null,
       suggestions: allSuggestions,
-    },
+    }),
     partialSource,
   }
 }
