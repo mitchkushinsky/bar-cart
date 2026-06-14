@@ -985,7 +985,7 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
   }
 
   return (
-    <div style={{ marginTop: 36 }}>
+    <div style={{ marginTop: 36, opacity: feedbackLoading ? 0.5 : 1, transition: 'opacity 0.3s', pointerEvents: feedbackLoading ? 'none' : 'auto' }}>
       {/* Name */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
         <h2 style={{ fontSize: 26, fontWeight: 800, color: C.gold, letterSpacing: '-0.03em', lineHeight: 1.2, margin: 0 }}>
@@ -1093,7 +1093,9 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
 
       {/* Feedback */}
       <div style={{ marginTop: 32, paddingTop: 24, borderTop: `1px solid ${C.border}` }}>
-        <div style={{ fontSize: 13, color: C.textFaint, marginBottom: 10 }}>Something off? Describe what to adjust:</div>
+        <div style={{ fontSize: 13, color: C.textFaint, marginBottom: 10 }}>
+          {feedbackLoading ? 'Revising based on your feedback…' : 'Something off? Describe what to adjust:'}
+        </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <input
             type="text"
@@ -1106,9 +1108,10 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
           <button
             onClick={handleFeedbackSubmit}
             disabled={!feedbackText.trim() || feedbackLoading}
-            style={{ background: feedbackText.trim() && !feedbackLoading ? C.gold : C.surface, border: `1px solid ${feedbackText.trim() && !feedbackLoading ? C.gold : C.border}`, borderRadius: 8, color: feedbackText.trim() && !feedbackLoading ? '#0f0f0f' : C.textFaint, fontSize: 13, fontWeight: 600, padding: '9px 14px', cursor: feedbackText.trim() && !feedbackLoading ? 'pointer' : 'default', whiteSpace: 'nowrap', transition: 'background 0.15s, color 0.15s' }}
+            style={{ background: feedbackText.trim() && !feedbackLoading ? C.gold : C.surface, border: `1px solid ${feedbackText.trim() && !feedbackLoading ? C.gold : C.border}`, borderRadius: 8, color: feedbackText.trim() && !feedbackLoading ? '#0f0f0f' : C.textFaint, fontSize: 13, fontWeight: 600, padding: '9px 14px', cursor: feedbackText.trim() && !feedbackLoading ? 'pointer' : 'default', whiteSpace: 'nowrap', transition: 'background 0.15s, color 0.15s', display: 'flex', alignItems: 'center', gap: 6 }}
           >
-            {feedbackLoading ? 'Adjusting…' : isInLab ? 'Tweak & Improve' : 'Something Off? Adjust'}
+            {feedbackLoading && <span style={{ display: 'inline-block', width: 12, height: 12, border: '2px solid currentColor', borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite', flexShrink: 0 }} />}
+            {feedbackLoading ? 'Revising…' : isInLab ? 'Tweak & Improve' : 'Something Off? Adjust'}
           </button>
         </div>
       </div>
@@ -1812,6 +1815,13 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
   )
 }
 
+const EXPLORE_LOADING_MSGS = [
+  'Searching published cocktail recipes…',
+  'Crafting original ideas for your ingredients…',
+  'Matching against your inventory…',
+  'Almost there…',
+]
+
 function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTheLab, user }) {
   const [step, setStep] = useState('ingredients')
   const [selected, setSelected] = useState([])
@@ -1827,6 +1837,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   const feedbackBannerRef = useRef(null)
   const [history, setHistory] = useState([])
   const [partialSource, setPartialSource] = useState(null)
+  const [loadingMsgIdx, setLoadingMsgIdx] = useState(0)
 
   useEffect(() => {
     const load = async () => {
@@ -1846,6 +1857,13 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     }
     load()
   }, [user?.id])
+
+  useEffect(() => {
+    if (step !== 'loading') return
+    setLoadingMsgIdx(0)
+    const id = setInterval(() => setLoadingMsgIdx(prev => (prev + 1) % EXPLORE_LOADING_MSGS.length), 8000)
+    return () => clearInterval(id)
+  }, [step])
 
   const upsertHistory = (ingredients, searchStyle, searchFlavors, searchLowABV, searchResult) => {
     const entry = {
@@ -2032,10 +2050,12 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   )
 
   if (step === 'loading') return (
-    <div style={{ textAlign: 'center', padding: '60px 0' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '65vh', textAlign: 'center', padding: '0 24px' }}>
       <style>{`@keyframes bcspin2 { to { transform: rotate(360deg); } }`}</style>
-      <div style={{ display: 'inline-block', width: 34, height: 34, border: `3px solid ${C.border}`, borderTopColor: C.gold, borderRadius: '50%', animation: 'bcspin2 0.75s linear infinite', marginBottom: 16 }} />
-      <div style={{ color: C.textMuted, fontSize: 15 }}>Searching recipes and crafting originals…</div>
+      <div style={{ fontSize: 52, marginBottom: 24, lineHeight: 1 }}>🍸</div>
+      <div style={{ width: 48, height: 48, border: `3px solid ${C.border}`, borderTopColor: C.gold, borderRadius: '50%', animation: 'bcspin2 0.75s linear infinite', marginBottom: 28 }} />
+      <div style={{ color: C.text, fontSize: 17, fontWeight: 600, marginBottom: 12 }}>Searching recipes and crafting originals…</div>
+      <div style={{ color: C.textMuted, fontSize: 14, minHeight: 22, transition: 'opacity 0.4s' }}>{EXPLORE_LOADING_MSGS[loadingMsgIdx]}</div>
     </div>
   )
 
@@ -2082,22 +2102,24 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
             {result.pairs_well_with}
           </div>
         )}
-        {canMake.length > 0 && (
-          <div style={{ marginBottom: 28 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              {canMake.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} />)}
+        <div style={{ opacity: isFeedbackLoading ? 0.4 : 1, transition: 'opacity 0.3s', pointerEvents: isFeedbackLoading ? 'none' : 'auto' }}>
+          {canMake.length > 0 && (
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {canMake.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} />)}
+              </div>
             </div>
-          </div>
-        )}
-        {worthBuying.length > 0 && (
-          <div style={{ marginBottom: 28 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Worth Buying For ({worthBuying.length})</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} />)}
+          )}
+          {worthBuying.length > 0 && (
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Worth Buying For ({worthBuying.length})</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} />)}
+              </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
         <div ref={feedbackBannerRef}>
           {feedbackBanner && (
             <div style={{ background: C.green + '15', border: `1px solid ${C.green}44`, borderRadius: 10, padding: '10px 16px', marginBottom: 16, fontSize: 14, color: C.green }}>
@@ -2106,7 +2128,10 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
           )}
         </div>
         <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 20 }}>
-          <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 10 }}>Want different results? Tell us what you're looking for:</div>
+          <style>{`@keyframes bcspini { to { transform: rotate(360deg); } }`}</style>
+          <div style={{ fontSize: 13, color: isFeedbackLoading ? C.textMuted : C.textMuted, marginBottom: 10 }}>
+            {isFeedbackLoading ? 'Revising based on your feedback…' : 'Want different results? Tell us what you\'re looking for:'}
+          </div>
           <div style={{ display: 'flex', gap: 8 }}>
             <input
               type="text"
@@ -2120,8 +2145,9 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
             <button
               onClick={handleFeedback}
               disabled={!feedback.trim() || isFeedbackLoading}
-              style={{ background: feedback.trim() && !isFeedbackLoading ? C.gold : C.surface, border: `1px solid ${feedback.trim() && !isFeedbackLoading ? C.gold : C.border}`, borderRadius: 8, color: feedback.trim() && !isFeedbackLoading ? '#0f0f0f' : C.textFaint, fontSize: 13, fontWeight: 600, padding: '10px 16px', cursor: feedback.trim() && !isFeedbackLoading ? 'pointer' : 'default', whiteSpace: 'nowrap', transition: 'background 0.15s, color 0.15s' }}>
-              {isFeedbackLoading ? '…' : 'Refine'}
+              style={{ background: feedback.trim() && !isFeedbackLoading ? C.gold : C.surface, border: `1px solid ${feedback.trim() && !isFeedbackLoading ? C.gold : C.border}`, borderRadius: 8, color: feedback.trim() && !isFeedbackLoading ? '#0f0f0f' : C.textFaint, fontSize: 13, fontWeight: 600, padding: '10px 16px', cursor: feedback.trim() && !isFeedbackLoading ? 'pointer' : 'default', whiteSpace: 'nowrap', transition: 'background 0.15s, color 0.15s', display: 'flex', alignItems: 'center', gap: 6 }}>
+              {isFeedbackLoading && <span style={{ display: 'inline-block', width: 12, height: 12, border: '2px solid currentColor', borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite', flexShrink: 0 }} />}
+              {isFeedbackLoading ? 'Revising…' : 'Refine'}
             </button>
           </div>
           {feedbackError && <div style={{ fontSize: 13, color: C.red, marginTop: 8 }}>{feedbackError}</div>}
