@@ -354,14 +354,14 @@ async function analyzeBarMenu(menuFile, cocktailName, inventoryText, cocktailPho
   return { data: await callClaude(body), body }
 }
 
-async function analyzeExplorations(ingredients, style, flavors, lowABV, inventoryText) {
+async function analyzeExplorationsRecipes(ingredients, style, flavors, lowABV, inventoryText) {
   const body = {
     model: MODEL,
-    max_tokens: 3000,
+    max_tokens: 2000,
     tools: [{ type: 'web_search_20250305', name: 'web_search' }],
     messages: [{
       role: 'user',
-      content: `You are an expert craft bartender helping someone explore cocktail possibilities.
+      content: `You are an expert craft bartender. Search the web for PUBLISHED cocktail recipes featuring the featured ingredients that match the selected style and flavor profile. Return ONLY real recipes found from published sources — do NOT invent original cocktails. Set origin_flag: "from_recipe" for ALL suggestions.
 
 Today's date is ${TODAY}.
 
@@ -375,13 +375,9 @@ ${inventoryText}
 
 SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated. Simple syrup — 2–4 weeks room temp. Amaro — 6–12 months. Commercial liqueurs — 6+ months.
 
-Use web search to find published cocktail recipes featuring the featured ingredients, and also invent original cocktails that showcase them well. Think like a creative craft bartender — suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate.
-
 First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
-Otherwise suggest 3–5 cocktails. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
-
-Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false (something worth buying an ingredient for), unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists.
+Otherwise use web search to find 2–3 published cocktail recipes. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
 
 Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
@@ -394,7 +390,7 @@ Return ONLY valid JSON with no markdown fences:
   "suggestions": [
     {
       "recipe_name": "string",
-      "origin_flag": "from_recipe | original",
+      "origin_flag": "from_recipe",
       "difficulty": "easy | medium | hard",
       "difficulty_note": "One sentence explaining difficulty",
       "can_make_now": true,
@@ -425,18 +421,135 @@ Return ONLY valid JSON with no markdown fences:
   } catch (_) {
     const retryText = await callClaudeText({
       model: MODEL,
-      max_tokens: 3000,
+      max_tokens: 2000,
       messages: [
         body.messages[0],
         { role: 'assistant', content: firstText },
         { role: 'user', content: 'Your previous response was cut off or invalid JSON. Please return ONLY the complete valid JSON object, no other text.' },
       ],
     })
-    try {
-      return extractJSON(retryText)
-    } catch (_) {
-      throw new Error('The response was too large to process. Try selecting fewer flavor profile options or a single ingredient.')
+    return extractJSON(retryText)
+  }
+}
+
+async function analyzeExplorationsOriginals(ingredients, style, flavors, lowABV, inventoryText) {
+  const body = {
+    model: MODEL,
+    max_tokens: 2000,
+    messages: [{
+      role: 'user',
+      content: `You are an expert craft bartender inventing ORIGINAL creative cocktails. Do NOT look up or reference published recipes — these should be entirely your own creative inventions. Set origin_flag: "original" for ALL suggestions. Think like a creative craft bartender — suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate.
+
+Today's date is ${TODAY}.
+
+FEATURED INGREDIENTS: ${ingredients.join(' and ')}
+COCKTAIL STYLE: ${style}
+FLAVOR PREFERENCES: ${flavors.length > 0 ? flavors.join(', ') : 'No specific preference'}
+LOW ALCOHOL: ${lowABV ? 'Yes — prioritize lower ABV options' : 'No preference'}
+
+BAR INVENTORY:
+${inventoryText}
+
+SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated. Simple syrup — 2–4 weeks room temp. Amaro — 6–12 months. Commercial liqueurs — 6+ months.
+
+First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
+
+Otherwise invent 2–3 original cocktails that showcase the featured ingredients. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
+
+Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false (something worth buying an ingredient for), unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists.
+
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+
+Return ONLY valid JSON with no markdown fences:
+{
+  "incompatible": false,
+  "incompatibility_reason": null,
+  "flavor_profile_note": "1-2 sentences on why these ingredients work together",
+  "pairs_well_with": "2-3 strongest flavor affinities only — one short sentence, not an exhaustive list",
+  "suggestions": [
+    {
+      "recipe_name": "string",
+      "origin_flag": "original",
+      "difficulty": "easy | medium | hard",
+      "difficulty_note": "One sentence explaining difficulty",
+      "can_make_now": true,
+      "missing_ingredients": [],
+      "summary": "1-2 sentence description",
+      "recipe": [{ "ingredient": "string", "amount": "string" }],
+      "instructions": "string",
+      "glass_type": "coupe | rocks | tiki | collins | null",
+      "ingredients": [
+        {
+          "ingredient": "string",
+          "status": "found | substitute | missing",
+          "location": "string or null",
+          "substitute": "string or null",
+          "substitute_location": "string or null",
+          "flavor_impact": "string or null"
+        }
+      ],
+      "technique_notes": "string or null"
     }
+  ]
+}`,
+    }],
+  }
+  const firstText = await callClaudeText(body)
+  try {
+    return extractJSON(firstText)
+  } catch (_) {
+    const retryText = await callClaudeText({
+      model: MODEL,
+      max_tokens: 2000,
+      messages: [
+        body.messages[0],
+        { role: 'assistant', content: firstText },
+        { role: 'user', content: 'Your previous response was cut off or invalid JSON. Please return ONLY the complete valid JSON object, no other text.' },
+      ],
+    })
+    return extractJSON(retryText)
+  }
+}
+
+async function analyzeExplorations(ingredients, style, flavors, lowABV, inventoryText) {
+  const [recipesSettled, originalsSettled] = await Promise.allSettled([
+    analyzeExplorationsRecipes(ingredients, style, flavors, lowABV, inventoryText),
+    analyzeExplorationsOriginals(ingredients, style, flavors, lowABV, inventoryText),
+  ])
+
+  const recipeData = recipesSettled.status === 'fulfilled' ? recipesSettled.value : null
+  const originalData = originalsSettled.status === 'fulfilled' ? originalsSettled.value : null
+
+  if (!recipeData && !originalData) {
+    throw new Error('Could not generate suggestions. Please try again.')
+  }
+
+  const partialSource = !recipeData ? 'web' : !originalData ? 'original' : null
+  const allSuggestions = [...(recipeData?.suggestions || []), ...(originalData?.suggestions || [])]
+  const primaryData = recipeData || originalData
+
+  if (allSuggestions.length === 0) {
+    return {
+      result: {
+        incompatible: true,
+        incompatibility_reason: primaryData.incompatibility_reason,
+        flavor_profile_note: null,
+        pairs_well_with: null,
+        suggestions: [],
+      },
+      partialSource,
+    }
+  }
+
+  return {
+    result: {
+      incompatible: false,
+      incompatibility_reason: null,
+      flavor_profile_note: recipeData?.flavor_profile_note || originalData?.flavor_profile_note || null,
+      pairs_well_with: recipeData?.pairs_well_with || originalData?.pairs_well_with || null,
+      suggestions: allSuggestions,
+    },
+    partialSource,
   }
 }
 
@@ -1691,6 +1804,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   const [feedbackBanner, setFeedbackBanner] = useState(false)
   const feedbackBannerRef = useRef(null)
   const [history, setHistory] = useState([])
+  const [partialSource, setPartialSource] = useState(null)
 
   useEffect(() => {
     const load = async () => {
@@ -1756,6 +1870,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     setFeedback('')
     setFeedbackError(null)
     setFeedbackBanner(false)
+    setPartialSource(null)
     setStep('results')
   }
 
@@ -1774,9 +1889,11 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
 
   const handleExplore = async () => {
     setStep('loading')
+    setPartialSource(null)
     try {
-      const data = await analyzeExplorations(selected, style, flavors, lowABV, inventoryText)
+      const { result: data, partialSource: ps } = await analyzeExplorations(selected, style, flavors, lowABV, inventoryText)
       setResult(data)
+      setPartialSource(ps)
       setStep('results')
       if (!data.incompatible) upsertHistory(selected, style, flavors, lowABV, data)
     } catch (err) {
@@ -1785,7 +1902,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     }
   }
 
-  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false) }
+  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -1896,8 +2013,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     <div style={{ textAlign: 'center', padding: '60px 0' }}>
       <style>{`@keyframes bcspin2 { to { transform: rotate(360deg); } }`}</style>
       <div style={{ display: 'inline-block', width: 34, height: 34, border: `3px solid ${C.border}`, borderTopColor: C.gold, borderRadius: '50%', animation: 'bcspin2 0.75s linear infinite', marginBottom: 16 }} />
-      <div style={{ color: C.textMuted, fontSize: 15 }}>Exploring cocktail possibilities…</div>
-      <div style={{ color: C.textFaint, fontSize: 13, marginTop: 6 }}>Searching for recipes and crafting originals</div>
+      <div style={{ color: C.textMuted, fontSize: 15 }}>Searching recipes and crafting originals…</div>
     </div>
   )
 
@@ -1928,6 +2044,11 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
           <div style={{ flex: 1, fontSize: 18, fontWeight: 700, color: C.text }}>{selected.join(' + ')}</div>
           <button onClick={reset} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap' }}>Start over</button>
         </div>
+        {partialSource && (
+          <div style={{ background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 8, padding: '8px 14px', marginBottom: 16, fontSize: 13, color: C.textMuted }}>
+            Some results unavailable — showing {partialSource === 'web' ? 'original' : 'web'} suggestions only
+          </div>
+        )}
         {result.flavor_profile_note && (
           <div style={{ background: C.gold + '12', border: `1px solid ${C.gold}33`, borderRadius: 10, padding: '12px 16px', marginBottom: result.pairs_well_with ? 8 : 24, fontSize: 14, color: C.text, lineHeight: 1.6 }}>
             ✨ {result.flavor_profile_note}
