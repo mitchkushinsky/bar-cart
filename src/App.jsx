@@ -357,7 +357,7 @@ async function analyzeBarMenu(menuFile, cocktailName, inventoryText, cocktailPho
 async function analyzeExplorationsRecipes(ingredients, style, flavors, lowABV, inventoryText) {
   const body = {
     model: MODEL,
-    max_tokens: 2000,
+    max_tokens: 3000,
     tools: [{ type: 'web_search_20250305', name: 'web_search' }],
     messages: [{
       role: 'user',
@@ -421,7 +421,7 @@ Return ONLY valid JSON with no markdown fences:
   } catch (_) {
     const retryText = await callClaudeText({
       model: MODEL,
-      max_tokens: 2000,
+      max_tokens: 3000,
       messages: [
         body.messages[0],
         { role: 'assistant', content: firstText },
@@ -435,7 +435,7 @@ Return ONLY valid JSON with no markdown fences:
 async function analyzeExplorationsOriginals(ingredients, style, flavors, lowABV, inventoryText) {
   const body = {
     model: MODEL,
-    max_tokens: 2000,
+    max_tokens: 3000,
     messages: [{
       role: 'user',
       content: `You are an expert craft bartender inventing ORIGINAL creative cocktails. Do NOT look up or reference published recipes — these should be entirely your own creative inventions. Set origin_flag: "original" for ALL suggestions. Think like a creative craft bartender — suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate.
@@ -500,7 +500,7 @@ Return ONLY valid JSON with no markdown fences:
   } catch (_) {
     const retryText = await callClaudeText({
       model: MODEL,
-      max_tokens: 2000,
+      max_tokens: 3000,
       messages: [
         body.messages[0],
         { role: 'assistant', content: firstText },
@@ -512,10 +512,19 @@ Return ONLY valid JSON with no markdown fences:
 }
 
 async function analyzeExplorations(ingredients, style, flavors, lowABV, inventoryText) {
+  const slimInventoryText = inventoryText.split('\n').map((line, i) => {
+    if (i === 0) return 'Spirit | Category | Status'
+    const parts = line.split(' | ')
+    return `${parts[0] || ''} | ${parts[3] || ''} | ${parts[5] || ''}`
+  }).join('\n')
+
   const [recipesSettled, originalsSettled] = await Promise.allSettled([
     analyzeExplorationsRecipes(ingredients, style, flavors, lowABV, inventoryText),
-    analyzeExplorationsOriginals(ingredients, style, flavors, lowABV, inventoryText),
+    analyzeExplorationsOriginals(ingredients, style, flavors, lowABV, slimInventoryText),
   ])
+
+  console.log('Web call result:', recipesSettled.status, recipesSettled.reason || 'ok')
+  console.log('Originals call result:', originalsSettled.status, originalsSettled.reason || 'ok')
 
   const recipeData = recipesSettled.status === 'fulfilled' ? recipesSettled.value : null
   const originalData = originalsSettled.status === 'fulfilled' ? originalsSettled.value : null
