@@ -1697,6 +1697,7 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
 
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
+      <div style={{ opacity: isTweakLoading ? 0.4 : 1, transition: 'opacity 0.3s', pointerEvents: isTweakLoading ? 'none' : 'auto' }}>
       <div style={{ marginBottom: 8 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 5 }}>
           <span style={{ fontWeight: 700, fontSize: 16, color: C.gold }}>{displayed.recipe_name || 'Untitled suggestion'}</span>
@@ -1771,6 +1772,7 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
           <button style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textFaint, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>👎 Archive</button>
         </div>
       )}
+      </div>
 
       <div style={{ marginTop: 10, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
         {tweakDone && !isTweaking && (
@@ -1797,8 +1799,9 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
               <button
                 onClick={handleTweakSubmit}
                 disabled={!tweakText.trim() || isTweakLoading}
-                style={{ background: tweakText.trim() && !isTweakLoading ? C.gold : C.surface, border: `1px solid ${tweakText.trim() && !isTweakLoading ? C.gold : C.border}`, borderRadius: 6, color: tweakText.trim() && !isTweakLoading ? '#0f0f0f' : C.textFaint, fontSize: 12, fontWeight: 600, padding: '7px 12px', cursor: tweakText.trim() && !isTweakLoading ? 'pointer' : 'default', transition: 'background 0.15s, color 0.15s', whiteSpace: 'nowrap' }}>
-                {isTweakLoading ? '…' : 'Tweak'}
+                style={{ background: tweakText.trim() && !isTweakLoading ? C.gold : C.surface, border: `1px solid ${tweakText.trim() && !isTweakLoading ? C.gold : C.border}`, borderRadius: 6, color: tweakText.trim() && !isTweakLoading ? '#0f0f0f' : C.textFaint, fontSize: 12, fontWeight: 600, padding: '7px 12px', cursor: tweakText.trim() && !isTweakLoading ? 'pointer' : 'default', transition: 'background 0.15s, color 0.15s', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 5 }}>
+                {isTweakLoading && <span style={{ display: 'inline-block', width: 11, height: 11, border: '2px solid currentColor', borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite', flexShrink: 0 }} />}
+                {isTweakLoading ? 'Tweaking…' : 'Tweak'}
               </button>
               <button
                 onClick={() => { setIsTweaking(false); setTweakText(''); setTweakError(null) }}
