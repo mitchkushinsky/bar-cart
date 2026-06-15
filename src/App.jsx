@@ -2374,7 +2374,8 @@ export default function App() {
     setInventoryLoading(true); setInventoryError(null); setInventory(null)
     console.log('Fetching inventory from:', url)
     try {
-      const res = await fetch(url)
+      const bustUrl = `${url}${url.includes('?') ? '&' : '?'}_=${Date.now()}`
+      const res = await fetch(bustUrl)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const text = await res.text()
       console.log('CSV text length:', text.length)
