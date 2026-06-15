@@ -532,6 +532,8 @@ async function analyzeExplorations(ingredients, style, flavors, lowABV, inventor
     return `${parts[0] || ''} | ${parts[3] || ''} | ${parts[5] || ''}${notes ? ` | ${notes}` : ''}`
   }).join('\n')
 
+  console.log('Slim inventory sample:', slimInventoryText.substring(0, 500))
+
   const [recipesSettled, originalsSettled] = await Promise.allSettled([
     analyzeExplorationsRecipes(ingredients, style, flavors, lowABV, inventoryText),
     analyzeExplorationsOriginals(ingredients, style, flavors, lowABV, slimInventoryText),
