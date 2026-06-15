@@ -449,6 +449,8 @@ Return ONLY valid JSON with no markdown fences:
 }
 
 async function analyzeExplorationsOriginals(ingredients, style, flavors, lowABV, inventoryText) {
+  const umeshuLine = inventoryText.split('\n').find(l => l.includes('Umeshu') || l.includes('Umenoyado'))
+  console.log('Umenoyado slim line:', umeshuLine)
   const body = {
     model: MODEL,
     max_tokens: 3000,
