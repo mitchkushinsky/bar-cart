@@ -113,11 +113,6 @@ function parseCSV(text) {
 
 function parseInventory(csvText) {
   const rows = parseCSV(csvText)
-  const umeshuRaw = rows.find(r => r[0] && r[0].includes('Umeshu'))
-  console.log('Umeshu raw row length:', umeshuRaw?.length)
-  console.log('Umeshu raw row:', JSON.stringify(umeshuRaw))
-  const firstWithNote = rows.slice(1).find(r => r[6] && r[6].trim())
-  console.log('First row with notes:', firstWithNote)
   const items = rows.slice(1).map((row) => ({
     spirit: row[0] || '',
     location: row[1] || '',
@@ -449,8 +444,6 @@ Return ONLY valid JSON with no markdown fences:
 }
 
 async function analyzeExplorationsOriginals(ingredients, style, flavors, lowABV, inventoryText) {
-  const umeshuLine = inventoryText.split('\n').find(l => l.includes('Umeshu') || l.includes('Umenoyado'))
-  console.log('Umenoyado slim line:', umeshuLine)
   const body = {
     model: MODEL,
     max_tokens: 3000,
@@ -2374,14 +2367,11 @@ export default function App() {
   // Inventory loading
   const loadInventory = useCallback(async (url) => {
     setInventoryLoading(true); setInventoryError(null); setInventory(null)
-    console.log('Fetching inventory from:', url)
     try {
       const bustUrl = `${url}${url.includes('?') ? '&' : '?'}_=${Date.now()}`
       const res = await fetch(bustUrl)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const text = await res.text()
-      console.log('CSV text length:', text.length)
-      setInventory(parseInventory(text))
+      setInventory(parseInventory(await res.text()))
     } catch (err) {
       setInventoryError(err.message)
     } finally {
