@@ -2372,10 +2372,13 @@ export default function App() {
   // Inventory loading
   const loadInventory = useCallback(async (url) => {
     setInventoryLoading(true); setInventoryError(null); setInventory(null)
+    console.log('Fetching inventory from:', url)
     try {
       const res = await fetch(url)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setInventory(parseInventory(await res.text()))
+      const text = await res.text()
+      console.log('CSV text length:', text.length)
+      setInventory(parseInventory(text))
     } catch (err) {
       setInventoryError(err.message)
     } finally {
