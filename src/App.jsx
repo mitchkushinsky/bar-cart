@@ -113,6 +113,8 @@ function parseCSV(text) {
 
 function parseInventory(csvText) {
   const rows = parseCSV(csvText)
+  const firstWithNote = rows.slice(1).find(r => r[6] && r[6].trim())
+  console.log('First row with notes:', firstWithNote)
   const items = rows.slice(1).map((row) => ({
     spirit: row[0] || '',
     location: row[1] || '',
