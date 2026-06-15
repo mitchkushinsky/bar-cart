@@ -526,9 +526,10 @@ Return ONLY valid JSON with no markdown fences:
 
 async function analyzeExplorations(ingredients, style, flavors, lowABV, inventoryText) {
   const slimInventoryText = inventoryText.split('\n').map((line, i) => {
-    if (i === 0) return 'Spirit | Category | Status'
+    if (i === 0) return 'Spirit | Category | Status | Notes'
     const parts = line.split(' | ')
-    return `${parts[0] || ''} | ${parts[3] || ''} | ${parts[5] || ''}`
+    const notes = (parts[6] || '').trim()
+    return `${parts[0] || ''} | ${parts[3] || ''} | ${parts[5] || ''}${notes ? ` | ${notes}` : ''}`
   }).join('\n')
 
   const [recipesSettled, originalsSettled] = await Promise.allSettled([
