@@ -56,7 +56,7 @@ import { supabase } from './supabase.js'
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const DEFAULT_SHEET_URL =
-  'https://docs.google.com/spreadsheets/d/e/2PACX-1vSWHwzLTItnOhFiPSAPObW6iJI1OVnpqiYgoaUzM_KYlzM2MgJsr4zFLpnaY_mB6kOVQLp6edO9xMIB/pub?output=csv'
+  'https://docs.google.com/spreadsheets/d/e/2PACX-1vSWHwzLTItnOhFiPSAPObW6iJI1OVnpqiYgoaUzM_KYlzM2MgJsr4zFLpnaY_mB6kOVQLp6edO9xMIB/pub?gid=709003368&single=true&output=csv'
 
 const MODEL = 'claude-sonnet-4-5'
 const MAX_TOKENS = 1500
@@ -113,6 +113,9 @@ function parseCSV(text) {
 
 function parseInventory(csvText) {
   const rows = parseCSV(csvText)
+  const umeshuRaw = rows.find(r => r[0] && r[0].includes('Umeshu'))
+  console.log('Umeshu raw row length:', umeshuRaw?.length)
+  console.log('Umeshu raw row:', JSON.stringify(umeshuRaw))
   const firstWithNote = rows.slice(1).find(r => r[6] && r[6].trim())
   console.log('First row with notes:', firstWithNote)
   const items = rows.slice(1).map((row) => ({

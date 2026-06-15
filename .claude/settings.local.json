@@ -12,7 +12,8 @@
       "Bash(npm install:*)",
       "Bash(git -C /Users/mitchellkushinsky/bar-cart log --all --oneline --grep=\"fitbit\\\\|vitamin\\\\|nutrition\\\\|food\\\\|nutrient\" -i)",
       "Bash(git -C /Users/mitchellkushinsky/bar-cart log --all --oneline)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(curl -s \"https://docs.google.com/spreadsheets/d/e/2PACX-1vSWHwzLTItnOhFiPSAPObW6iJI1OVnpqiYgoaUzM_KYlzM2MgJsr4zFLpnaY_mB6kOVQLp6edO9xMIB/pub?output=csv\")"
     ]
   }
 }
