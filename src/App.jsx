@@ -49,6 +49,10 @@
 // );
 // alter table in_the_lab enable row level security;
 // create policy "Users own their lab" on in_the_lab for all using (auth.uid() = user_id);
+// alter table in_the_lab add column if not exists original_recipe jsonb;
+// alter table in_the_lab add column if not exists original_instructions text;
+// alter table in_the_lab add column if not exists original_summary text;
+// alter table in_the_lab add column if not exists original_glass_type text;
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
@@ -942,13 +946,14 @@ function DifficultyBadge({ difficulty }) {
 
 // ─── Results ──────────────────────────────────────────────────────────────────
 
-function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, inTheLabList, onToggleInTheLab, onFeedback, feedbackLoading, inventory, isInLab, labItem, onMarkTried, onSaveLabToFavorites, onUpdateLabNotes, onArchiveFromLab }) {
+function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, inTheLabList, onToggleInTheLab, onFeedback, feedbackLoading, inventory, isInLab, labItem, onMarkTried, onSaveLabToFavorites, onUpdateLabNotes, onArchiveFromLab, onRevertLabTweak }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
   const adjustmentNoteRef = useRef(null)
   const [drawerItem, setDrawerItem] = useState(null)
   const [flavorCache, setFlavorCache] = useState({})
   const [drawerLoading, setDrawerLoading] = useState(false)
+  const [revertedBanner, setRevertedBanner] = useState(false)
 
   useEffect(() => {
     if (adjustmentNote) {
@@ -1061,13 +1066,30 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
       )}
 
       {/* Adjustment note */}
-      {adjustmentNote && (
-        <div ref={adjustmentNoteRef} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, background: C.gold + '18', border: `1px solid ${C.gold}44`, borderRadius: 10, padding: '12px 16px', marginBottom: 20 }}>
+      {revertedBanner ? (
+        <div ref={adjustmentNoteRef} style={{ display: 'flex', alignItems: 'center', gap: 10, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 16px', marginBottom: 20, fontSize: 14, color: C.textMuted }}>
+          ↩ Reverted to original
+        </div>
+      ) : adjustmentNote && (
+        <div ref={adjustmentNoteRef} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, background: C.gold + '18', border: `1px solid ${C.gold}44`, borderRadius: 10, padding: '12px 16px', marginBottom: isInLab && labItem?.originalRecipe ? 6 : 20 }}>
           <span style={{ fontSize: 16, flexShrink: 0, marginTop: 1 }}>✓</span>
           <div>
             <span style={{ fontSize: 12, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: C.gold }}>Adjusted </span>
             <span style={{ fontSize: 14, color: C.text }}>{adjustmentNote}</span>
           </div>
+        </div>
+      )}
+      {!revertedBanner && isInLab && labItem?.originalRecipe && (
+        <div style={{ marginBottom: 20 }}>
+          <button
+            onClick={() => {
+              onRevertLabTweak(labItem)
+              setRevertedBanner(true)
+              setTimeout(() => setRevertedBanner(false), 3000)
+            }}
+            style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 13, cursor: 'pointer', padding: 0, textDecoration: 'underline' }}>
+            ↩ Revert to original
+          </button>
         </div>
       )}
 
@@ -2298,6 +2320,10 @@ export default function App() {
     source: row.source || 'Exploration', originFlag: row.origin_flag || null,
     difficulty: row.difficulty || null, primaryIngredients: row.primary_ingredients || [],
     tried: row.tried || false,
+    originalRecipe: row.original_recipe || null,
+    originalInstructions: row.original_instructions || null,
+    originalSummary: row.original_summary || null,
+    originalGlassType: row.original_glass_type || null,
     savedAt: row.saved_at,
   })
 
@@ -2595,6 +2621,40 @@ export default function App() {
     handleBackToSource()
   }
 
+  const revertLabTweak = async (item) => {
+    const revertedLabItem = {
+      ...item,
+      recipe: item.originalRecipe || [],
+      instructions: item.originalInstructions || null,
+      summary: item.originalSummary || null,
+      glassType: item.originalGlassType || null,
+      originalRecipe: null, originalInstructions: null,
+      originalSummary: null, originalGlassType: null,
+    }
+    if (user) {
+      try {
+        await supabase.from('in_the_lab').update({
+          recipe: item.originalRecipe || [],
+          instructions: item.originalInstructions || null,
+          summary: item.originalSummary || null,
+          glass_type: item.originalGlassType || null,
+          original_recipe: null, original_instructions: null,
+          original_summary: null, original_glass_type: null,
+        }).eq('id', item.id)
+      } catch (_) {}
+    }
+    setCurrentLabItem(revertedLabItem)
+    setInTheLabList(prev => prev.map(i => i.id === item.id ? revertedLabItem : i))
+    setResult(prev => ({
+      ...prev,
+      recipe: item.originalRecipe || [],
+      instructions: item.originalInstructions || null,
+      summary: item.originalSummary || null,
+      glass_type: item.originalGlassType || null,
+    }))
+    setAdjustmentNote(null)
+  }
+
   const viewToMake = (item) => {
     sourceScrollRef.current = window.scrollY
     setError(null); setAdjustmentNote(null)
@@ -2732,6 +2792,39 @@ export default function App() {
       setLastRequestBody(feedbackBody)
       setAdjustmentNote(revised.adjustment_note || null)
       setError(null)
+
+      if (resultSource === 'inthelab' && currentLabItem) {
+        const needsSnapshot = !currentLabItem.originalRecipe
+        const updateData = {
+          recipe: revised.recipe || [],
+          instructions: revised.instructions || null,
+          summary: revised.summary || null,
+          glass_type: revised.glass_type || null,
+          ...(needsSnapshot ? {
+            original_recipe: result.recipe || [],
+            original_instructions: result.instructions || null,
+            original_summary: result.summary || null,
+            original_glass_type: result.glass_type || null,
+          } : {}),
+        }
+        if (user) { try { await supabase.from('in_the_lab').update(updateData).eq('id', currentLabItem.id) } catch (_) {} }
+        const updatedLabItem = {
+          ...currentLabItem,
+          recipe: revised.recipe || [],
+          instructions: revised.instructions || null,
+          summary: revised.summary || null,
+          glassType: revised.glass_type || null,
+          ...(needsSnapshot ? {
+            originalRecipe: result.recipe || [],
+            originalInstructions: result.instructions || null,
+            originalSummary: result.summary || null,
+            originalGlassType: result.glass_type || null,
+          } : {}),
+        }
+        setCurrentLabItem(updatedLabItem)
+        setInTheLabList(prev => prev.map(i => i.id === currentLabItem.id ? updatedLabItem : i))
+      }
+
       setResult(processResult(revised))
     } catch (err) {
       setError(err.message || 'Something went wrong. Please try again.')
@@ -2971,6 +3064,7 @@ export default function App() {
                 onSaveLabToFavorites={saveLabToFavorites}
                 onUpdateLabNotes={updateLabNotes}
                 onArchiveFromLab={(id) => { removeFromInTheLab(id); handleBackToSource() }}
+                onRevertLabTweak={revertLabTweak}
               />
             </>
           )}
