@@ -1756,8 +1756,6 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
     }
   }
 
-  console.log('Rendering suggestion:', JSON.stringify(suggestion))
-
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
       <div style={{ opacity: isTweakLoading ? 0.4 : 1, transition: 'opacity 0.3s', pointerEvents: isTweakLoading ? 'none' : 'auto' }}>
@@ -2677,6 +2675,7 @@ export default function App() {
     setCurrentLabItem(item)
     setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType })
     setResultSource('inthelab')
+    setLastRequestBody({ model: MODEL, max_tokens: MAX_TOKENS, messages: [{ role: 'user', content: 'Please analyze this cocktail recipe.' }] })
     setScreen('analyze')
   }
 
