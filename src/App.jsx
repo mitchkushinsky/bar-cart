@@ -586,7 +586,7 @@ async function analyzeExplorations(ingredients, style, flavors, lowABV, inventor
 async function refineExplorations(ingredients, style, flavors, lowABV, inventoryText, previousNames, feedbackText) {
   const body = {
     model: MODEL,
-    max_tokens: 3000,
+    max_tokens: 6000,
     messages: [{
       role: 'user',
       content: `You are an expert craft bartender helping someone explore cocktail possibilities.
@@ -607,7 +607,7 @@ Previous suggestions shown to the user: ${previousNames.join(', ')}
 
 The user provided feedback on the previous suggestions: "${feedbackText}". Based on this feedback, return a revised set of suggestions. If the feedback asks for 'more' or 'additional' results, include new suggestions not previously shown. If the feedback asks for something 'different' or describes a change to a specific recipe, revise accordingly. Return the same JSON structure as before, including updated flavor_profile_note and pairs_well_with if relevant.
 
-Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false, unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists.
+Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false, unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists. Return no more than 4 suggestions total.
 
 Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
@@ -651,7 +651,7 @@ Return ONLY valid JSON with no markdown fences:
   } catch (_) {
     const retryText = await callClaudeText({
       model: MODEL,
-      max_tokens: 3000,
+      max_tokens: 6000,
       messages: [
         body.messages[0],
         { role: 'assistant', content: firstText },
@@ -661,7 +661,7 @@ Return ONLY valid JSON with no markdown fences:
     try {
       return extractJSON(retryText)
     } catch (_) {
-      throw new Error('The response was too large to process. Try selecting fewer flavor profile options or a single ingredient.')
+      throw new Error('Could not generate valid suggestions. Please try again.')
     }
   }
 }
