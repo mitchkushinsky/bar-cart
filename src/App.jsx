@@ -2258,6 +2258,7 @@ export default function App() {
   const [inventory, setInventory] = useState(null)
   const [inventoryLoading, setInventoryLoading] = useState(false)
   const [inventoryError, setInventoryError] = useState(null)
+  const [, setAffinityBackfillInProgress] = useState(false)
 
   // Navigation
   const [screen, setScreen] = useState('analyze')
@@ -2435,7 +2436,54 @@ export default function App() {
       const bustUrl = `${url}${url.includes('?') ? '&' : '?'}_=${Date.now()}`
       const res = await fetch(bustUrl)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setInventory(parseInventory(await res.text()))
+      const parsed = parseInventory(await res.text())
+      setInventory(parsed)
+
+      // Fire-and-forget affinity backfill for ingredients not yet analyzed
+      ;(async () => {
+        try {
+          const excludedNorm = EXCLUDE_FROM_INVENTORY.map(e => e.trim().toLowerCase())
+          const candidates = parsed
+            .filter(item => !item.oos)
+            .filter(item => !excludedNorm.some(ex => item.spirit.trim().toLowerCase().includes(ex)))
+            .map(item => ({ name: item.spirit.trim(), normName: item.spirit.trim().toLowerCase(), category: item.category.trim() }))
+
+          if (candidates.length === 0) return
+
+          const { data: existing, error: fetchErr } = await supabase
+            .from('ingredient_affinities')
+            .select('ingredient_name')
+            .in('ingredient_name', candidates.map(c => c.normName))
+
+          if (fetchErr) { console.warn('[affinities] fetch error:', fetchErr.message); return }
+
+          const existingSet = new Set((existing || []).map(r => r.ingredient_name))
+          const newIngredients = candidates.filter(c => !existingSet.has(c.normName))
+
+          if (newIngredients.length === 0) { console.log('[affinities] all ingredients up to date'); return }
+
+          console.log(`[affinities] analyzing ${newIngredients.length} new ingredient(s):`, newIngredients.map(c => c.name))
+          setAffinityBackfillInProgress(true)
+
+          const response = await fetch('/api/backfill-affinities', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ ingredients: newIngredients.map(c => ({ name: c.name, category: c.category })) }),
+          })
+
+          if (!response.ok) {
+            const err = await response.json().catch(() => ({ error: response.statusText }))
+            throw new Error(err.error || `HTTP ${response.status}`)
+          }
+
+          const result = await response.json()
+          console.log(`[affinities] backfill complete: ${result.count} ingredient(s) stored`)
+        } catch (err) {
+          console.warn('[affinities] backfill failed (non-blocking):', err.message)
+        } finally {
+          setAffinityBackfillInProgress(false)
+        }
+      })()
     } catch (err) {
       setInventoryError(err.message)
     } finally {
