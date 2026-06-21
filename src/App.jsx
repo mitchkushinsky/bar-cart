@@ -2448,17 +2448,27 @@ export default function App() {
             .filter(item => !excludedNorm.some(ex => item.spirit.trim().toLowerCase().includes(ex)))
             .map(item => ({ name: item.spirit.trim(), normName: item.spirit.trim().toLowerCase(), category: item.category.trim() }))
 
-          if (candidates.length === 0) return
+          // Dedupe by normalized name — backup bottles share an ingredient name but
+          // need only one affinity entry. Two rows for the same name in one upsert
+          // batch causes a Postgres ON CONFLICT error that fails the whole chunk.
+          const seenNames = new Set()
+          const dedupedCandidates = candidates.filter(c => {
+            if (seenNames.has(c.normName)) return false
+            seenNames.add(c.normName)
+            return true
+          })
+
+          if (dedupedCandidates.length === 0) return
 
           const { data: existing, error: fetchErr } = await supabase
             .from('ingredient_affinities')
             .select('ingredient_name')
-            .in('ingredient_name', candidates.map(c => c.normName))
+            .in('ingredient_name', dedupedCandidates.map(c => c.normName))
 
           if (fetchErr) { console.warn('[affinities] fetch error:', fetchErr.message); return }
 
           const existingSet = new Set((existing || []).map(r => r.ingredient_name))
-          const newIngredients = candidates.filter(c => !existingSet.has(c.normName))
+          const newIngredients = dedupedCandidates.filter(c => !existingSet.has(c.normName))
 
           if (newIngredients.length === 0) { console.log('[affinities] all ingredients up to date'); return }
 
