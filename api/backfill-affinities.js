@@ -38,12 +38,13 @@ export default async function handler(req, res) {
 - flavor_affinities: 1-2 sentences describing what flavors and ingredients it pairs well with in cocktails
 - affinity_tags: 4-8 short lowercase tags describing key flavor affinities (e.g. "citrus", "vanilla", "bitter", "stone fruit")
 
-Return ONLY a valid JSON array with no extra text or explanation. Each element must be:
+Return ONLY a valid JSON array with no extra text or explanation, with exactly one object per ingredient listed below, in the SAME ORDER as listed. Each element must be:
 {
-  "name": "<exact ingredient name as given>",
   "flavor_affinities": "...",
   "affinity_tags": ["tag1", "tag2", ...]
 }
+
+Do NOT include a "name" field — match your response to the input purely by position/order.
 
 Ingredients:
 ${ingredientList}`
@@ -74,17 +75,23 @@ ${ingredientList}`
 
     const parsed = extractJSONArray(textBlock.text)
 
-    const inputMap = new Map(ingredients.map(i => [i.name.trim().toLowerCase(), i.category || null]))
+    if (parsed.length !== ingredients.length) {
+      console.warn(`[backfill-affinities] response count mismatch: expected ${ingredients.length}, got ${parsed.length}`)
+    }
 
-    const rows = parsed
-      .filter(item => item.name && item.flavor_affinities)
-      .map(item => ({
-        ingredient_name: item.name.trim().toLowerCase(),
-        category: inputMap.get(item.name.trim().toLowerCase()) || null,
-        flavor_affinities: item.flavor_affinities,
-        affinity_tags: Array.isArray(item.affinity_tags) ? item.affinity_tags : [],
-        analyzed_at: new Date().toISOString(),
-      }))
+    const rows = ingredients
+      .map((ing, i) => {
+        const item = parsed[i]
+        if (!item || !item.flavor_affinities) return null
+        return {
+          ingredient_name: ing.name.trim().toLowerCase(),
+          category: ing.category || null,
+          flavor_affinities: item.flavor_affinities,
+          affinity_tags: Array.isArray(item.affinity_tags) ? item.affinity_tags : [],
+          analyzed_at: new Date().toISOString(),
+        }
+      })
+      .filter(Boolean)
 
     const adminSupabase = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false },
