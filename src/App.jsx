@@ -2462,22 +2462,41 @@ export default function App() {
 
           if (newIngredients.length === 0) { console.log('[affinities] all ingredients up to date'); return }
 
-          console.log(`[affinities] analyzing ${newIngredients.length} new ingredient(s):`, newIngredients.map(c => c.name))
-          setAffinityBackfillInProgress(true)
-
-          const response = await fetch('/api/backfill-affinities', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ ingredients: newIngredients.map(c => ({ name: c.name, category: c.category })) }),
-          })
-
-          if (!response.ok) {
-            const err = await response.json().catch(() => ({ error: response.statusText }))
-            throw new Error(err.error || `HTTP ${response.status}`)
+          const CHUNK_SIZE = 20
+          const chunks = []
+          for (let i = 0; i < newIngredients.length; i += CHUNK_SIZE) {
+            chunks.push(newIngredients.slice(i, i + CHUNK_SIZE))
           }
 
-          const result = await response.json()
-          console.log(`[affinities] backfill complete: ${result.count} ingredient(s) stored`)
+          console.log(`[affinities] analyzing ${newIngredients.length} new ingredient(s) in ${chunks.length} chunk(s) of up to ${CHUNK_SIZE}`)
+          setAffinityBackfillInProgress(true)
+
+          let totalStored = 0
+          let failedChunks = 0
+
+          for (let i = 0; i < chunks.length; i++) {
+            try {
+              const response = await fetch('/api/backfill-affinities', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ ingredients: chunks[i].map(c => ({ name: c.name, category: c.category })) }),
+              })
+
+              if (!response.ok) {
+                const err = await response.json().catch(() => ({ error: response.statusText }))
+                throw new Error(err.error || `HTTP ${response.status}`)
+              }
+
+              const result = await response.json()
+              totalStored += result.count
+              console.log(`[affinities] chunk ${i + 1}/${chunks.length}: stored ${result.count} ingredient(s)`)
+            } catch (err) {
+              failedChunks++
+              console.warn(`[affinities] chunk ${i + 1}/${chunks.length} failed (continuing):`, err.message)
+            }
+          }
+
+          console.log(`[affinities] backfill complete: ${totalStored}/${newIngredients.length} ingredient(s) stored${failedChunks > 0 ? ` (${failedChunks} chunk(s) failed)` : ''}`)
         } catch (err) {
           console.warn('[affinities] backfill failed (non-blocking):', err.message)
         } finally {
