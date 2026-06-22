@@ -1911,6 +1911,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   const [combinationError, setCombinationError] = useState(null)
   const [showIngredientAdder, setShowIngredientAdder] = useState(false)
   const [adderQuery, setAdderQuery] = useState('')
+  const [resultsPreviousStep, setResultsPreviousStep] = useState('prefs')
 
   useEffect(() => {
     const load = async () => {
@@ -2002,6 +2003,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
 
   const handleExplore = async (styleOverride) => {
     const activeStyle = styleOverride !== undefined ? styleOverride : style
+    setResultsPreviousStep(styleOverride !== undefined ? 'combination' : 'prefs')
     setStep('loading')
     setPartialSource(null)
     try {
@@ -2016,7 +2018,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     }
   }
 
-  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery('') }
+  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setResultsPreviousStep('prefs') }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2465,6 +2467,7 @@ Rules:
   if (step === 'results' && result) {
     if (result.incompatible) return (
       <div>
+        <button onClick={() => setStep(resultsPreviousStep)} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
         <div style={{ background: C.amber + '15', border: `1px solid ${C.amber}44`, borderRadius: 10, padding: '20px', marginBottom: 20 }}>
           <div style={{ fontSize: 18, fontWeight: 700, color: C.amber, marginBottom: 8 }}>These don't quite mix…</div>
           <div style={{ fontSize: 14, color: C.text, lineHeight: 1.6 }}>{result.incompatibility_reason}</div>
@@ -2478,6 +2481,7 @@ Rules:
 
     return (
       <div>
+        <button onClick={() => setStep(resultsPreviousStep)} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
           <div style={{ flex: 1, fontSize: 18, fontWeight: 700, color: C.text }}>{selected.join(' + ')}</div>
           <button onClick={reset} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap' }}>Start over</button>
