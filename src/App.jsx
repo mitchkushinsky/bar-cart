@@ -1902,6 +1902,9 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   const [history, setHistory] = useState([])
   const [partialSource, setPartialSource] = useState(null)
   const [loadingMsgIdx, setLoadingMsgIdx] = useState(0)
+  const [affinityData, setAffinityData] = useState({})
+  const [affinityLoading, setAffinityLoading] = useState(false)
+  const [affinityError, setAffinityError] = useState(null)
 
   useEffect(() => {
     const load = async () => {
@@ -2006,7 +2009,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     }
   }
 
-  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null) }
+  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2025,6 +2028,29 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
       setFeedbackError(err.message || 'Something went wrong. Please try again.')
     } finally {
       setIsFeedbackLoading(false)
+    }
+  }
+
+  const handleNextFromIngredients = async () => {
+    setAffinityLoading(true)
+    setAffinityError(null)
+    try {
+      const normalizedSelected = selected.map(s => s.trim().toLowerCase())
+      const { data, error } = await supabase
+        .from('ingredient_affinities')
+        .select('ingredient_name, flavor_affinities, spirit_tags, flavor_tags')
+        .in('ingredient_name', normalizedSelected)
+      if (error) throw error
+      const map = {}
+      ;(data || []).forEach(row => { map[row.ingredient_name] = row })
+      setAffinityData(map)
+    } catch (err) {
+      console.warn('[affinities] failed to load affinity data:', err.message)
+      setAffinityData({})
+      setAffinityError('Could not load affinity data. You can still continue.')
+    } finally {
+      setAffinityLoading(false)
+      setStep('affinities')
     }
   }
 
@@ -2057,12 +2083,83 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
       )}
       <IngredientSearch inventory={inventory} selected={selected} onSelect={ing => setSelected(p => [...p, ing])} onRemove={ing => setSelected(p => p.filter(i => i !== ing))} />
       {selected.length > 0 && (
-        <button onClick={() => setStep('prefs')} style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: 'pointer', marginTop: 24 }}>
-          Next →
+        <button onClick={handleNextFromIngredients} disabled={affinityLoading} style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: affinityLoading ? 'default' : 'pointer', marginTop: 24, opacity: affinityLoading ? 0.7 : 1 }}>
+          {affinityLoading ? 'Loading…' : 'Next →'}
         </button>
       )}
     </div>
   )
+
+  if (step === 'affinities') {
+    const selectedNorm = selected.map(s => s.trim().toLowerCase())
+    const getInventoryMatches = (spiritTags) => {
+      if (!spiritTags?.length || !inventory) return []
+      return inventory
+        .filter(item => !item.oos)
+        .filter(item => {
+          const normSpirit = item.spirit.trim().toLowerCase()
+          return spiritTags.some(tag => normSpirit.includes(tag) || tag.includes(normSpirit))
+        })
+        .filter(item => !selectedNorm.includes(item.spirit.trim().toLowerCase()))
+        .map(item => item.spirit)
+        .slice(0, 8)
+    }
+    return (
+      <div>
+        <button onClick={() => setStep('ingredients')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 24 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
+        {affinityError && (
+          <div style={{ background: C.amber + '15', border: `1px solid ${C.amber}44`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.amber, marginBottom: 20 }}>{affinityError}</div>
+        )}
+        {selected.map((ingName, i) => {
+          const normName = ingName.trim().toLowerCase()
+          const row = affinityData[normName]
+          const spiritTags = row?.spirit_tags || []
+          const flavorTags = row?.flavor_tags || []
+          const matches = getInventoryMatches(spiritTags)
+          return (
+            <div key={normName}>
+              {i > 0 && <div style={{ borderTop: `1px solid ${C.border}`, margin: '20px 0' }} />}
+              <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.gold, marginBottom: 12 }}>{ingName}</div>
+              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 16 }}>
+                <div style={{ fontSize: 14, color: row?.flavor_affinities ? C.textMuted : C.textFaint, lineHeight: 1.55 }}>
+                  {row?.flavor_affinities || 'No affinity data available for this ingredient.'}
+                </div>
+              </div>
+              <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Pairs Well With — Spirits</div>
+              <div style={{ marginBottom: 16 }}>
+                {matches.length > 0 ? (
+                  <div style={{ display: 'flex', flexWrap: 'wrap' }}>
+                    {matches.map(spirit => (
+                      <span key={spirit} style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.gold + '22', border: `1px solid ${C.gold}44`, color: C.gold }}>{spirit}</span>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 13, color: C.textFaint }}>None in your current inventory</div>
+                )}
+              </div>
+              <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Pairs Well With — Flavors</div>
+              <div style={{ marginBottom: 8 }}>
+                {flavorTags.length > 0 ? (
+                  <div style={{ display: 'flex', flexWrap: 'wrap' }}>
+                    {flavorTags.map(tag => (
+                      <span key={tag} style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.surface, border: `1px solid ${C.border}`, color: C.textMuted }}>{tag}</span>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 13, color: C.textFaint }}>No flavor tags available</div>
+                )}
+              </div>
+            </div>
+          )
+        })}
+        <button onClick={() => setStep('prefs')} style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: 'pointer', marginTop: 24 }}>Quick Build →</button>
+        <button disabled style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, color: C.textFaint, fontWeight: 600, fontSize: 15, padding: '13px', cursor: 'default', marginTop: 8, opacity: 0.6 }}>
+          + Add an Ingredient  <span style={{ fontSize: 11, fontWeight: 400 }}>(coming soon)</span>
+        </button>
+      </div>
+    )
+  }
 
   if (step === 'prefs') return (
     <div>
