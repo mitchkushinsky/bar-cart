@@ -31,13 +31,19 @@ export default async function handler(req, res) {
   }
 
   const ingredientList = ingredients
-    .map((ing, i) => `${i + 1}. ${ing.name}${ing.category ? ` (${ing.category})` : ''}`)
+    .map((ing, i) => {
+      let line = `${i + 1}. ${ing.name}${ing.category ? ` (${ing.category})` : ''}`
+      if (ing.notes) line += `\n   Owner notes: ${ing.notes}`
+      return line
+    })
     .join('\n')
 
   const prompt = `You are a cocktail and spirits expert. For each ingredient below, provide:
 - flavor_affinities: 1-2 sentences describing what flavors and ingredients it pairs well with in cocktails
 - spirit_tags: 3-6 short lowercase tags naming SPECIFIC ALCOHOLIC INGREDIENTS that pair well (spirits, liqueurs, wines, vermouths — e.g. "rum", "gin", "raspberry liqueur", "dry vermouth", "champagne"). These should be ingredient names, not flavor descriptors.
 - flavor_tags: 4-8 short lowercase tags describing NON-ALCOHOLIC flavor affinities — fruits, botanicals, spices, textures, etc. (e.g. "citrus", "ginger", "raspberry", "honey", "bitter", "stone fruit"). These should be flavor/ingredient descriptors, not spirit names.
+
+If "Owner notes" are provided for an ingredient, treat them as expert supplementary knowledge — incorporate them into your analysis, letting them bias or correct the tags and affinities where relevant. Owner notes take precedence over general knowledge when they conflict.
 
 Important: A flavor (like "raspberry") can appear in BOTH spirit_tags (as "raspberry liqueur") AND flavor_tags (as "raspberry") — this is correct and intentional.
 

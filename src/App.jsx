@@ -2543,7 +2543,7 @@ export default function App() {
           const candidates = parsed
             .filter(item => !item.oos)
             .filter(item => !excludedNorm.some(ex => item.spirit.trim().toLowerCase().includes(ex)))
-            .map(item => ({ name: item.spirit.trim(), normName: item.spirit.trim().toLowerCase(), category: item.category.trim() }))
+            .map(item => ({ name: item.spirit.trim(), normName: item.spirit.trim().toLowerCase(), category: item.category.trim(), notes: (item.notes || '').trim() }))
 
           // Dedupe by normalized name — backup bottles share an ingredient name but
           // need only one affinity entry. Two rows for the same name in one upsert
