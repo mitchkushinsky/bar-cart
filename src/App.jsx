@@ -2616,7 +2616,7 @@ export default function App() {
               const response = await fetch('/api/backfill-affinities', {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ ingredients: chunks[i].map(c => ({ name: c.name, category: c.category })) }),
+                body: JSON.stringify({ ingredients: chunks[i].map(c => ({ name: c.name, category: c.category, notes: c.notes })) }),
               })
 
               if (!response.ok) {
