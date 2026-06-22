@@ -1898,6 +1898,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   const [feedbackError, setFeedbackError] = useState(null)
   const [feedbackBanner, setFeedbackBanner] = useState(false)
   const feedbackBannerRef = useRef(null)
+  const stepRef = useRef(step)
   const [history, setHistory] = useState([])
   const [partialSource, setPartialSource] = useState(null)
   const [loadingMsgIdx, setLoadingMsgIdx] = useState(0)
@@ -1929,6 +1930,8 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     }
     load()
   }, [user?.id])
+
+  useEffect(() => { stepRef.current = step }, [step])
 
   useEffect(() => {
     if (step !== 'loading') return
@@ -2130,11 +2133,11 @@ Rules:
         messages: [{ role: 'user', content: prompt }],
       })
       setCombinationData(parsed)
-      setStep('combination')
+      if (stepRef.current === 'affinities' || stepRef.current === 'combination') setStep('combination')
     } catch (err) {
       console.warn('[combination] analysis failed:', err.message)
       setCombinationError('Could not analyze this combination. You can still proceed with Quick Build.')
-      setStep('combination')
+      if (stepRef.current === 'affinities' || stepRef.current === 'combination') setStep('combination')
     } finally {
       setCombinationLoading(false)
     }
