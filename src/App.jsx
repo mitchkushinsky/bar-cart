@@ -2036,13 +2036,43 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     setAffinityError(null)
     try {
       const normalizedSelected = selected.map(s => s.trim().toLowerCase())
+
+      // Step 1: Check what's already in the affinities table
       const { data, error } = await supabase
         .from('ingredient_affinities')
         .select('ingredient_name, flavor_affinities, spirit_tags, flavor_tags')
         .in('ingredient_name', normalizedSelected)
       if (error) throw error
+
       const map = {}
       ;(data || []).forEach(row => { map[row.ingredient_name] = row })
+
+      // Step 2: Find selected ingredients with no affinity data
+      const missing = selected.filter(s => !map[s.trim().toLowerCase()])
+
+      // Step 3: Generate on-demand for any not in the table
+      if (missing.length > 0) {
+        try {
+          const ingredients = missing.map(name => ({ name, category: '', notes: '' }))
+          const response = await fetch('/api/backfill-affinities', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ ingredients }),
+          })
+          if (response.ok) {
+            const { data: freshData } = await supabase
+              .from('ingredient_affinities')
+              .select('ingredient_name, flavor_affinities, spirit_tags, flavor_tags')
+              .in('ingredient_name', missing.map(s => s.trim().toLowerCase()))
+            ;(freshData || []).forEach(row => { map[row.ingredient_name] = row })
+          } else {
+            console.warn('[affinities] on-demand generation failed for:', missing)
+          }
+        } catch (onDemandErr) {
+          console.warn('[affinities] on-demand error:', onDemandErr.message)
+        }
+      }
+
       setAffinityData(map)
     } catch (err) {
       console.warn('[affinities] failed to load affinity data:', err.message)
