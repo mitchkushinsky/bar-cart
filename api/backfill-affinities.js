@@ -36,12 +36,16 @@ export default async function handler(req, res) {
 
   const prompt = `You are a cocktail and spirits expert. For each ingredient below, provide:
 - flavor_affinities: 1-2 sentences describing what flavors and ingredients it pairs well with in cocktails
-- affinity_tags: 4-8 short lowercase tags describing key flavor affinities (e.g. "citrus", "vanilla", "bitter", "stone fruit")
+- spirit_tags: 3-6 short lowercase tags naming SPECIFIC ALCOHOLIC INGREDIENTS that pair well (spirits, liqueurs, wines, vermouths — e.g. "rum", "gin", "raspberry liqueur", "dry vermouth", "champagne"). These should be ingredient names, not flavor descriptors.
+- flavor_tags: 4-8 short lowercase tags describing NON-ALCOHOLIC flavor affinities — fruits, botanicals, spices, textures, etc. (e.g. "citrus", "ginger", "raspberry", "honey", "bitter", "stone fruit"). These should be flavor/ingredient descriptors, not spirit names.
+
+Important: A flavor (like "raspberry") can appear in BOTH spirit_tags (as "raspberry liqueur") AND flavor_tags (as "raspberry") — this is correct and intentional.
 
 Return ONLY a valid JSON array with no extra text or explanation, with exactly one object per ingredient listed below, in the SAME ORDER as listed. Each element must be:
 {
   "flavor_affinities": "...",
-  "affinity_tags": ["tag1", "tag2", ...]
+  "spirit_tags": ["tag1", "tag2", ...],
+  "flavor_tags": ["tag1", "tag2", ...]
 }
 
 Do NOT include a "name" field — match your response to the input purely by position/order.
@@ -83,11 +87,15 @@ ${ingredientList}`
       .map((ing, i) => {
         const item = parsed[i]
         if (!item || !item.flavor_affinities) return null
+        const spiritTags = Array.isArray(item.spirit_tags) ? item.spirit_tags : []
+        const flavorTags = Array.isArray(item.flavor_tags) ? item.flavor_tags : []
         return {
           ingredient_name: ing.name.trim().toLowerCase(),
           category: ing.category || null,
           flavor_affinities: item.flavor_affinities,
-          affinity_tags: Array.isArray(item.affinity_tags) ? item.affinity_tags : [],
+          spirit_tags: spiritTags,
+          flavor_tags: flavorTags,
+          affinity_tags: [...new Set([...spiritTags, ...flavorTags])],
           analyzed_at: new Date().toISOString(),
         }
       })
