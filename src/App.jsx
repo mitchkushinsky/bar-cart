@@ -1673,6 +1673,7 @@ const EXPLORATION_HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
 const EXPLORATION_STYLE_EMOJI = {
   'Stirred': '🥃', 'On the Rocks': '🧊', 'Shaken / Sours': '🍋',
   'Highball': '🫧', 'Tiki / Swizzle': '🌺', 'Warm Drink': '☕',
+  'Spirit Forward / Dry': '🥃', 'Earthy / Smoky': '🍂',
 }
 
 function makeExplorationKey(ingredients, style, flavors, lowABV) {
@@ -1905,6 +1906,11 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   const [affinityData, setAffinityData] = useState({})
   const [affinityLoading, setAffinityLoading] = useState(false)
   const [affinityError, setAffinityError] = useState(null)
+  const [combinationData, setCombinationData] = useState(null)
+  const [combinationLoading, setCombinationLoading] = useState(false)
+  const [combinationError, setCombinationError] = useState(null)
+  const [showIngredientAdder, setShowIngredientAdder] = useState(false)
+  const [adderQuery, setAdderQuery] = useState('')
 
   useEffect(() => {
     const load = async () => {
@@ -1994,22 +2000,23 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
 
   const toggleFlavor = id => setFlavors(prev => prev.includes(id) ? prev.filter(f => f !== id) : prev.length < 3 ? [...prev, id] : prev)
 
-  const handleExplore = async () => {
+  const handleExplore = async (styleOverride) => {
+    const activeStyle = styleOverride !== undefined ? styleOverride : style
     setStep('loading')
     setPartialSource(null)
     try {
-      const { result: data, partialSource: ps } = await analyzeExplorations(selected, style, flavors, lowABV, inventoryText)
+      const { result: data, partialSource: ps } = await analyzeExplorations(selected, activeStyle, flavors, lowABV, inventoryText)
       setResult(data)
       setPartialSource(ps)
       setStep('results')
-      if (!data.incompatible) upsertHistory(selected, style, flavors, lowABV, data)
+      if (!data.incompatible) upsertHistory(selected, activeStyle, flavors, lowABV, data)
     } catch (err) {
       setError(err.message || 'Something went wrong. Please try again.')
       setStep('error')
     }
   }
 
-  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false) }
+  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery('') }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2082,6 +2089,99 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
       setAffinityLoading(false)
       setStep('affinities')
     }
+  }
+
+  const analyzeCombination = async (ingredients, currentAffinityData) => {
+    const affinityMap = currentAffinityData || affinityData
+    setCombinationLoading(true)
+    setCombinationError(null)
+    try {
+      const affinityContext = ingredients.map(ing => {
+        const row = affinityMap[ing.trim().toLowerCase()]
+        if (!row) return `${ing}: no affinity data available`
+        return `${ing}: ${row.flavor_affinities} Spirit affinities: ${row.spirit_tags?.join(', ')}. Flavor affinities: ${row.flavor_tags?.join(', ')}.`
+      }).join('\n\n')
+
+      const prompt = `You are an expert craft bartender analyzing a combination of ingredients for cocktail creation.
+
+SELECTED INGREDIENTS: ${ingredients.join(', ')}
+
+KNOWN AFFINITY DATA:
+${affinityContext}
+
+Based on these ingredients and their affinity profiles, provide a combination analysis in this exact JSON format:
+{
+  "combined_profile": "2-3 sentences describing the combined flavor profile of these ingredients together — what character the drink will have, what mood or occasion it suits",
+  "suggested_style": "one of: Stirred, On the Rocks, Shaken / Sours, Highball, Tiki / Swizzle, Warm Drink, Spirit Forward / Dry, Earthy / Smoky",
+  "style_reason": "one concise sentence explaining why this style fits this combination",
+  "additional_suggestions": [
+    { "name": "ingredient name", "reason": "one brief sentence why it would work" }
+  ]
+}
+
+Rules:
+- additional_suggestions should contain 1-2 items max — non-alcoholic modifiers, citrus, herbs, syrups, or specific spirits that would meaningfully complete this combination. Do NOT suggest ingredients already selected.
+- suggested_style must be EXACTLY one of the 8 style strings listed above, no variations.
+- Return ONLY valid JSON, no other text.`
+
+      const parsed = await callClaude({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 800,
+        messages: [{ role: 'user', content: prompt }],
+      })
+      setCombinationData(parsed)
+      setStep('combination')
+    } catch (err) {
+      console.warn('[combination] analysis failed:', err.message)
+      setCombinationError('Could not analyze this combination. You can still proceed with Quick Build.')
+      setStep('combination')
+    } finally {
+      setCombinationLoading(false)
+    }
+  }
+
+  const handleAddAndAnalyze = async (ingredientName) => {
+    const trimmed = ingredientName.trim()
+    if (!trimmed || selected.map(s => s.trim().toLowerCase()).includes(trimmed.toLowerCase())) return
+    const newSelected = [...selected, trimmed]
+    setSelected(newSelected)
+    setShowIngredientAdder(false)
+    setAdderQuery('')
+
+    const normNew = trimmed.trim().toLowerCase()
+    const mergedAffinityData = { ...affinityData }
+
+    if (!mergedAffinityData[normNew]) {
+      try {
+        const { data } = await supabase
+          .from('ingredient_affinities')
+          .select('ingredient_name, flavor_affinities, spirit_tags, flavor_tags')
+          .eq('ingredient_name', normNew)
+          .single()
+        if (data) {
+          mergedAffinityData[normNew] = data
+        } else {
+          const response = await fetch('/api/backfill-affinities', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ ingredients: [{ name: trimmed, category: '', notes: '' }] }),
+          })
+          if (response.ok) {
+            const { data: freshData } = await supabase
+              .from('ingredient_affinities')
+              .select('ingredient_name, flavor_affinities, spirit_tags, flavor_tags')
+              .eq('ingredient_name', normNew)
+              .single()
+            if (freshData) mergedAffinityData[normNew] = freshData
+          }
+        }
+      } catch (_) {
+        // Non-blocking — analyzeCombination handles missing affinity data gracefully
+      }
+    }
+
+    setAffinityData(mergedAffinityData)
+    await analyzeCombination(newSelected, mergedAffinityData)
   }
 
   if (step === 'ingredients') return (
@@ -2161,7 +2261,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
                 {matches.length > 0 ? (
                   <div style={{ display: 'flex', flexWrap: 'wrap' }}>
                     {matches.map(spirit => (
-                      <span key={spirit} style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.gold + '22', border: `1px solid ${C.gold}44`, color: C.gold }}>{spirit}</span>
+                      <span key={spirit} onClick={() => handleAddAndAnalyze(spirit)} style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.gold + '22', border: `1px solid ${C.gold}44`, color: C.gold, cursor: 'pointer' }}>{spirit}</span>
                     ))}
                   </div>
                 ) : (
@@ -2173,7 +2273,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
                 {flavorTags.length > 0 ? (
                   <div style={{ display: 'flex', flexWrap: 'wrap' }}>
                     {flavorTags.map(tag => (
-                      <span key={tag} style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.surface, border: `1px solid ${C.border}`, color: C.textMuted }}>{tag}</span>
+                      <span key={tag} onClick={() => handleAddAndAnalyze(tag)} style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.surface, border: `1px solid ${C.border}`, color: C.textMuted, cursor: 'pointer' }}>{tag}</span>
                     ))}
                   </div>
                 ) : (
@@ -2183,9 +2283,114 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
             </div>
           )
         })}
-        <button onClick={() => setStep('prefs')} style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: 'pointer', marginTop: 24 }}>Quick Build →</button>
-        <button disabled style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, color: C.textFaint, fontWeight: 600, fontSize: 15, padding: '13px', cursor: 'default', marginTop: 8, opacity: 0.6 }}>
-          + Add an Ingredient  <span style={{ fontSize: 11, fontWeight: 400 }}>(coming soon)</span>
+        {!showIngredientAdder ? (
+          <button
+            onClick={() => setShowIngredientAdder(true)}
+            style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, color: C.textMuted, fontWeight: 600, fontSize: 15, padding: '13px', cursor: 'pointer', marginTop: 8 }}>
+            + Add an Ingredient
+          </button>
+        ) : (
+          <div style={{ marginTop: 8 }}>
+            <input
+              autoFocus
+              value={adderQuery}
+              onChange={e => setAdderQuery(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && adderQuery.trim()) handleAddAndAnalyze(adderQuery.trim()) }}
+              placeholder="Type an ingredient..."
+              style={{ width: '100%', background: C.surface, border: `1px solid ${C.gold}`, borderRadius: 10, color: C.text, fontSize: 15, padding: '13px 16px', boxSizing: 'border-box', outline: 'none' }}
+            />
+            <div style={{ fontSize: 12, color: C.textFaint, marginTop: 6, paddingLeft: 4 }}>Press Enter to add, or tap any pill above</div>
+            <button
+              onClick={() => { setShowIngredientAdder(false); setAdderQuery('') }}
+              style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 13, cursor: 'pointer', marginTop: 4, padding: '4px 0' }}>
+              Cancel
+            </button>
+          </div>
+        )}
+        <button onClick={() => setStep('prefs')} style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: 'pointer', marginTop: 8 }}>
+          Quick Build →
+        </button>
+      </div>
+    )
+  }
+
+  if (step === 'combination') {
+    const COMBO_STYLES = [
+      { id: 'Stirred', emoji: '🥃' }, { id: 'On the Rocks', emoji: '🧊' },
+      { id: 'Shaken / Sours', emoji: '🍋' }, { id: 'Highball', emoji: '🫧' },
+      { id: 'Tiki / Swizzle', emoji: '🌺' }, { id: 'Warm Drink', emoji: '☕' },
+      { id: 'Spirit Forward / Dry', emoji: '🥃' }, { id: 'Earthy / Smoky', emoji: '🍂' },
+    ]
+
+    return (
+      <div>
+        <button onClick={() => { setCombinationData(null); setCombinationError(null); setStep('affinities') }} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 24 }}>
+          Building: <span style={{ color: C.gold }}>{selected.join(' + ')}</span>
+        </div>
+
+        {combinationLoading ? (
+          <div style={{ textAlign: 'center', padding: '40px 0', color: C.textFaint, fontSize: 14 }}>
+            Analyzing combination…
+          </div>
+        ) : combinationError ? (
+          <div style={{ background: C.amber + '15', border: `1px solid ${C.amber}44`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.amber, marginBottom: 20 }}>
+            {combinationError}
+          </div>
+        ) : combinationData ? (
+          <>
+            <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Combined Profile</div>
+            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 20 }}>
+              <div style={{ fontSize: 14, color: C.textMuted, lineHeight: 1.55 }}>{combinationData.combined_profile}</div>
+            </div>
+
+            <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Suggested Style</div>
+            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 8 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: C.gold, marginBottom: 4 }}>
+                {EXPLORATION_STYLE_EMOJI[combinationData.suggested_style] || '✨'} {combinationData.suggested_style}
+              </div>
+              <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5 }}>{combinationData.style_reason}</div>
+            </div>
+
+            <div style={{ fontSize: 12, color: C.textFaint, marginBottom: 16, paddingLeft: 2 }}>Not the right vibe? Pick another:</div>
+            <div style={{ display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 4, marginBottom: 20 }}>
+              {COMBO_STYLES.filter(s => s.id !== combinationData.suggested_style).map(s => (
+                <button
+                  key={s.id}
+                  onClick={() => setCombinationData(prev => ({ ...prev, suggested_style: s.id, style_reason: 'Manually selected.' }))}
+                  style={{ flexShrink: 0, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 13, fontWeight: 500, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                  {s.emoji} {s.id}
+                </button>
+              ))}
+            </div>
+
+            {combinationData.additional_suggestions?.length > 0 && (
+              <>
+                <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Consider Adding</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 20 }}>
+                  {combinationData.additional_suggestions.map((s, i) => (
+                    <div
+                      key={i}
+                      onClick={() => handleAddAndAnalyze(s.name)}
+                      style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 16px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                      <div>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: C.text, marginBottom: 2 }}>{s.name}</div>
+                        <div style={{ fontSize: 12, color: C.textFaint, lineHeight: 1.4 }}>{s.reason}</div>
+                      </div>
+                      <span style={{ color: C.gold, fontSize: 18, flexShrink: 0 }}>+</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </>
+        ) : null}
+
+        <button
+          onClick={() => handleExplore(combinationData?.suggested_style || null)}
+          disabled={combinationLoading}
+          style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: combinationLoading ? 'default' : 'pointer', marginTop: 8, opacity: combinationLoading ? 0.7 : 1 }}>
+          Build Recipes →
         </button>
       </div>
     )
