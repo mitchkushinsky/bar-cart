@@ -2282,7 +2282,7 @@ Rules:
                 {flavorTags.length > 0 ? (
                   <div style={{ display: 'flex', flexWrap: 'wrap' }}>
                     {flavorTags.map(tag => (
-                      <span key={tag} onClick={() => { setAdderQuery(tag); setShowIngredientAdder(true) }} style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.surface, border: `1px solid ${C.border}`, color: C.textMuted, cursor: 'pointer' }}>{tag}</span>
+                      <span key={tag} onClick={() => handleAddAndAnalyze(tag)} style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.surface, border: `1px solid ${C.border}`, color: C.textMuted, cursor: 'pointer' }}>{tag}</span>
                     ))}
                   </div>
                 ) : (
