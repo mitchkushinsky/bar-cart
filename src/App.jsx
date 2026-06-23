@@ -395,12 +395,17 @@ First check if the featured ingredients fundamentally clash in cocktail contexts
 
 Otherwise use web search to find 2–3 published cocktail recipes. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
 
+CRITICAL: Every recipe suggestion MUST include ALL featured ingredients (${ingredients.join(', ')}). Do NOT suggest recipes that omit any featured ingredient — even if fewer results are available as a result.
+
+If you cannot find 2–3 published recipes that include ALL featured ingredients, return as many as you can find (even 0 or 1). If no qualifying published recipes exist, return an empty suggestions array and set "no_recipes_found": true. Do NOT invent original recipes in this call — that is handled separately.
+
 Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
 Return ONLY valid JSON with no markdown fences:
 {
   "incompatible": false,
   "incompatibility_reason": null,
+  "no_recipes_found": false,
   "flavor_profile_note": "1-2 sentences on why these ingredients work together",
   "pairs_well_with": "2-3 strongest flavor affinities only — one short sentence, not an exhaustive list",
   "suggestions": [
@@ -473,6 +478,8 @@ SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated
 First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
 Otherwise invent 2–3 original cocktails that showcase the featured ingredients. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
+
+CRITICAL: Every original cocktail MUST feature ALL of the featured ingredients (${ingredients.join(', ')}). Do not omit any featured ingredient from any suggestion.
 
 Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false (something worth buying an ingredient for), unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists.
 
@@ -555,6 +562,7 @@ async function analyzeExplorations(ingredients, style, flavors, lowABV, inventor
   const partialSource = !recipeData ? 'web' : !originalData ? 'original' : null
   const allSuggestions = [...(recipeData?.suggestions || []), ...(originalData?.suggestions || [])]
   const primaryData = recipeData || originalData
+  const noPublishedRecipes = recipesSettled.status === 'fulfilled' && recipesSettled.value?.no_recipes_found === true
 
   if (allSuggestions.length === 0) {
     return {
@@ -563,6 +571,7 @@ async function analyzeExplorations(ingredients, style, flavors, lowABV, inventor
         incompatibility_reason: primaryData.incompatibility_reason,
         flavor_profile_note: null,
         pairs_well_with: null,
+        no_recipes_found: noPublishedRecipes,
         suggestions: [],
       }),
       partialSource,
@@ -575,6 +584,7 @@ async function analyzeExplorations(ingredients, style, flavors, lowABV, inventor
       incompatibility_reason: null,
       flavor_profile_note: recipeData?.flavor_profile_note || originalData?.flavor_profile_note || null,
       pairs_well_with: recipeData?.pairs_well_with || originalData?.pairs_well_with || null,
+      no_recipes_found: noPublishedRecipes,
       suggestions: allSuggestions,
     }),
     partialSource,
@@ -2339,8 +2349,10 @@ Rules:
         </div>
 
         {combinationLoading ? (
-          <div style={{ textAlign: 'center', padding: '40px 0', color: C.textFaint, fontSize: 14 }}>
-            Analyzing combination…
+          <div style={{ textAlign: 'center', padding: '40px 0' }}>
+            <style>{`@keyframes bcspin3 { to { transform: rotate(360deg); } }`}</style>
+            <div style={{ width: 32, height: 32, borderRadius: '50%', border: `3px solid ${C.border}`, borderTopColor: C.gold, animation: 'bcspin3 0.8s linear infinite', margin: '0 auto 16px' }} />
+            <div style={{ fontSize: 14, color: C.textFaint }}>Analyzing combination…</div>
           </div>
         ) : combinationError ? (
           <div style={{ background: C.amber + '15', border: `1px solid ${C.amber}44`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.amber, marginBottom: 20 }}>
@@ -2396,9 +2408,9 @@ Rules:
         ) : null}
 
         <button
-          onClick={() => handleExplore(combinationData?.suggested_style, true)}
+          onClick={() => !combinationLoading && handleExplore(combinationData?.suggested_style, true)}
           disabled={combinationLoading}
-          style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: combinationLoading ? 'default' : 'pointer', marginTop: 8, opacity: combinationLoading ? 0.7 : 1 }}>
+          style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: combinationLoading ? 'default' : 'pointer', marginTop: 8, opacity: combinationLoading ? 0.5 : 1, transition: 'opacity 0.2s' }}>
           Build Recipes →
         </button>
       </div>
@@ -2507,6 +2519,11 @@ Rules:
           <div style={{ background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 10, padding: '12px 16px', marginBottom: 24, fontSize: 14, color: C.text, lineHeight: 1.6 }}>
             <div style={{ fontWeight: 600, color: C.amber, marginBottom: 4 }}>🔗 Pairs Well With</div>
             {result.pairs_well_with}
+          </div>
+        )}
+        {result.no_recipes_found && (
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.textFaint, marginBottom: 20, lineHeight: 1.5 }}>
+            No published recipes were found featuring all of these ingredients together. Showing original creations only.
           </div>
         )}
         <div style={{ opacity: isFeedbackLoading ? 0.4 : 1, transition: 'opacity 0.3s', pointerEvents: isFeedbackLoading ? 'none' : 'auto' }}>
