@@ -2002,9 +2002,9 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
 
   const toggleFlavor = id => setFlavors(prev => prev.includes(id) ? prev.filter(f => f !== id) : prev.length < 3 ? [...prev, id] : prev)
 
-  const handleExplore = async (styleOverride) => {
+  const handleExplore = async (styleOverride, fromCombination = false) => {
     const activeStyle = styleOverride !== undefined ? styleOverride : style
-    setResultsPreviousStep(styleOverride !== undefined ? 'combination' : 'prefs')
+    setResultsPreviousStep(fromCombination ? 'combination' : 'prefs')
     setStep('loading')
     setPartialSource(null)
     try {
@@ -2151,6 +2151,12 @@ Rules:
     setShowIngredientAdder(false)
     setAdderQuery('')
 
+    // Navigate immediately so user sees loading state rather than the expanded affinities screen
+    setCombinationLoading(true)
+    setCombinationData(null)
+    setCombinationError(null)
+    setStep('combination')
+
     const normNew = trimmed.trim().toLowerCase()
     const mergedAffinityData = { ...affinityData }
 
@@ -2276,7 +2282,7 @@ Rules:
                 {flavorTags.length > 0 ? (
                   <div style={{ display: 'flex', flexWrap: 'wrap' }}>
                     {flavorTags.map(tag => (
-                      <span key={tag} onClick={() => handleAddAndAnalyze(tag)} style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.surface, border: `1px solid ${C.border}`, color: C.textMuted, cursor: 'pointer' }}>{tag}</span>
+                      <span key={tag} onClick={() => { setAdderQuery(tag); setShowIngredientAdder(true) }} style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.surface, border: `1px solid ${C.border}`, color: C.textMuted, cursor: 'pointer' }}>{tag}</span>
                     ))}
                   </div>
                 ) : (
@@ -2302,7 +2308,7 @@ Rules:
               placeholder="Type an ingredient..."
               style={{ width: '100%', background: C.surface, border: `1px solid ${C.gold}`, borderRadius: 10, color: C.text, fontSize: 15, padding: '13px 16px', boxSizing: 'border-box', outline: 'none' }}
             />
-            <div style={{ fontSize: 12, color: C.textFaint, marginTop: 6, paddingLeft: 4 }}>Press Enter to add, or tap any pill above</div>
+            <div style={{ fontSize: 12, color: C.textFaint, marginTop: 6, paddingLeft: 4 }}>Refine or replace, then press Enter to add</div>
             <button
               onClick={() => { setShowIngredientAdder(false); setAdderQuery('') }}
               style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 13, cursor: 'pointer', marginTop: 4, padding: '4px 0' }}>
@@ -2390,7 +2396,7 @@ Rules:
         ) : null}
 
         <button
-          onClick={() => handleExplore(combinationData?.suggested_style || null)}
+          onClick={() => handleExplore(combinationData?.suggested_style, true)}
           disabled={combinationLoading}
           style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: combinationLoading ? 'default' : 'pointer', marginTop: 8, opacity: combinationLoading ? 0.7 : 1 }}>
           Build Recipes →
