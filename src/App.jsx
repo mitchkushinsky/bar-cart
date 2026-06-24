@@ -2073,7 +2073,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
       // Step 3: Generate on-demand for any not in the table
       if (missing.length > 0) {
         try {
-          const ingredients = missing.map(name => ({ name, category: '', notes: '' }))
+          const ingredients = missing.map(name => ({ name, category: '', notes: '', own_flavors: map[name.trim().toLowerCase()]?.flavor_tags || [] }))
           const response = await fetch('/api/backfill-affinities', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
@@ -2183,7 +2183,7 @@ Rules:
           const response = await fetch('/api/backfill-affinities', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ ingredients: [{ name: trimmed, category: '', notes: '' }] }),
+            body: JSON.stringify({ ingredients: [{ name: trimmed, category: '', notes: '', own_flavors: mergedAffinityData[normNew]?.flavor_tags || [] }] }),
           })
           if (response.ok) {
             const { data: freshData } = await supabase

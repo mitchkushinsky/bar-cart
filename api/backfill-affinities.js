@@ -34,6 +34,7 @@ export default async function handler(req, res) {
     .map((ing, i) => {
       let line = `${i + 1}. ${ing.name}${ing.category ? ` (${ing.category})` : ''}`
       if (ing.notes) line += `\n   Owner notes: ${ing.notes}`
+      if (ing.own_flavors?.length) line += `\n   Own flavors: ${ing.own_flavors.join(', ')}`
       return line
     })
     .join('\n')
@@ -44,6 +45,8 @@ export default async function handler(req, res) {
 - flavor_tags: 4-8 short lowercase tags describing NON-ALCOHOLIC flavor affinities — fruits, botanicals, spices, textures, etc. (e.g. "citrus", "ginger", "raspberry", "honey", "bitter", "stone fruit"). These should be flavor/ingredient descriptors, not spirit names.
 
 If "Owner notes" are provided for an ingredient, treat them as expert supplementary knowledge — incorporate them into your analysis, letting them bias or correct the tags and affinities where relevant. Owner notes take precedence over general knowledge when they conflict.
+
+If "Own flavors" are listed for an ingredient, use them as context when generating pairing suggestions. Do NOT suggest flavors that are dominant or defining characteristics of the spirit itself — those flavors are already present in the drink, so suggesting them as pairings is redundant. You MAY suggest a flavor from Own flavors if it is a subtle accent worth amplifying, but use judgment: if a flavor is central to the spirit's identity, exclude it from the pairing suggestions.
 
 Important: A flavor (like "raspberry") can appear in BOTH spirit_tags (as "raspberry liqueur") AND flavor_tags (as "raspberry") — this is correct and intentional.
 
