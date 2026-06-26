@@ -53,6 +53,31 @@
 // alter table in_the_lab add column if not exists original_instructions text;
 // alter table in_the_lab add column if not exists original_summary text;
 // alter table in_the_lab add column if not exists original_glass_type text;
+//
+// create table if not exists exploration_whiteboards (
+//   id uuid default gen_random_uuid() primary key,
+//   user_id uuid references auth.users not null,
+//   title text not null,
+//   status text not null default 'active',
+//   last_touched_at timestamptz default now(),
+//   created_at timestamptz default now()
+// );
+// alter table exploration_whiteboards enable row level security;
+// create policy "Users own their whiteboards" on exploration_whiteboards for all using (auth.uid() = user_id);
+//
+// create table if not exists exploration_nodes (
+//   id uuid default gen_random_uuid() primary key,
+//   whiteboard_id uuid references exploration_whiteboards not null,
+//   parent_node_id uuid references exploration_nodes,
+//   node_type text not null,
+//   payload jsonb not null default '{}',
+//   notes text,
+//   created_at timestamptz default now()
+// );
+// alter table exploration_nodes enable row level security;
+// create policy "Users own their nodes" on exploration_nodes for all using (
+//   auth.uid() = (select user_id from exploration_whiteboards where id = whiteboard_id)
+// );
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
@@ -1728,7 +1753,7 @@ function removeLocalExplorationHistory(searchKey) {
   return entries
 }
 
-function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, onSaveInTheLab }) {
+function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, onSaveInTheLab, user, whiteboardId, recipeListNodeId }) {
   const [expanded, setExpanded] = useState(false)
   const [savedTo, setSavedTo] = useState(null) // null | 'ondeck' | 'inthelab'
   const [tweakedSuggestion, setTweakedSuggestion] = useState(null)
@@ -1737,6 +1762,7 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
   const [isTweakLoading, setIsTweakLoading] = useState(false)
   const [tweakDone, setTweakDone] = useState(false)
   const [tweakError, setTweakError] = useState(null)
+  const recipeNodeIdRef = useRef(null)
 
   const displayed = tweakedSuggestion || suggestion
 
@@ -1748,16 +1774,46 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
     onSaveInTheLab(displayed, primaryIngredients)
     setSavedTo('inthelab')
   }
+  const handleToggleExpand = async () => {
+    const next = !expanded
+    setExpanded(next)
+    if (next && !recipeNodeIdRef.current && user && whiteboardId && recipeListNodeId) {
+      try {
+        const { data } = await supabase
+          .from('exploration_nodes')
+          .insert({ whiteboard_id: whiteboardId, parent_node_id: recipeListNodeId, node_type: 'recipe', payload: { recipe: displayed } })
+          .select('id').single()
+        recipeNodeIdRef.current = data?.id ?? null
+        if (data?.id) {
+          await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId)
+        }
+      } catch (err) {
+        console.warn('[whiteboard] recipe node write failed:', err.message)
+      }
+    }
+  }
+
   const handleTweakSubmit = async () => {
     if (!tweakText.trim() || isTweakLoading) return
     setIsTweakLoading(true)
     setTweakError(null)
+    const promptText = tweakText.trim()
     try {
-      const revised = await tweakSingleSuggestion(displayed, tweakText.trim())
+      const revised = await tweakSingleSuggestion(displayed, promptText)
       setTweakedSuggestion(revised)
       setTweakDone(true)
       setIsTweaking(false)
       setTweakText('')
+      if (user && whiteboardId && recipeNodeIdRef.current) {
+        try {
+          await supabase
+            .from('exploration_nodes')
+            .insert({ whiteboard_id: whiteboardId, parent_node_id: recipeNodeIdRef.current, node_type: 'tweak', payload: { prompt: promptText, result: revised } })
+          await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId)
+        } catch (err) {
+          console.warn('[whiteboard] tweak node write failed:', err.message)
+        }
+      }
     } catch (err) {
       setTweakError(err.message || 'Could not tweak this suggestion. Please try again.')
     } finally {
@@ -1782,7 +1838,7 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
 
       {displayed.summary && <p style={{ fontSize: 14, color: C.textMuted, lineHeight: 1.55, marginBottom: 10 }}>{displayed.summary}</p>}
 
-      <button onClick={() => setExpanded(e => !e)}
+      <button onClick={handleToggleExpand}
         style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0, marginBottom: expanded ? 12 : 0 }}>
         {expanded ? '▲ Hide recipe' : '▼ Show recipe & ingredients'}
       </button>
@@ -1895,7 +1951,7 @@ const EXPLORE_LOADING_MSGS = [
   'Almost there…',
 ]
 
-function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTheLab, user }) {
+function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTheLab, user, pendingRestore, onRestoreConsumed }) {
   const [step, setStep] = useState('ingredients')
   const [selected, setSelected] = useState([])
   const [style, setStyle] = useState(null)
@@ -1921,6 +1977,9 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   const [showIngredientAdder, setShowIngredientAdder] = useState(false)
   const [adderQuery, setAdderQuery] = useState('')
   const [resultsPreviousStep, setResultsPreviousStep] = useState('prefs')
+  const [currentWhiteboardId, setCurrentWhiteboardId] = useState(null)
+  const [currentRecipeListNodeId, setCurrentRecipeListNodeId] = useState(null)
+  const [continueFromNodeId, setContinueFromNodeId] = useState(null)
 
   useEffect(() => {
     const load = async () => {
@@ -1942,6 +2001,21 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   }, [user?.id])
 
   useEffect(() => { stepRef.current = step }, [step])
+
+  useEffect(() => {
+    if (!pendingRestore) return
+    setSelected(pendingRestore.primary_ingredients || [])
+    setStyle(pendingRestore.cocktail_style || null)
+    setFlavors(pendingRestore.flavor_profile || [])
+    setLowABV(pendingRestore.low_abv || false)
+    setResult(pendingRestore.result || null)
+    setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null)
+    setCurrentWhiteboardId(pendingRestore.whiteboardId || null)
+    setCurrentRecipeListNodeId(pendingRestore.restoreRecipeListNodeId || null)
+    setContinueFromNodeId(pendingRestore.continueFromNodeId || null)
+    setStep(pendingRestore.resumeStep || (pendingRestore.result ? 'results' : 'ingredients'))
+    onRestoreConsumed?.()
+  }, [pendingRestore]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (step !== 'loading') return
@@ -2022,14 +2096,51 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
       setResult(data)
       setPartialSource(ps)
       setStep('results')
-      if (!data.incompatible) upsertHistory(selected, activeStyle, flavors, lowABV, data)
+      if (!data.incompatible) {
+        upsertHistory(selected, activeStyle, flavors, lowABV, data)
+        if (user) {
+          try {
+            const now = new Date().toISOString()
+            let wbId = currentWhiteboardId
+            let recipeListParentId = continueFromNodeId
+
+            if (!wbId) {
+              const { data: wb } = await supabase
+                .from('exploration_whiteboards')
+                .insert({ user_id: user.id, title: selected.join(' + '), status: 'active', last_touched_at: now })
+                .select('id').single()
+              wbId = wb?.id
+              setCurrentWhiteboardId(wbId ?? null)
+              if (wbId) {
+                const { data: ingNode } = await supabase
+                  .from('exploration_nodes')
+                  .insert({ whiteboard_id: wbId, parent_node_id: null, node_type: 'ingredients', payload: { selected: [...selected], style: fromCombination ? 'recommended' : 'overridden', cocktail_style: activeStyle, flavor_profile: [...flavors], low_abv: lowABV } })
+                  .select('id').single()
+                recipeListParentId = ingNode?.id ?? null
+              }
+            }
+
+            if (wbId) {
+              const { data: listNode } = await supabase
+                .from('exploration_nodes')
+                .insert({ whiteboard_id: wbId, parent_node_id: recipeListParentId ?? null, node_type: 'recipe_list', payload: { recipes: data.suggestions || [] } })
+                .select('id').single()
+              setCurrentRecipeListNodeId(listNode?.id ?? null)
+              setContinueFromNodeId(null)
+              await supabase.from('exploration_whiteboards').update({ last_touched_at: now }).eq('id', wbId)
+            }
+          } catch (err) {
+            console.warn('[whiteboard] failed to write whiteboard:', err.message)
+          }
+        }
+      }
     } catch (err) {
       setError(err.message || 'Something went wrong. Please try again.')
       setStep('error')
     }
   }
 
-  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setResultsPreviousStep('prefs') }
+  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setResultsPreviousStep('prefs'); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setContinueFromNodeId(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2207,29 +2318,6 @@ Rules:
     <div>
       <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 4 }}>Explorations</div>
       <div style={{ fontSize: 14, color: C.textMuted, marginBottom: 24, lineHeight: 1.55 }}>Pick up to 2 ingredients and we'll suggest cocktails you can make — or inspire you to try something new.</div>
-      {history.length > 0 && (
-        <div style={{ marginBottom: 24 }}>
-          <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>Recent Searches</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {history.map((entry, i) => (
-              <div key={entry.search_key || i}
-                style={{ display: 'flex', alignItems: 'center', gap: 10, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', cursor: 'pointer' }}
-                onClick={() => restoreFromHistory(entry)}>
-                <span style={{ fontSize: 18, flexShrink: 0 }}>{EXPLORATION_STYLE_EMOJI[entry.cocktail_style] || '✨'}</span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.primary_ingredients.join(' + ')}</div>
-                  <div style={{ fontSize: 11, color: C.textFaint, marginTop: 1 }}>{entry.cocktail_style} · {relativeTime(entry.updated_at)}</div>
-                </div>
-                <button
-                  onClick={e => { e.stopPropagation(); handleRemoveHistory(entry.search_key) }}
-                  style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 14, cursor: 'pointer', padding: '2px 6px', flexShrink: 0 }}>
-                  ✕
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
       <IngredientSearch inventory={inventory} selected={selected} onSelect={ing => setSelected(p => [...p, ing])} onRemove={ing => setSelected(p => p.filter(i => i !== ing))} />
       {selected.length > 0 && (
         <button onClick={handleNextFromIngredients} disabled={affinityLoading} style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: affinityLoading ? 'default' : 'pointer', marginTop: 24, opacity: affinityLoading ? 0.7 : 1 }}>
@@ -2531,7 +2619,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} />)}
+                {canMake.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} />)}
               </div>
             </div>
           )}
@@ -2539,7 +2627,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Worth Buying For ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} />)}
+                {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} />)}
               </div>
             </div>
           )}
@@ -2585,18 +2673,378 @@ Rules:
 
 // ─── Bottom Tab Bar ───────────────────────────────────────────────────────────
 
+function WhiteboardsTab({ user, onOpen }) {
+  const [whiteboards, setWhiteboards] = useState([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    if (!user) { setLoading(false); return }
+    const load = async () => {
+      setLoading(true)
+      try {
+        const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
+        await supabase.from('exploration_whiteboards')
+          .update({ status: 'archived' })
+          .eq('user_id', user.id).eq('status', 'active').lt('last_touched_at', cutoff)
+        const { data } = await supabase.from('exploration_whiteboards')
+          .select('id, title, last_touched_at')
+          .eq('user_id', user.id).eq('status', 'active')
+          .order('last_touched_at', { ascending: false })
+        setWhiteboards(data || [])
+      } catch (err) {
+        console.warn('[whiteboards] load error:', err.message)
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
+  }, [user?.id])
+
+  const handleArchive = async (id) => {
+    try {
+      await supabase.from('exploration_whiteboards').update({ status: 'archived' }).eq('id', id)
+      setWhiteboards(prev => prev.filter(w => w.id !== id))
+    } catch (err) {
+      console.warn('[whiteboards] archive error:', err.message)
+    }
+  }
+
+  if (!user) return <div style={{ fontSize: 14, color: C.textFaint, textAlign: 'center', padding: '40px 0' }}>Sign in to use Whiteboards.</div>
+  if (loading) return <div style={{ fontSize: 14, color: C.textFaint, textAlign: 'center', padding: '40px 0' }}>Loading…</div>
+  if (whiteboards.length === 0) return <div style={{ fontSize: 14, color: C.textFaint, textAlign: 'center', padding: '40px 0' }}>No active whiteboards. Complete an exploration to create one.</div>
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {whiteboards.map(wb => (
+        <div key={wb.id} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{wb.title}</div>
+            <div style={{ fontSize: 11, color: C.textFaint, marginTop: 2 }}>{relativeTime(wb.last_touched_at)}</div>
+          </div>
+          <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+            <button onClick={() => onOpen(wb.id)}
+              style={{ background: C.gold, border: 'none', borderRadius: 20, color: '#0f0f0f', fontSize: 12, fontWeight: 700, padding: '5px 14px', cursor: 'pointer' }}>
+              Open
+            </button>
+            <button onClick={() => handleArchive(wb.id)}
+              style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textFaint, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>
+              Archive
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
+  const [nodes, setNodes] = useState([])
+  const [whiteboard, setWhiteboard] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [expandedIds, setExpandedIds] = useState(new Set())
+  const [nodeNotes, setNodeNotes] = useState({})
+
+  useEffect(() => {
+    const load = async () => {
+      setLoading(true)
+      try {
+        const [{ data: wb }, { data: nds }] = await Promise.all([
+          supabase.from('exploration_whiteboards').select('*').eq('id', whiteboardId).single(),
+          supabase.from('exploration_nodes').select('*').eq('whiteboard_id', whiteboardId).order('created_at', { ascending: true }),
+        ])
+        setWhiteboard(wb)
+        const allNodes = nds || []
+        setNodes(allNodes)
+        const notesMap = {}
+        allNodes.forEach(n => { if (n.notes) notesMap[n.id] = n.notes })
+        setNodeNotes(notesMap)
+      } catch (err) {
+        console.warn('[whiteboard] load error:', err.message)
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
+  }, [whiteboardId])
+
+  const toggleExpand = (id) => {
+    setExpandedIds(prev => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  }
+
+  const handleSaveNotes = async (nodeId, notes) => {
+    try {
+      await supabase.from('exploration_nodes').update({ notes }).eq('id', nodeId)
+      await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId)
+    } catch (err) {
+      console.warn('[whiteboard] note save failed:', err.message)
+    }
+  }
+
+  const buildContinueRestore = (node) => {
+    const nodeMap = {}
+    nodes.forEach(n => { nodeMap[n.id] = n })
+
+    const selfAndAncestors = []
+    let cur = node
+    while (cur) { selfAndAncestors.unshift(cur); cur = cur.parent_node_id ? nodeMap[cur.parent_node_id] : null }
+
+    const ingredientsNode = selfAndAncestors.find(n => n.node_type === 'ingredients')
+    const recipeListNode = selfAndAncestors.find(n => n.node_type === 'recipe_list')
+
+    const selected = ingredientsNode?.payload?.selected || []
+    const cocktailStyle = ingredientsNode?.payload?.cocktail_style || null
+    const flavorProfile = ingredientsNode?.payload?.flavor_profile || []
+    const lowABV = ingredientsNode?.payload?.low_abv || false
+
+    const isIngredients = node.node_type === 'ingredients'
+    const restoreRecipeListNodeId = isIngredients ? null : (node.node_type === 'recipe_list' ? node.id : recipeListNode?.id ?? null)
+    const recipes = isIngredients ? null : (node.node_type === 'recipe_list' ? node.payload?.recipes : recipeListNode?.payload?.recipes) || []
+    const result = isIngredients ? null : { incompatible: false, incompatibility_reason: null, flavor_profile_note: null, pairs_well_with: null, suggestions: recipes }
+
+    return {
+      primary_ingredients: selected,
+      cocktail_style: cocktailStyle,
+      flavor_profile: flavorProfile,
+      low_abv: lowABV,
+      result,
+      resumeStep: isIngredients ? 'ingredients' : 'results',
+      whiteboardId,
+      continueFromNodeId: node.id,
+      restoreRecipeListNodeId,
+    }
+  }
+
+  const NODE_LABELS = { ingredients: 'Ingredients', recipe_list: 'Recipes', recipe: 'Recipe', tweak: 'Tweak' }
+
+  const nodeSummary = (node) => {
+    if (node.node_type === 'ingredients') {
+      const parts = [node.payload?.selected?.join(', ')]
+      if (node.payload?.cocktail_style) parts.push(node.payload.cocktail_style)
+      return parts.filter(Boolean).join(' · ')
+    }
+    if (node.node_type === 'recipe_list') return `${(node.payload?.recipes || []).length} recipes generated`
+    if (node.node_type === 'recipe') return node.payload?.recipe?.recipe_name || 'Recipe'
+    if (node.node_type === 'tweak') {
+      const p = node.payload?.prompt || ''
+      return p.length > 60 ? p.slice(0, 60) + '…' : p
+    }
+    return node.node_type
+  }
+
+  const renderNodeDetail = (node) => {
+    if (node.node_type === 'ingredients') return (
+      <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.6 }}>
+        <div><b>Ingredients:</b> {node.payload?.selected?.join(', ')}</div>
+        {node.payload?.cocktail_style && <div><b>Style:</b> {node.payload.cocktail_style}</div>}
+        {node.payload?.flavor_profile?.length > 0 && <div><b>Flavors:</b> {node.payload.flavor_profile.join(', ')}</div>}
+      </div>
+    )
+    if (node.node_type === 'recipe_list') return (
+      <div style={{ fontSize: 13, color: C.textMuted }}>
+        {(node.payload?.recipes || []).map((r, i) => (
+          <div key={i} style={{ padding: '4px 0', borderBottom: i < node.payload.recipes.length - 1 ? `1px solid ${C.border}` : 'none' }}>
+            {r.recipe_name}
+          </div>
+        ))}
+      </div>
+    )
+    if (node.node_type === 'recipe') {
+      const r = node.payload?.recipe || {}
+      return (
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: C.gold, marginBottom: 6 }}>{r.recipe_name}</div>
+          {r.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, marginBottom: 10 }}>{r.summary}</div>}
+          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 6 }}>Tasting Notes</div>
+          <textarea
+            value={nodeNotes[node.id] ?? node.notes ?? ''}
+            onChange={e => setNodeNotes(prev => ({ ...prev, [node.id]: e.target.value }))}
+            onBlur={e => handleSaveNotes(node.id, e.target.value)}
+            placeholder="Add your tasting notes…"
+            rows={3}
+            style={{ width: '100%', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, padding: '8px 10px', resize: 'vertical', outline: 'none', boxSizing: 'border-box' }}
+          />
+        </div>
+      )
+    }
+    if (node.node_type === 'tweak') return (
+      <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5 }}>
+        <div style={{ marginBottom: 6 }}><b>Prompt:</b> "{node.payload?.prompt}"</div>
+        {node.payload?.result?.recipe_name && (
+          <div style={{ color: C.gold, fontWeight: 600 }}>{node.payload.result.recipe_name}</div>
+        )}
+        {node.payload?.result?.summary && <div style={{ marginTop: 4 }}>{node.payload.result.summary}</div>}
+      </div>
+    )
+    return null
+  }
+
+  const renderNode = (node, depth) => {
+    const isExpanded = expandedIds.has(node.id)
+    const isRoot = !node.parent_node_id
+    const children = nodes.filter(n => n.parent_node_id === node.id)
+
+    return (
+      <div key={node.id}>
+        <div style={{ display: 'flex', marginLeft: depth * 16, paddingLeft: depth > 0 ? 12 : 0, borderLeft: depth > 0 ? `2px solid ${C.border}` : 'none' }}>
+          <div style={{ flex: 1, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', marginBottom: 6, cursor: 'pointer' }}
+            onClick={() => toggleExpand(node.id)}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 10, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: '2px 7px', color: C.textFaint, fontWeight: 700, letterSpacing: '0.05em', textTransform: 'uppercase', flexShrink: 0 }}>
+                {NODE_LABELS[node.node_type] || node.node_type}
+              </span>
+              <span style={{ fontSize: 13, color: C.text, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{nodeSummary(node)}</span>
+              <span style={{ color: C.textFaint, fontSize: 11, flexShrink: 0 }}>{isExpanded ? '▲' : '▼'}</span>
+            </div>
+
+            {isExpanded && (
+              <div style={{ marginTop: 10 }} onClick={e => e.stopPropagation()}>
+                {renderNodeDetail(node)}
+                {!isRoot && (
+                  <button
+                    onClick={() => onContinueFromNode(buildContinueRestore(node))}
+                    style={{ marginTop: 12, background: 'none', border: `1px solid ${C.gold}`, borderRadius: 20, color: C.gold, fontSize: 12, fontWeight: 600, padding: '5px 14px', cursor: 'pointer' }}>
+                    Continue from here →
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+        {children.map(child => renderNode(child, depth + 1))}
+      </div>
+    )
+  }
+
+  const rootNodes = nodes.filter(n => !n.parent_node_id)
+
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
+        <button onClick={onBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, cursor: 'pointer', padding: 0 }}>← Back</button>
+        <div style={{ fontSize: 20, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {whiteboard?.title || 'Whiteboard'}
+        </div>
+      </div>
+
+      {loading && <div style={{ fontSize: 14, color: C.textFaint, textAlign: 'center', padding: '40px 0' }}>Loading…</div>}
+
+      {!loading && nodes.length === 0 && (
+        <div style={{ fontSize: 14, color: C.textFaint, textAlign: 'center', padding: '40px 0' }}>No nodes yet.</div>
+      )}
+
+      {!loading && rootNodes.length > 0 && (
+        <div style={{ paddingBottom: 40 }}>
+          {rootNodes.map(root => renderNode(root, 0))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function InProgressScreen({ user, subTab, setSubTab, onContinue, onOpenWhiteboard }) {
+  const [history, setHistory] = useState([])
+
+  useEffect(() => {
+    const load = async () => {
+      if (user) {
+        const cutoff = new Date(Date.now() - EXPLORATION_HISTORY_MAX_AGE_MS).toISOString()
+        await supabase.from('explorations_history').delete().eq('user_id', user.id).lt('updated_at', cutoff)
+        const { data } = await supabase
+          .from('explorations_history')
+          .select('search_key,primary_ingredients,cocktail_style,flavor_profile,low_abv,result,updated_at')
+          .eq('user_id', user.id)
+          .order('updated_at', { ascending: false })
+          .limit(20)
+        if (data) setHistory(data)
+      } else {
+        setHistory(loadLocalExplorationHistory())
+      }
+    }
+    load()
+  }, [user?.id])
+
+  const handleRemove = (searchKey) => {
+    if (user) {
+      supabase.from('explorations_history').delete().eq('user_id', user.id).eq('search_key', searchKey).then()
+    }
+    setHistory(prev => {
+      const updated = prev.filter(e => e.search_key !== searchKey)
+      if (!user) saveLocalExplorationHistory(updated)
+      return updated
+    })
+  }
+
+  const IN_PROGRESS_TABS = [
+    { id: 'saved_explorations', label: 'Saved Explorations' },
+    { id: 'whiteboards', label: 'Whiteboards' },
+  ]
+
+  return (
+    <div>
+      <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 20 }}>In Progress</div>
+
+      {/* Sub-tabs */}
+      <div style={{ display: 'flex', borderBottom: `1px solid ${C.border}`, marginBottom: 24 }}>
+        {IN_PROGRESS_TABS.map(({ id, label }) => (
+          <button key={id} onClick={() => setSubTab(id)}
+            style={{ background: 'none', border: 'none', borderBottom: subTab === id ? `2px solid ${C.gold}` : '2px solid transparent', color: subTab === id ? C.gold : C.textMuted, fontSize: 14, fontWeight: subTab === id ? 600 : 400, padding: '8px 16px', cursor: 'pointer', marginBottom: -1 }}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {subTab === 'saved_explorations' && (
+        history.length === 0 ? (
+          <div style={{ fontSize: 14, color: C.textFaint, textAlign: 'center', padding: '40px 0' }}>No saved explorations yet. Start one from the Explorations tab.</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {history.map((entry, i) => (
+              <div key={entry.search_key || i}
+                style={{ display: 'flex', alignItems: 'center', gap: 10, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px' }}>
+                <span style={{ fontSize: 18, flexShrink: 0 }}>{EXPLORATION_STYLE_EMOJI[entry.cocktail_style] || '✨'}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.primary_ingredients.join(' + ')}</div>
+                  <div style={{ fontSize: 11, color: C.textFaint, marginTop: 1 }}>{entry.cocktail_style} · {relativeTime(entry.updated_at)}</div>
+                </div>
+                <button
+                  onClick={() => onContinue(entry)}
+                  style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '4px 10px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>
+                  Continue →
+                </button>
+                <button
+                  onClick={() => handleRemove(entry.search_key)}
+                  style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 14, cursor: 'pointer', padding: '2px 6px', flexShrink: 0 }}>
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        )
+      )}
+
+      {subTab === 'whiteboards' && (
+        <WhiteboardsTab user={user} onOpen={onOpenWhiteboard} />
+      )}
+    </div>
+  )
+}
+
 function BottomTabBar({ screen, onTab }) {
   const tabs = [
     { id: 'analyze',      icon: '🔍', label: 'Analyze' },
-    { id: 'explorations', icon: '✨', label: 'Explorations' },
+    { id: 'explorations', icon: '✨', label: 'Explore' },
+    { id: 'in_progress',  icon: '🗂️', label: 'In Progress' },
     { id: 'saved',        icon: '🍸', label: 'Saved' },
     { id: 'inventory',    icon: '📦', label: 'Inventory' },
-    { id: 'shopping',     icon: '🛒', label: 'Shopping' },
   ]
   return (
     <div style={{ position: 'fixed', bottom: 0, left: 0, right: 0, background: C.bg, borderTop: `1px solid ${C.border}`, display: 'flex', zIndex: 50, paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}>
       {tabs.map(({ id, icon, label }) => {
-        const active = screen === id
+        const active = screen === id || (id === 'in_progress' && screen === 'whiteboard')
         return (
           <button key={id} onClick={() => onTab(id)}
             style={{ flex: 1, background: 'none', border: 'none', color: active ? C.gold : C.textMuted, padding: '10px 4px 12px', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, transition: 'color 0.15s' }}>
@@ -2623,6 +3071,9 @@ export default function App() {
   // Navigation
   const [screen, setScreen] = useState('analyze')
   const [savedSubTab, setSavedSubTab] = useState('ondeck')
+  const [inProgressSubTab, setInProgressSubTab] = useState('saved_explorations')
+  const [pendingExplorationRestore, setPendingExplorationRestore] = useState(null)
+  const [currentOpenWhiteboardId, setCurrentOpenWhiteboardId] = useState(null)
 
   // Auth
   const [user, setUser] = useState(null)
@@ -3396,6 +3847,28 @@ export default function App() {
           onSaveOnDeck={handleSaveOnDeckFromExploration}
           onSaveInTheLab={handleSaveInTheLabFromExploration}
           user={user}
+          pendingRestore={pendingExplorationRestore}
+          onRestoreConsumed={() => setPendingExplorationRestore(null)}
+        />
+      )}
+
+      {/* Screen: In Progress */}
+      {screen === 'in_progress' && (
+        <InProgressScreen
+          user={user}
+          subTab={inProgressSubTab}
+          setSubTab={setInProgressSubTab}
+          onContinue={entry => { setPendingExplorationRestore(entry); setScreen('explorations') }}
+          onOpenWhiteboard={id => { setCurrentOpenWhiteboardId(id); setScreen('whiteboard') }}
+        />
+      )}
+
+      {/* Screen: Whiteboard */}
+      {screen === 'whiteboard' && currentOpenWhiteboardId && (
+        <WhiteboardScreen
+          whiteboardId={currentOpenWhiteboardId}
+          onBack={() => setScreen('in_progress')}
+          onContinueFromNode={restore => { setPendingExplorationRestore(restore); setScreen('explorations') }}
         />
       )}
 
