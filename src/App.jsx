@@ -2821,9 +2821,18 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
         </div>
       )
     }
-    if (node.node_type === 'tweak') return (
+    if (node.node_type === 'tweak') {
+      const tried = !!triedMap[node.id]
+      return (
       <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5 }}>
-        <div style={{ marginBottom: 6 }}><b>Prompt:</b> "{node.payload?.prompt}"</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+          <div style={{ flex: 1 }}><b>Prompt:</b> "{node.payload?.prompt}"</div>
+          <button
+            onClick={(e) => { e.stopPropagation(); handleToggleTried(node.id) }}
+            style={{ background: tried ? C.green + '22' : C.border + '66', border: `1px solid ${tried ? C.green : C.textFaint}`, borderRadius: 20, color: tried ? C.green : C.textMuted, fontSize: 12, fontWeight: tried ? 700 : 400, padding: '4px 12px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all 0.15s', flexShrink: 0 }}>
+            {tried ? '✓ Tried' : 'Mark Tried'}
+          </button>
+        </div>
         {node.payload?.result?.recipe_name && (
           <div style={{ color: C.gold, fontWeight: 600, marginBottom: 4 }}>{node.payload.result.recipe_name}</div>
         )}
@@ -2839,6 +2848,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
         />
       </div>
     )
+    }
     return null
   }
 
