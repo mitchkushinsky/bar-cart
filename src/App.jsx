@@ -2114,7 +2114,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
               if (wbId) {
                 const { data: ingNode } = await supabase
                   .from('exploration_nodes')
-                  .insert({ whiteboard_id: wbId, parent_node_id: null, node_type: 'ingredients', payload: { selected: [...selected], style: fromCombination ? 'recommended' : 'overridden', cocktail_style: activeStyle, flavor_profile: [...flavors], low_abv: lowABV } })
+                  .insert({ whiteboard_id: wbId, parent_node_id: null, node_type: 'ingredients', payload: { selected: selected.map(s => String(s)), style: fromCombination ? 'recommended' : 'overridden', cocktail_style: activeStyle != null ? String(activeStyle) : null, flavor_profile: flavors.map(f => String(f)), low_abv: Boolean(lowABV) } })
                   .select('id').single()
                 recipeListParentId = ingNode?.id ?? null
               }
