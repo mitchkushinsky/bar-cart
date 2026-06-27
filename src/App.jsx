@@ -79,7 +79,7 @@
 //   auth.uid() = (select user_id from exploration_whiteboards where id = whiteboard_id)
 // );
 
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import './App.css'
 import { supabase } from './supabase.js'
 
