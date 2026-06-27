@@ -979,14 +979,13 @@ function DifficultyBadge({ difficulty }) {
 
 // ─── Results ──────────────────────────────────────────────────────────────────
 
-function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, inTheLabList, onToggleInTheLab, onFeedback, feedbackLoading, inventory, isInLab, labItem, onMarkTried, onSaveLabToFavorites, onUpdateLabNotes, onArchiveFromLab, onRevertLabTweak }) {
+function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, onFeedback, feedbackLoading, inventory }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
   const adjustmentNoteRef = useRef(null)
   const [drawerItem, setDrawerItem] = useState(null)
   const [flavorCache, setFlavorCache] = useState({})
   const [drawerLoading, setDrawerLoading] = useState(false)
-  const [revertedBanner, setRevertedBanner] = useState(false)
 
   useEffect(() => {
     if (adjustmentNote) {
@@ -1018,7 +1017,6 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
   const variationCount = result.variations?.length || 0
   const isFav = favorites.some(f => f.recipeName === result.recipe_name)
   const isToMake = toMake.some(f => f.recipeName === result.recipe_name)
-  const isInLabSaved = (inTheLabList || []).some(f => f.recipeName === result.recipe_name)
 
   const handleFeedbackSubmit = () => {
     if (!feedbackText.trim()) return
@@ -1036,58 +1034,20 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
         {result.glass_type && <GlassIcon type={result.glass_type} size={22} />}
       </div>
       {/* Action buttons */}
-      {isInLab && labItem ? (
-        <>
-          <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
-            <button
-              onClick={() => onMarkTried(labItem.id, !labItem.tried)}
-              style={{ background: labItem.tried ? C.green + '22' : 'none', border: `1px solid ${labItem.tried ? C.green : C.border}`, borderRadius: 20, color: labItem.tried ? C.green : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all 0.15s' }}>
-              {labItem.tried ? '✓ Tried' : '✓ Mark as Tried'}
-            </button>
-            <button
-              onClick={() => onSaveLabToFavorites(labItem)}
-              style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap' }}>
-              → Save to Favorites
-            </button>
-            <button
-              onClick={() => onArchiveFromLab(labItem.id)}
-              style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap' }}>
-              🗑 Archive
-            </button>
-          </div>
-          <div style={{ marginBottom: 20 }}>
-            <div style={{ fontSize: 12, color: C.textFaint, marginBottom: 6 }}>Your notes</div>
-            <textarea
-              key={labItem.id}
-              defaultValue={labItem.note || ''}
-              onBlur={(e) => onUpdateLabNotes(labItem.id, e.target.value)}
-              placeholder="How did it go? What would you change?"
-              style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 13, padding: '10px 12px', resize: 'vertical', minHeight: 72, outline: 'none', boxSizing: 'border-box', fontFamily: 'inherit', lineHeight: 1.5 }}
-            />
-          </div>
-        </>
-      ) : (
-        <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
-          <button
-            onClick={() => { console.log('On Deck clicked', result); onToggleToMake(result) }}
-            style={{ background: 'none', border: `1px solid ${isToMake ? C.blue : C.border}`, borderRadius: 20, color: isToMake ? C.blue : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
-          >
-            {isToMake ? '🍹 Saved to On Deck' : '🍹 On Deck'}
-          </button>
-          <button
-            onClick={() => onToggleInTheLab(result)}
-            style={{ background: 'none', border: `1px solid ${isInLabSaved ? C.amber : C.border}`, borderRadius: 20, color: isInLabSaved ? C.amber : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
-          >
-            {isInLabSaved ? '🧪 In the Lab ✓' : '🧪 In the Lab'}
-          </button>
-          <button
-            onClick={() => onToggleFavorite(result)}
-            style={{ background: 'none', border: `1px solid ${isFav ? C.gold : C.border}`, borderRadius: 20, color: isFav ? C.gold : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
-          >
-            {isFav ? '♥ Saved' : '♡ Save to Favorites'}
-          </button>
-        </div>
-      )}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+        <button
+          onClick={() => onToggleToMake(result)}
+          style={{ background: 'none', border: `1px solid ${isToMake ? C.blue : C.border}`, borderRadius: 20, color: isToMake ? C.blue : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
+        >
+          {isToMake ? '🍹 Saved to On Deck' : '🍹 On Deck'}
+        </button>
+        <button
+          onClick={() => onToggleFavorite(result)}
+          style={{ background: 'none', border: `1px solid ${isFav ? C.gold : C.border}`, borderRadius: 20, color: isFav ? C.gold : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
+        >
+          {isFav ? '♥ Saved' : '♡ Save to Favorites'}
+        </button>
+      </div>
 
       {result.summary && (
         <p style={{ color: C.textMuted, fontSize: 15, marginBottom: result._trainingDataFallback ? 10 : 24, lineHeight: 1.65, maxWidth: 600 }}>
@@ -1099,30 +1059,13 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
       )}
 
       {/* Adjustment note */}
-      {revertedBanner ? (
-        <div ref={adjustmentNoteRef} style={{ display: 'flex', alignItems: 'center', gap: 10, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 16px', marginBottom: 20, fontSize: 14, color: C.textMuted }}>
-          ↩ Reverted to original
-        </div>
-      ) : adjustmentNote && (
-        <div ref={adjustmentNoteRef} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, background: C.gold + '18', border: `1px solid ${C.gold}44`, borderRadius: 10, padding: '12px 16px', marginBottom: isInLab && labItem?.originalRecipe ? 6 : 20 }}>
+      {adjustmentNote && (
+        <div ref={adjustmentNoteRef} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, background: C.gold + '18', border: `1px solid ${C.gold}44`, borderRadius: 10, padding: '12px 16px', marginBottom: 20 }}>
           <span style={{ fontSize: 16, flexShrink: 0, marginTop: 1 }}>✓</span>
           <div>
             <span style={{ fontSize: 12, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: C.gold }}>Adjusted </span>
             <span style={{ fontSize: 14, color: C.text }}>{adjustmentNote}</span>
           </div>
-        </div>
-      )}
-      {!revertedBanner && isInLab && labItem?.originalRecipe && (
-        <div style={{ marginBottom: 20 }}>
-          <button
-            onClick={() => {
-              onRevertLabTweak(labItem)
-              setRevertedBanner(true)
-              setTimeout(() => setRevertedBanner(false), 3000)
-            }}
-            style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 13, cursor: 'pointer', padding: 0, textDecoration: 'underline' }}>
-            ↩ Revert to original
-          </button>
         </div>
       )}
 
@@ -1202,7 +1145,7 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
             style={{ background: feedbackText.trim() && !feedbackLoading ? C.gold : C.surface, border: `1px solid ${feedbackText.trim() && !feedbackLoading ? C.gold : C.border}`, borderRadius: 8, color: feedbackText.trim() && !feedbackLoading ? '#0f0f0f' : C.textFaint, fontSize: 13, fontWeight: 600, padding: '9px 14px', cursor: feedbackText.trim() && !feedbackLoading ? 'pointer' : 'default', whiteSpace: 'nowrap', transition: 'background 0.15s, color 0.15s', display: 'flex', alignItems: 'center', gap: 6 }}
           >
             {feedbackLoading && <span style={{ display: 'inline-block', width: 12, height: 12, border: '2px solid currentColor', borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite', flexShrink: 0 }} />}
-            {feedbackLoading ? 'Revising…' : isInLab ? 'Tweak & Improve' : 'Something Off? Adjust'}
+            {feedbackLoading ? 'Revising…' : 'Something Off? Adjust'}
           </button>
         </div>
       </div>
@@ -1501,56 +1444,20 @@ function ToMakeCard({ item, onRemove, onView }) {
   )
 }
 
-// ─── In the Lab Card ──────────────────────────────────────────────────────────
-
-function InTheLabCard({ item, onRemove, onView }) {
-  return (
-    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontWeight: 700, fontSize: 16, color: C.amber, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
-            {item.recipeName}{item.glassType && <GlassIcon type={item.glassType} size={15} />}
-            {item.tried && <span style={{ fontSize: 11, fontWeight: 700, color: C.green, background: C.green + '22', borderRadius: 10, padding: '2px 7px' }}>✓ Tried</span>}
-          </div>
-          {item.source === 'Exploration' && (
-            <div style={{ display: 'flex', gap: 6, marginBottom: 6, flexWrap: 'wrap' }}>
-              <OriginBadge originFlag={item.originFlag} />
-              <DifficultyBadge difficulty={item.difficulty} />
-            </div>
-          )}
-          {item.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{item.summary}</div>}
-          {item.recipe && item.recipe.length > 0 && (
-            <div style={{ marginTop: 8, fontSize: 12, color: C.textFaint }}>
-              {item.recipe.slice(0, 3).map(r => r.ingredient).join(', ')}{item.recipe.length > 3 ? ` +${item.recipe.length - 3} more` : ''}
-            </div>
-          )}
-        </div>
-        <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
-          <button onClick={() => onView(item)} style={{ background: C.amber, border: 'none', borderRadius: 7, color: '#0f0f0f', fontSize: 12, fontWeight: 700, padding: '6px 12px', cursor: 'pointer' }}>View</button>
-          <button onClick={() => onRemove(item.id)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textFaint, fontSize: 18, padding: '2px 8px', cursor: 'pointer', lineHeight: 1 }}>×</button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 // ─── Saved Screen ─────────────────────────────────────────────────────────────
 
 const SOURCE_OPTIONS = ['All', 'Recipe Screenshot', 'Bar Menu', 'Cocktail Name', 'Exploration']
 
-function SavedScreen({ savedSubTab, setSavedSubTab, toMake, inTheLabList, favorites, onRemoveToMake, onRemoveInTheLab, onRemoveFavorite, onViewToMake, onViewInTheLab, onViewFavorite, onUpdateNote }) {
+function SavedScreen({ savedSubTab, setSavedSubTab, toMake, favorites, onRemoveToMake, onRemoveFavorite, onViewToMake, onViewFavorite, onUpdateNote }) {
   const [sourceFilter, setSourceFilter] = useState('All')
   const [ingredientFilter, setIngredientFilter] = useState(null)
 
-  const labTriedCount = inTheLabList.filter(i => i.tried).length
-
   const SUB_TABS = [
-    { id: 'ondeck',   label: 'On Deck',    count: toMake.length,        color: C.blue },
-    { id: 'inthelab', label: 'In the Lab', count: inTheLabList.length, triedCount: labTriedCount, color: C.amber },
-    { id: 'favorites',label: 'Favorites',  count: favorites.length,     color: C.gold },
+    { id: 'ondeck',   label: 'On Deck',   count: toMake.length,    color: C.blue },
+    { id: 'favorites',label: 'Favorites', count: favorites.length, color: C.gold },
   ]
 
-  const currentList = savedSubTab === 'ondeck' ? toMake : savedSubTab === 'inthelab' ? inTheLabList : favorites
+  const currentList = savedSubTab === 'ondeck' ? toMake : favorites
 
   let filteredList = sourceFilter === 'All' ? currentList : currentList.filter(i => (i.source || 'manual') === sourceFilter)
   if (sourceFilter === 'Exploration' && ingredientFilter) {
@@ -1563,7 +1470,6 @@ function SavedScreen({ savedSubTab, setSavedSubTab, toMake, inTheLabList, favori
 
   const emptyMsg = currentList.length === 0
     ? savedSubTab === 'ondeck' ? 'No recipes on deck yet. Analyze a recipe and tap 🍹 On Deck.'
-      : savedSubTab === 'inthelab' ? 'Nothing in the lab yet. Save a recipe with 🧪 In the Lab.'
       : 'No saved favorites yet. Analyze a recipe and tap ♡ Save to Favorites.'
     : 'No items match the current filter.'
 
@@ -1571,14 +1477,14 @@ function SavedScreen({ savedSubTab, setSavedSubTab, toMake, inTheLabList, favori
     <div>
       {/* Sub-tabs */}
       <div style={{ display: 'flex', borderBottom: `1px solid ${C.border}`, marginBottom: 16 }}>
-        {SUB_TABS.map(({ id, label, count, triedCount, color }) => {
+        {SUB_TABS.map(({ id, label, count, color }) => {
           const active = savedSubTab === id
           return (
             <button key={id} onClick={() => { setSavedSubTab(id); setSourceFilter('All'); setIngredientFilter(null) }}
               style={{ flex: 1, background: 'none', border: 'none', borderBottom: active ? `2px solid ${color}` : '2px solid transparent', color: active ? color : C.textMuted, fontSize: 13, fontWeight: active ? 600 : 400, padding: '10px 4px', cursor: 'pointer', marginBottom: -1, transition: 'color 0.15s', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 5 }}>
               {label}
               <span style={{ fontSize: 10, fontWeight: 700, background: color + '33', color, borderRadius: 10, padding: '1px 5px' }}>
-                {id === 'inthelab' && count > 0 ? `${triedCount}/${count}` : count}
+                {count}
               </span>
             </button>
           )
@@ -1619,7 +1525,6 @@ function SavedScreen({ savedSubTab, setSavedSubTab, toMake, inTheLabList, favori
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {filteredList.map(item => {
             if (savedSubTab === 'favorites') return <FavoriteCard key={item.id} fav={item} onRemove={onRemoveFavorite} onView={onViewFavorite} onUpdateNote={onUpdateNote} />
-            if (savedSubTab === 'inthelab') return <InTheLabCard key={item.id} item={item} onRemove={onRemoveInTheLab} onView={onViewInTheLab} />
             return <ToMakeCard key={item.id} item={item} onRemove={onRemoveToMake} onView={onViewToMake} />
           })}
         </div>
@@ -1753,9 +1658,9 @@ function removeLocalExplorationHistory(searchKey) {
   return entries
 }
 
-function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, onSaveInTheLab, user, whiteboardId, recipeListNodeId }) {
-  const [expanded, setExpanded] = useState(false)
-  const [savedTo, setSavedTo] = useState(null) // null | 'ondeck' | 'inthelab'
+function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, user, whiteboardId, recipeListNodeId, autoExpand }) {
+  const [expanded, setExpanded] = useState(!!autoExpand)
+  const [savedTo, setSavedTo] = useState(null) // null | 'ondeck'
   const [tweakedSuggestion, setTweakedSuggestion] = useState(null)
   const [isTweaking, setIsTweaking] = useState(false)
   const [tweakText, setTweakText] = useState('')
@@ -1769,10 +1674,6 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
   const handleOnDeck = () => {
     onSaveOnDeck(displayed, primaryIngredients)
     setSavedTo('ondeck')
-  }
-  const handleInLab = () => {
-    onSaveInTheLab(displayed, primaryIngredients)
-    setSavedTo('inthelab')
   }
   const handleToggleExpand = async () => {
     const next = !expanded
@@ -1884,18 +1785,10 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, o
       )}
 
       {savedTo ? (
-        <div style={{ marginTop: 12, fontSize: 13, color: C.textFaint, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <span>✓ Saved to {savedTo === 'ondeck' ? 'On Deck' : 'In the Lab'}</span>
-          <button onClick={savedTo === 'ondeck' ? handleInLab : handleOnDeck}
-            style={{ background: 'none', border: 'none', color: C.gold, fontSize: 13, cursor: 'pointer', padding: 0, textDecoration: 'underline' }}>
-            Move to {savedTo === 'ondeck' ? 'In the Lab' : 'On Deck'} instead?
-          </button>
-        </div>
+        <div style={{ marginTop: 12, fontSize: 13, color: C.textFaint }}>✓ Saved to On Deck</div>
       ) : (
         <div style={{ display: 'flex', gap: 6, marginTop: 12, flexWrap: 'wrap' }}>
           <button onClick={handleOnDeck} style={{ background: 'none', border: `1px solid ${C.blue}`, borderRadius: 20, color: C.blue, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>🍹 On Deck</button>
-          <button onClick={handleInLab} style={{ background: 'none', border: `1px solid ${C.amber}`, borderRadius: 20, color: C.amber, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>🧪 In the Lab</button>
-          <button style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textFaint, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>👎 Archive</button>
         </div>
       )}
       </div>
@@ -1951,7 +1844,7 @@ const EXPLORE_LOADING_MSGS = [
   'Almost there…',
 ]
 
-function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTheLab, user, pendingRestore, onRestoreConsumed }) {
+function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pendingRestore, onRestoreConsumed }) {
   const [step, setStep] = useState('ingredients')
   const [selected, setSelected] = useState([])
   const [style, setStyle] = useState(null)
@@ -1980,6 +1873,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
   const [currentWhiteboardId, setCurrentWhiteboardId] = useState(null)
   const [currentRecipeListNodeId, setCurrentRecipeListNodeId] = useState(null)
   const [continueFromNodeId, setContinueFromNodeId] = useState(null)
+  const [autoExpandRecipeName, setAutoExpandRecipeName] = useState(null)
 
   useEffect(() => {
     const load = async () => {
@@ -2013,6 +1907,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     setCurrentWhiteboardId(pendingRestore.whiteboardId || null)
     setCurrentRecipeListNodeId(pendingRestore.restoreRecipeListNodeId || null)
     setContinueFromNodeId(pendingRestore.continueFromNodeId || null)
+    setAutoExpandRecipeName(pendingRestore.autoExpandRecipeName || null)
     setStep(pendingRestore.resumeStep || (pendingRestore.result ? 'results' : 'ingredients'))
     onRestoreConsumed?.()
   }, [pendingRestore]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -2140,7 +2035,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, onSaveInTh
     }
   }
 
-  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setResultsPreviousStep('prefs'); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setContinueFromNodeId(null) }
+  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setResultsPreviousStep('prefs'); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setContinueFromNodeId(null); setAutoExpandRecipeName(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2619,7 +2514,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} />)}
+                {canMake.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} autoExpand={autoExpandRecipeName === s.recipe_name} />)}
               </div>
             </div>
           )}
@@ -2627,7 +2522,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Worth Buying For ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} onSaveInTheLab={onSaveInTheLab} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} />)}
+                {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} autoExpand={autoExpandRecipeName === s.recipe_name} />)}
               </div>
             </div>
           )}
@@ -2743,6 +2638,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
   const [loading, setLoading] = useState(true)
   const [expandedIds, setExpandedIds] = useState(new Set())
   const [nodeNotes, setNodeNotes] = useState({})
+  const [triedMap, setTriedMap] = useState({})
 
   useEffect(() => {
     const load = async () => {
@@ -2756,8 +2652,13 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
         const allNodes = nds || []
         setNodes(allNodes)
         const notesMap = {}
-        allNodes.forEach(n => { if (n.notes) notesMap[n.id] = n.notes })
+        const triedInit = {}
+        allNodes.forEach(n => {
+          if (n.notes) notesMap[n.id] = n.notes
+          if (n.tried) triedInit[n.id] = true
+        })
         setNodeNotes(notesMap)
+        setTriedMap(triedInit)
       } catch (err) {
         console.warn('[whiteboard] load error:', err.message)
       } finally {
@@ -2784,6 +2685,18 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     }
   }
 
+  const handleToggleTried = async (nodeId) => {
+    const next = !triedMap[nodeId]
+    setTriedMap(prev => ({ ...prev, [nodeId]: next }))
+    try {
+      await supabase.from('exploration_nodes').update({ tried: next }).eq('id', nodeId)
+      await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId)
+    } catch (err) {
+      console.warn('[whiteboard] tried toggle failed:', err.message)
+      setTriedMap(prev => ({ ...prev, [nodeId]: !next }))
+    }
+  }
+
   const buildContinueRestore = (node) => {
     const nodeMap = {}
     nodes.forEach(n => { nodeMap[n.id] = n })
@@ -2802,8 +2715,25 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
 
     const isIngredients = node.node_type === 'ingredients'
     const restoreRecipeListNodeId = isIngredients ? null : (node.node_type === 'recipe_list' ? node.id : recipeListNode?.id ?? null)
-    const recipes = isIngredients ? null : (node.node_type === 'recipe_list' ? node.payload?.recipes : recipeListNode?.payload?.recipes) || []
-    const result = isIngredients ? null : { incompatible: false, incompatibility_reason: null, flavor_profile_note: null, pairs_well_with: null, suggestions: recipes }
+    const baseRecipes = isIngredients ? null : (node.node_type === 'recipe_list' ? node.payload?.recipes : recipeListNode?.payload?.recipes) || []
+
+    // For tweak nodes: replace the original recipe in the list with the tweaked version
+    // so the card opens showing the tweaked result ready to tweak further.
+    let suggestions = baseRecipes
+    let autoExpandRecipeName = null
+    if (node.node_type === 'recipe') {
+      autoExpandRecipeName = node.payload?.recipe?.recipe_name ?? null
+    } else if (node.node_type === 'tweak') {
+      const recipeAncestor = selfAndAncestors.find(n => n.node_type === 'recipe')
+      const originalName = recipeAncestor?.payload?.recipe?.recipe_name
+      const tweakedResult = node.payload?.result
+      if (originalName && tweakedResult && Array.isArray(baseRecipes)) {
+        suggestions = baseRecipes.map(r => r.recipe_name === originalName ? { ...r, ...tweakedResult } : r)
+      }
+      autoExpandRecipeName = tweakedResult?.recipe_name ?? originalName ?? null
+    }
+
+    const result = isIngredients ? null : { incompatible: false, incompatibility_reason: null, flavor_profile_note: null, pairs_well_with: null, suggestions }
 
     return {
       primary_ingredients: selected,
@@ -2815,6 +2745,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
       whiteboardId,
       continueFromNodeId: node.id,
       restoreRecipeListNodeId,
+      autoExpandRecipeName,
     }
   }
 
@@ -2854,9 +2785,17 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     )
     if (node.node_type === 'recipe') {
       const r = node.payload?.recipe || {}
+      const tried = !!triedMap[node.id]
       return (
         <div>
-          <div style={{ fontSize: 14, fontWeight: 700, color: C.gold, marginBottom: 6 }}>{r.recipe_name}</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: C.gold, flex: 1 }}>{r.recipe_name}</div>
+            <button
+              onClick={() => handleToggleTried(node.id)}
+              style={{ background: tried ? C.green + '22' : 'none', border: `1px solid ${tried ? C.green : C.border}`, borderRadius: 20, color: tried ? C.green : C.textMuted, fontSize: 12, fontWeight: tried ? 700 : 400, padding: '4px 12px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all 0.15s', flexShrink: 0 }}>
+              {tried ? '✓ Tried' : 'Mark Tried'}
+            </button>
+          </div>
           {r.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, marginBottom: 10 }}>{r.summary}</div>}
           <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 6 }}>Tasting Notes</div>
           <textarea
@@ -2874,9 +2813,18 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
       <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5 }}>
         <div style={{ marginBottom: 6 }}><b>Prompt:</b> "{node.payload?.prompt}"</div>
         {node.payload?.result?.recipe_name && (
-          <div style={{ color: C.gold, fontWeight: 600 }}>{node.payload.result.recipe_name}</div>
+          <div style={{ color: C.gold, fontWeight: 600, marginBottom: 4 }}>{node.payload.result.recipe_name}</div>
         )}
-        {node.payload?.result?.summary && <div style={{ marginTop: 4 }}>{node.payload.result.summary}</div>}
+        {node.payload?.result?.summary && <div style={{ marginBottom: 10 }}>{node.payload.result.summary}</div>}
+        <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 6 }}>Tasting Notes</div>
+        <textarea
+          value={nodeNotes[node.id] ?? node.notes ?? ''}
+          onChange={e => setNodeNotes(prev => ({ ...prev, [node.id]: e.target.value }))}
+          onBlur={e => handleSaveNotes(node.id, e.target.value)}
+          placeholder="Add your tasting notes…"
+          rows={3}
+          style={{ width: '100%', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, padding: '8px 10px', resize: 'vertical', outline: 'none', boxSizing: 'border-box' }}
+        />
       </div>
     )
     return null
@@ -3105,15 +3053,11 @@ export default function App() {
   const [toMake, setToMake] = useState(() => {
     try { return JSON.parse(localStorage.getItem('bar-cart-to-make')) || [] } catch { return [] }
   })
-  const [inTheLabList, setInTheLabList] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('bar-cart-in-the-lab')) || [] } catch { return [] }
-  })
 
   useEffect(() => { shoppingListRef.current = shoppingList }, [shoppingList])
   useEffect(() => { if (!user) localStorage.setItem('bar-cart-shopping', JSON.stringify(shoppingList)) }, [shoppingList, user])
   useEffect(() => { if (!user) localStorage.setItem('bar-cart-favorites', JSON.stringify(favorites)) }, [favorites, user])
   useEffect(() => { if (!user) localStorage.setItem('bar-cart-to-make', JSON.stringify(toMake)) }, [toMake, user])
-  useEffect(() => { if (!user) localStorage.setItem('bar-cart-in-the-lab', JSON.stringify(inTheLabList)) }, [inTheLabList, user])
 
   // DB helpers
   const dbFavToLocal = (row) => ({
@@ -3136,21 +3080,6 @@ export default function App() {
     savedAt: row.saved_at,
   })
 
-  const dbInTheLabToLocal = (row) => ({
-    id: row.id, recipeName: row.recipe_name, summary: row.summary,
-    recipe: row.recipe || [], instructions: row.instructions || null,
-    ingredients: row.ingredients || [], variations: row.variations || [],
-    glassType: row.glass_type || null, note: row.notes || '', mode: row.mode,
-    source: row.source || 'Exploration', originFlag: row.origin_flag || null,
-    difficulty: row.difficulty || null, primaryIngredients: row.primary_ingredients || [],
-    tried: row.tried || false,
-    originalRecipe: row.original_recipe || null,
-    originalInstructions: row.original_instructions || null,
-    originalSummary: row.original_summary || null,
-    originalGlassType: row.original_glass_type || null,
-    savedAt: row.saved_at,
-  })
-
   const migrateAndLoadData = async (u) => {
     const [{ data: favData }, { data: shopData }, { data: toMakeData }] = await Promise.all([
       supabase.from('favorites').select('*').eq('user_id', u.id).order('saved_at', { ascending: false }),
@@ -3158,19 +3087,12 @@ export default function App() {
       supabase.from('to_make').select('*').eq('user_id', u.id).order('saved_at', { ascending: false }),
     ])
 
-    let labData = null
-    try {
-      const { data, error } = await supabase.from('in_the_lab').select('*').eq('user_id', u.id).order('saved_at', { ascending: false })
-      if (!error) labData = data
-    } catch (_) {}
-
-    const hasCloudData = (favData?.length > 0) || (shopData?.length > 0) || (toMakeData?.length > 0) || (labData?.length > 0)
+    const hasCloudData = (favData?.length > 0) || (shopData?.length > 0) || (toMakeData?.length > 0)
 
     if (!hasCloudData) {
       const localFavs = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-favorites')) || [] } catch { return [] } })()
       const localShopping = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-shopping')) || [] } catch { return [] } })()
       const localToMake = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-to-make')) || [] } catch { return [] } })()
-      const localLab = (() => { try { return JSON.parse(localStorage.getItem('bar-cart-in-the-lab')) || [] } catch { return [] } })()
 
       if (localFavs.length > 0) {
         const rows = localFavs.map(f => ({ user_id: u.id, recipe_name: f.recipeName, summary: f.summary || null, recipe: f.recipe || [], instructions: f.instructions || null, ingredients: f.ingredients || [], variations: f.variations || [], glass_type: f.glassType || null, notes: f.note || null, saved_at: f.savedAt || new Date().toISOString() }))
@@ -3187,24 +3109,15 @@ export default function App() {
         const { data: inserted } = await supabase.from('to_make').upsert(rows, { onConflict: 'user_id,recipe_name', ignoreDuplicates: true }).select()
         if (inserted) setToMake(inserted.map(dbToMakeToLocal))
       }
-      if (localLab.length > 0) {
-        try {
-          const rows = localLab.map(f => ({ user_id: u.id, recipe_name: f.recipeName, summary: f.summary || null, recipe: f.recipe || [], instructions: f.instructions || null, ingredients: f.ingredients || [], variations: f.variations || [], glass_type: f.glassType || null, source: f.source || 'Exploration', origin_flag: f.originFlag || null, difficulty: f.difficulty || null, primary_ingredients: f.primaryIngredients || [], saved_at: f.savedAt || new Date().toISOString() }))
-          const { data: inserted } = await supabase.from('in_the_lab').upsert(rows, { onConflict: 'user_id,recipe_name', ignoreDuplicates: true }).select()
-          if (inserted) setInTheLabList(inserted.map(dbInTheLabToLocal))
-        } catch (_) {}
-      }
     } else {
       if (favData) setFavorites(favData.map(dbFavToLocal))
       if (shopData) setShoppingList(shopData.map(r => ({ id: r.id, name: r.name })))
       if (toMakeData) setToMake(toMakeData.map(dbToMakeToLocal))
-      if (labData) setInTheLabList(labData.map(dbInTheLabToLocal))
     }
 
     localStorage.removeItem('bar-cart-favorites')
     localStorage.removeItem('bar-cart-shopping')
     localStorage.removeItem('bar-cart-to-make')
-    localStorage.removeItem('bar-cart-in-the-lab')
   }
 
   // Auth effect
@@ -3225,7 +3138,6 @@ export default function App() {
         try { setFavorites(JSON.parse(localStorage.getItem('bar-cart-favorites')) || []) } catch { setFavorites([]) }
         try { setShoppingList(JSON.parse(localStorage.getItem('bar-cart-shopping')) || []) } catch { setShoppingList([]) }
         try { setToMake(JSON.parse(localStorage.getItem('bar-cart-to-make')) || []) } catch { setToMake([]) }
-        try { setInTheLabList(JSON.parse(localStorage.getItem('bar-cart-in-the-lab')) || []) } catch { setInTheLabList([]) }
       }
     })
     return () => subscription.unsubscribe()
@@ -3250,7 +3162,6 @@ export default function App() {
   const [feedbackLoading, setFeedbackLoading] = useState(false)
   const [adjustmentNote, setAdjustmentNote] = useState(null)
   const [resultSource, setResultSource] = useState(null) // 'ondeck' | 'favorites' | null
-  const [currentLabItem, setCurrentLabItem] = useState(null)
   const sourceScrollRef = useRef(0)
   const [sharedImage, setSharedImage] = useState(null) // pending share-target file awaiting mode selection
 
@@ -3466,95 +3377,6 @@ export default function App() {
     setToMake(prev => prev.filter(f => f.id !== id))
   }
 
-  // In the Lab helpers
-  const toggleInTheLab = async (res, extras = {}) => {
-    const { source = 'manual', originFlag = null, difficulty = null, primaryIngredients = [] } = extras
-    if (user) {
-      const existing = inTheLabList.find(f => f.recipeName === res.recipe_name)
-      if (existing) {
-        await supabase.from('in_the_lab').delete().eq('id', existing.id)
-        setInTheLabList(prev => prev.filter(f => f.id !== existing.id))
-      } else {
-        try {
-          const { data, error } = await supabase.from('in_the_lab').insert({
-            user_id: user.id, recipe_name: res.recipe_name, summary: res.summary || null,
-            recipe: res.recipe || [], instructions: res.instructions || null,
-            ingredients: res.ingredients || [], variations: res.variations || [],
-            glass_type: res.glass_type || null, source, origin_flag: originFlag,
-            difficulty, primary_ingredients: primaryIngredients, tried: false, saved_at: new Date().toISOString(),
-          }).select().single()
-          if (!error && data) setInTheLabList(prev => [dbInTheLabToLocal(data), ...prev])
-        } catch (_) {}
-      }
-    } else {
-      setInTheLabList(prev => {
-        const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
-        if (existing >= 0) return prev.filter((_, i) => i !== existing)
-        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, source, originFlag, difficulty, primaryIngredients, savedAt: new Date().toISOString() }, ...prev]
-      })
-    }
-  }
-
-  const removeFromInTheLab = async (id) => {
-    if (user) { try { await supabase.from('in_the_lab').delete().eq('id', id) } catch (_) {} }
-    setInTheLabList(prev => prev.filter(f => f.id !== id))
-  }
-
-  const toggleLabTried = async (id, tried) => {
-    setInTheLabList(prev => prev.map(i => i.id === id ? { ...i, tried } : i))
-    setCurrentLabItem(prev => prev?.id === id ? { ...prev, tried } : prev)
-    if (user) { try { await supabase.from('in_the_lab').update({ tried }).eq('id', id) } catch (_) {} }
-  }
-
-  const updateLabNotes = async (id, notes) => {
-    setInTheLabList(prev => prev.map(i => i.id === id ? { ...i, note: notes } : i))
-    setCurrentLabItem(prev => prev?.id === id ? { ...prev, note: notes } : prev)
-    if (user) { try { await supabase.from('in_the_lab').update({ notes }).eq('id', id) } catch (_) {} }
-  }
-
-  const saveLabToFavorites = async (item) => {
-    const alreadyFav = favorites.some(f => f.recipeName === item.recipeName)
-    if (!alreadyFav) {
-      await toggleFavorite({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType }, { source: item.source })
-    }
-    await removeFromInTheLab(item.id)
-    handleBackToSource()
-  }
-
-  const revertLabTweak = async (item) => {
-    const revertedLabItem = {
-      ...item,
-      recipe: item.originalRecipe || [],
-      instructions: item.originalInstructions || null,
-      summary: item.originalSummary || null,
-      glassType: item.originalGlassType || null,
-      originalRecipe: null, originalInstructions: null,
-      originalSummary: null, originalGlassType: null,
-    }
-    if (user) {
-      try {
-        await supabase.from('in_the_lab').update({
-          recipe: item.originalRecipe || [],
-          instructions: item.originalInstructions || null,
-          summary: item.originalSummary || null,
-          glass_type: item.originalGlassType || null,
-          original_recipe: null, original_instructions: null,
-          original_summary: null, original_glass_type: null,
-        }).eq('id', item.id)
-      } catch (_) {}
-    }
-    setCurrentLabItem(revertedLabItem)
-    setInTheLabList(prev => prev.map(i => i.id === item.id ? revertedLabItem : i))
-    setResult(prev => ({
-      ...prev,
-      recipe: item.originalRecipe || [],
-      instructions: item.originalInstructions || null,
-      summary: item.originalSummary || null,
-      glass_type: item.originalGlassType || null,
-    }))
-    setAdjustmentNote(null)
-  }
-
   const viewToMake = (item) => {
     sourceScrollRef.current = window.scrollY
     setError(null); setAdjustmentNote(null)
@@ -3568,16 +3390,6 @@ export default function App() {
     setError(null); setAdjustmentNote(null)
     setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType })
     setResultSource('favorites')
-    setScreen('analyze')
-  }
-
-  const viewInTheLab = (item) => {
-    sourceScrollRef.current = window.scrollY
-    setError(null); setAdjustmentNote(null)
-    setCurrentLabItem(item)
-    setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType })
-    setResultSource('inthelab')
-    setLastRequestBody({ model: MODEL, max_tokens: MAX_TOKENS, messages: [{ role: 'user', content: 'Please analyze this cocktail recipe.' }] })
     setScreen('analyze')
   }
 
@@ -3694,37 +3506,6 @@ export default function App() {
       setAdjustmentNote(revised.adjustment_note || null)
       setError(null)
 
-      if (resultSource === 'inthelab' && currentLabItem) {
-        const needsSnapshot = !currentLabItem.originalRecipe
-        const updateData = {
-          recipe: revised.recipe || [],
-          instructions: revised.instructions || null,
-          summary: revised.summary || null,
-          glass_type: revised.glass_type || null,
-          ...(needsSnapshot ? {
-            original_recipe: result.recipe || [],
-            original_instructions: result.instructions || null,
-            original_summary: result.summary || null,
-            original_glass_type: result.glass_type || null,
-          } : {}),
-        }
-        if (user) { try { await supabase.from('in_the_lab').update(updateData).eq('id', currentLabItem.id) } catch (_) {} }
-        const updatedLabItem = {
-          ...currentLabItem,
-          recipe: revised.recipe || [],
-          instructions: revised.instructions || null,
-          summary: revised.summary || null,
-          glassType: revised.glass_type || null,
-          ...(needsSnapshot ? {
-            originalRecipe: result.recipe || [],
-            originalInstructions: result.instructions || null,
-            originalSummary: result.summary || null,
-            originalGlassType: result.glass_type || null,
-          } : {}),
-        }
-        setCurrentLabItem(updatedLabItem)
-        setInTheLabList(prev => prev.map(i => i.id === currentLabItem.id ? updatedLabItem : i))
-      }
 
       setResult(processResult(revised))
     } catch (err) {
@@ -3761,10 +3542,6 @@ export default function App() {
 
   const handleSaveOnDeckFromExploration = (suggestion, primaryIngredients) => {
     toggleToMake({ recipe_name: suggestion.recipe_name, summary: suggestion.summary, recipe: suggestion.recipe, instructions: suggestion.instructions, ingredients: suggestion.ingredients, variations: suggestion.variations || [], glass_type: suggestion.glass_type }, { source: 'Exploration', originFlag: suggestion.origin_flag, difficulty: suggestion.difficulty, primaryIngredients })
-  }
-
-  const handleSaveInTheLabFromExploration = (suggestion, primaryIngredients) => {
-    toggleInTheLab({ recipe_name: suggestion.recipe_name, summary: suggestion.summary, recipe: suggestion.recipe, instructions: suggestion.instructions, ingredients: suggestion.ingredients, variations: suggestion.variations || [], glass_type: suggestion.glass_type }, { source: 'Exploration', originFlag: suggestion.origin_flag, difficulty: suggestion.difficulty, primaryIngredients })
   }
 
   return (
@@ -3846,9 +3623,9 @@ export default function App() {
       {screen === 'saved' && (
         <SavedScreen
           savedSubTab={savedSubTab} setSavedSubTab={setSavedSubTab}
-          toMake={toMake} inTheLabList={inTheLabList} favorites={favorites}
-          onRemoveToMake={removeFromToMake} onRemoveInTheLab={removeFromInTheLab} onRemoveFavorite={removeFavorite}
-          onViewToMake={viewToMake} onViewInTheLab={viewInTheLab} onViewFavorite={viewFavorite}
+          toMake={toMake} favorites={favorites}
+          onRemoveToMake={removeFromToMake} onRemoveFavorite={removeFavorite}
+          onViewToMake={viewToMake} onViewFavorite={viewFavorite}
           onUpdateNote={updateFavoriteNote}
         />
       )}
@@ -3859,7 +3636,6 @@ export default function App() {
           inventory={inventory}
           inventoryText={inventoryText}
           onSaveOnDeck={handleSaveOnDeckFromExploration}
-          onSaveInTheLab={handleSaveInTheLabFromExploration}
           user={user}
           pendingRestore={pendingExplorationRestore}
           onRestoreConsumed={() => setPendingExplorationRestore(null)}
@@ -3964,7 +3740,7 @@ export default function App() {
             <>
               {resultSource && (
                 <button onClick={handleBackToSource} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0 0', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5 }}>
-                  ← Back to {resultSource === 'ondeck' ? 'On Deck' : resultSource === 'inthelab' ? 'In the Lab' : 'Favorites'}
+                  ← Back to {resultSource === 'ondeck' ? 'On Deck' : 'Favorites'}
                 </button>
               )}
               <Results
@@ -3976,18 +3752,9 @@ export default function App() {
                 onToggleFavorite={res => toggleFavorite(res, { source: analysisModeSource })}
                 toMake={toMake}
                 onToggleToMake={res => toggleToMake(res, { source: analysisModeSource })}
-                inTheLabList={inTheLabList}
-                onToggleInTheLab={res => toggleInTheLab(res, { source: analysisModeSource })}
                 onFeedback={handleFeedback}
                 feedbackLoading={feedbackLoading}
                 inventory={inventory}
-                isInLab={resultSource === 'inthelab'}
-                labItem={resultSource === 'inthelab' ? currentLabItem : null}
-                onMarkTried={toggleLabTried}
-                onSaveLabToFavorites={saveLabToFavorites}
-                onUpdateLabNotes={updateLabNotes}
-                onArchiveFromLab={(id) => { removeFromInTheLab(id); handleBackToSource() }}
-                onRevertLabTweak={revertLabTweak}
               />
             </>
           )}
