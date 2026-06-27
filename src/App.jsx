@@ -2882,10 +2882,26 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     return null
   }
 
+  // Build parent→children map once so each node occupies exactly one position in the
+  // tree, regardless of what parent_node_id values exist in the DB.
+  const { treeRoots, childrenMap } = useMemo(() => {
+    const childrenMap = {}
+    nodes.forEach(n => { childrenMap[n.id] = [] })
+    const roots = []
+    nodes.forEach(n => {
+      if (n.parent_node_id && childrenMap[n.parent_node_id] !== undefined) {
+        childrenMap[n.parent_node_id].push(n)
+      } else {
+        roots.push(n)
+      }
+    })
+    return { treeRoots: roots, childrenMap }
+  }, [nodes])
+
   const renderNode = (node, depth) => {
     const isExpanded = expandedIds.has(node.id)
     const isRoot = !node.parent_node_id
-    const children = nodes.filter(n => n.parent_node_id === node.id)
+    const children = childrenMap[node.id] || []
 
     return (
       <div key={node.id}>
@@ -2919,8 +2935,6 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     )
   }
 
-  const rootNodes = nodes.filter(n => !n.parent_node_id)
-
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
@@ -2936,9 +2950,9 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
         <div style={{ fontSize: 14, color: C.textFaint, textAlign: 'center', padding: '40px 0' }}>No nodes yet.</div>
       )}
 
-      {!loading && rootNodes.length > 0 && (
+      {!loading && treeRoots.length > 0 && (
         <div style={{ paddingBottom: 40 }}>
-          {rootNodes.map(root => renderNode(root, 0))}
+          {treeRoots.map(root => renderNode(root, 0))}
         </div>
       )}
     </div>
