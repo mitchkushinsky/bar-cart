@@ -1668,6 +1668,13 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
   const [tweakDone, setTweakDone] = useState(false)
   const [tweakError, setTweakError] = useState(null)
   const recipeNodeIdRef = useRef(null)
+  const cardRef = useRef(null)
+
+  useEffect(() => {
+    if (autoExpand && cardRef.current) {
+      setTimeout(() => cardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const displayed = tweakedSuggestion || suggestion
 
@@ -1723,7 +1730,7 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
   }
 
   return (
-    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
+    <div ref={cardRef} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
       <div style={{ opacity: isTweakLoading ? 0.4 : 1, transition: 'opacity 0.3s', pointerEvents: isTweakLoading ? 'none' : 'auto' }}>
       <div style={{ marginBottom: 8 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 5 }}>
@@ -2727,10 +2734,15 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
       const recipeAncestor = selfAndAncestors.find(n => n.node_type === 'recipe')
       const originalName = recipeAncestor?.payload?.recipe?.recipe_name
       const tweakedResult = node.payload?.result
-      if (originalName && tweakedResult && Array.isArray(baseRecipes)) {
-        suggestions = baseRecipes.map(r => r.recipe_name === originalName ? { ...r, ...tweakedResult } : r)
+      if (originalName && tweakedResult && Array.isArray(baseRecipes) && baseRecipes.length > 0) {
+        // Spread tweakedResult but never wipe out recipe_name if the tweaked version doesn't have one
+        const safeTweaked = tweakedResult.recipe_name
+          ? tweakedResult
+          : { ...tweakedResult, recipe_name: originalName }
+        suggestions = baseRecipes.map(r => r.recipe_name === originalName ? { ...r, ...safeTweaked } : r)
       }
-      autoExpandRecipeName = tweakedResult?.recipe_name ?? originalName ?? null
+      // Prefer tweaked name; fall back to original so the card can still be found
+      autoExpandRecipeName = tweakedResult?.recipe_name || originalName || null
     }
 
     const result = isIngredients ? null : { incompatible: false, incompatibility_reason: null, flavor_profile_note: null, pairs_well_with: null, suggestions }
@@ -2791,8 +2803,8 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
             <div style={{ fontSize: 14, fontWeight: 700, color: C.gold, flex: 1 }}>{r.recipe_name}</div>
             <button
-              onClick={() => handleToggleTried(node.id)}
-              style={{ background: tried ? C.green + '22' : 'none', border: `1px solid ${tried ? C.green : C.border}`, borderRadius: 20, color: tried ? C.green : C.textMuted, fontSize: 12, fontWeight: tried ? 700 : 400, padding: '4px 12px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all 0.15s', flexShrink: 0 }}>
+              onClick={(e) => { e.stopPropagation(); handleToggleTried(node.id) }}
+              style={{ background: tried ? C.green + '22' : C.border + '66', border: `1px solid ${tried ? C.green : C.textFaint}`, borderRadius: 20, color: tried ? C.green : C.textMuted, fontSize: 12, fontWeight: tried ? 700 : 400, padding: '4px 12px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all 0.15s', flexShrink: 0 }}>
               {tried ? '✓ Tried' : 'Mark Tried'}
             </button>
           </div>
