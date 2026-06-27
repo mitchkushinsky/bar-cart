@@ -2907,90 +2907,11 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
   )
 }
 
-function InProgressScreen({ user, subTab, setSubTab, onContinue, onOpenWhiteboard }) {
-  const [history, setHistory] = useState([])
-
-  useEffect(() => {
-    const load = async () => {
-      if (user) {
-        const cutoff = new Date(Date.now() - EXPLORATION_HISTORY_MAX_AGE_MS).toISOString()
-        await supabase.from('explorations_history').delete().eq('user_id', user.id).lt('updated_at', cutoff)
-        const { data } = await supabase
-          .from('explorations_history')
-          .select('search_key,primary_ingredients,cocktail_style,flavor_profile,low_abv,result,updated_at')
-          .eq('user_id', user.id)
-          .order('updated_at', { ascending: false })
-          .limit(20)
-        if (data) setHistory(data)
-      } else {
-        setHistory(loadLocalExplorationHistory())
-      }
-    }
-    load()
-  }, [user?.id])
-
-  const handleRemove = (searchKey) => {
-    if (user) {
-      supabase.from('explorations_history').delete().eq('user_id', user.id).eq('search_key', searchKey).then()
-    }
-    setHistory(prev => {
-      const updated = prev.filter(e => e.search_key !== searchKey)
-      if (!user) saveLocalExplorationHistory(updated)
-      return updated
-    })
-  }
-
-  const IN_PROGRESS_TABS = [
-    { id: 'saved_explorations', label: 'Saved Explorations' },
-    { id: 'whiteboards', label: 'Whiteboards' },
-  ]
-
+function InProgressScreen({ user, onOpenWhiteboard }) {
   return (
     <div>
       <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 20 }}>In Progress</div>
-
-      {/* Sub-tabs */}
-      <div style={{ display: 'flex', borderBottom: `1px solid ${C.border}`, marginBottom: 24 }}>
-        {IN_PROGRESS_TABS.map(({ id, label }) => (
-          <button key={id} onClick={() => setSubTab(id)}
-            style={{ background: 'none', border: 'none', borderBottom: subTab === id ? `2px solid ${C.gold}` : '2px solid transparent', color: subTab === id ? C.gold : C.textMuted, fontSize: 14, fontWeight: subTab === id ? 600 : 400, padding: '8px 16px', cursor: 'pointer', marginBottom: -1 }}>
-            {label}
-          </button>
-        ))}
-      </div>
-
-      {subTab === 'saved_explorations' && (
-        history.length === 0 ? (
-          <div style={{ fontSize: 14, color: C.textFaint, textAlign: 'center', padding: '40px 0' }}>No saved explorations yet. Start one from the Explorations tab.</div>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {history.map((entry, i) => (
-              <div key={entry.search_key || i}
-                style={{ display: 'flex', alignItems: 'center', gap: 10, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px' }}>
-                <span style={{ fontSize: 18, flexShrink: 0 }}>{EXPLORATION_STYLE_EMOJI[entry.cocktail_style] || '✨'}</span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.primary_ingredients.join(' + ')}</div>
-                  <div style={{ fontSize: 11, color: C.textFaint, marginTop: 1 }}>{entry.cocktail_style} · {relativeTime(entry.updated_at)}</div>
-                </div>
-                <button
-                  onClick={() => onContinue(entry)}
-                  style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '4px 10px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>
-                  Continue →
-                </button>
-                <button
-                  onClick={() => handleRemove(entry.search_key)}
-                  style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 14, cursor: 'pointer', padding: '2px 6px', flexShrink: 0 }}>
-                  ✕
-                </button>
-              </div>
-            ))}
-          </div>
-        )
-      )}
-
-      {subTab === 'whiteboards' && (
-        <WhiteboardsTab user={user} onOpen={onOpenWhiteboard} />
-      )}
+      <WhiteboardsTab user={user} onOpen={onOpenWhiteboard} />
     </div>
   )
 }
@@ -3033,7 +2954,6 @@ export default function App() {
   // Navigation
   const [screen, setScreen] = useState('analyze')
   const [savedSubTab, setSavedSubTab] = useState('ondeck')
-  const [inProgressSubTab, setInProgressSubTab] = useState('saved_explorations')
   const [pendingExplorationRestore, setPendingExplorationRestore] = useState(null)
   const [currentOpenWhiteboardId, setCurrentOpenWhiteboardId] = useState(null)
 
@@ -3646,9 +3566,6 @@ export default function App() {
       {screen === 'in_progress' && (
         <InProgressScreen
           user={user}
-          subTab={inProgressSubTab}
-          setSubTab={setInProgressSubTab}
-          onContinue={entry => { setPendingExplorationRestore(entry); setScreen('explorations') }}
           onOpenWhiteboard={id => { setCurrentOpenWhiteboardId(id); setScreen('whiteboard') }}
         />
       )}
