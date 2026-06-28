@@ -1854,6 +1854,7 @@ const EXPLORE_LOADING_MSGS = [
 function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pendingRestore, onRestoreConsumed, onBackToInProgress }) {
   const [step, setStep] = useState('ingredients')
   const wasRestoredRef = useRef(false)
+  const stepEffectMountedRef = useRef(false)
   const [selected, setSelected] = useState([])
   const [style, setStyle] = useState(null)
   const [flavors, setFlavors] = useState([])
@@ -1923,8 +1924,11 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     onRestoreConsumed?.()
   }, [pendingRestore]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // When the user backs all the way out of a restored exploration, switch to In Progress sub-tab
+  // When the user backs all the way out of a restored exploration, switch to In Progress sub-tab.
+  // Skip the initial mount: on mount the pendingRestore effect already set wasRestoredRef=true
+  // AND step is still 'ingredients', so without this guard the callback fires immediately.
   useEffect(() => {
+    if (!stepEffectMountedRef.current) { stepEffectMountedRef.current = true; return }
     if (step === 'ingredients' && wasRestoredRef.current) {
       wasRestoredRef.current = false
       onBackToInProgress?.()
