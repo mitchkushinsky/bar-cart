@@ -1658,7 +1658,7 @@ function removeLocalExplorationHistory(searchKey) {
   return entries
 }
 
-function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, user, whiteboardId, recipeListNodeId, autoExpand }) {
+function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, user, whiteboardId, recipeListNodeId, autoExpand, restoreRecipeNodeId }) {
   const [expanded, setExpanded] = useState(!!autoExpand)
   const [savedTo, setSavedTo] = useState(null) // null | 'ondeck'
   const [tweakedSuggestion, setTweakedSuggestion] = useState(null)
@@ -1667,7 +1667,7 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
   const [isTweakLoading, setIsTweakLoading] = useState(false)
   const [tweakDone, setTweakDone] = useState(false)
   const [tweakError, setTweakError] = useState(null)
-  const recipeNodeIdRef = useRef(null)
+  const recipeNodeIdRef = useRef(restoreRecipeNodeId || null)
   const cardRef = useRef(null)
 
   useEffect(() => {
@@ -1881,6 +1881,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   const [currentRecipeListNodeId, setCurrentRecipeListNodeId] = useState(null)
   const [continueFromNodeId, setContinueFromNodeId] = useState(null)
   const [autoExpandRecipeName, setAutoExpandRecipeName] = useState(null)
+  const [autoExpandRecipeNodeId, setAutoExpandRecipeNodeId] = useState(null)
 
   useEffect(() => {
     const load = async () => {
@@ -1915,6 +1916,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setCurrentRecipeListNodeId(pendingRestore.restoreRecipeListNodeId || null)
     setContinueFromNodeId(pendingRestore.continueFromNodeId || null)
     setAutoExpandRecipeName(pendingRestore.autoExpandRecipeName || null)
+    setAutoExpandRecipeNodeId(pendingRestore.restoreRecipeNodeId || null)
     setStep(pendingRestore.resumeStep || (pendingRestore.result ? 'results' : 'ingredients'))
     onRestoreConsumed?.()
   }, [pendingRestore]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -2042,7 +2044,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
-  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setResultsPreviousStep('prefs'); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setContinueFromNodeId(null); setAutoExpandRecipeName(null) }
+  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setResultsPreviousStep('prefs'); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setContinueFromNodeId(null); setAutoExpandRecipeName(null); setAutoExpandRecipeNodeId(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2521,7 +2523,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} autoExpand={autoExpandRecipeName === s.recipe_name} />)}
+                {canMake.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} autoExpand={autoExpandRecipeName === s.recipe_name} restoreRecipeNodeId={autoExpandRecipeName === s.recipe_name ? autoExpandRecipeNodeId : null} />)}
               </div>
             </div>
           )}
@@ -2529,7 +2531,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Worth Buying For ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} autoExpand={autoExpandRecipeName === s.recipe_name} />)}
+                {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} autoExpand={autoExpandRecipeName === s.recipe_name} restoreRecipeNodeId={autoExpandRecipeName === s.recipe_name ? autoExpandRecipeNodeId : null} />)}
               </div>
             </div>
           )}
@@ -2728,8 +2730,10 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     // so the card opens showing the tweaked result ready to tweak further.
     let suggestions = baseRecipes
     let autoExpandRecipeName = null
+    let restoreRecipeNodeId = null
     if (node.node_type === 'recipe') {
       autoExpandRecipeName = node.payload?.recipe?.recipe_name ?? null
+      restoreRecipeNodeId = node.id
     } else if (node.node_type === 'tweak') {
       const recipeAncestor = selfAndAncestors.find(n => n.node_type === 'recipe')
       const originalName = recipeAncestor?.payload?.recipe?.recipe_name
@@ -2743,6 +2747,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
       }
       // Prefer tweaked name; fall back to original so the card can still be found
       autoExpandRecipeName = tweakedResult?.recipe_name || originalName || null
+      restoreRecipeNodeId = recipeAncestor?.id ?? null
     }
 
     const result = isIngredients ? null : { incompatible: false, incompatibility_reason: null, flavor_profile_note: null, pairs_well_with: null, suggestions }
@@ -2758,6 +2763,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
       continueFromNodeId: node.id,
       restoreRecipeListNodeId,
       autoExpandRecipeName,
+      restoreRecipeNodeId,
     }
   }
 
