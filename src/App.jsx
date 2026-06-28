@@ -1851,8 +1851,9 @@ const EXPLORE_LOADING_MSGS = [
   'Almost there…',
 ]
 
-function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pendingRestore, onRestoreConsumed }) {
+function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pendingRestore, onRestoreConsumed, onBackToInProgress }) {
   const [step, setStep] = useState('ingredients')
+  const wasRestoredRef = useRef(false)
   const [selected, setSelected] = useState([])
   const [style, setStyle] = useState(null)
   const [flavors, setFlavors] = useState([])
@@ -1918,8 +1919,17 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setAutoExpandRecipeName(pendingRestore.autoExpandRecipeName || null)
     setAutoExpandRecipeNodeId(pendingRestore.restoreRecipeNodeId || null)
     setStep(pendingRestore.resumeStep || (pendingRestore.result ? 'results' : 'ingredients'))
+    wasRestoredRef.current = true
     onRestoreConsumed?.()
   }, [pendingRestore]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // When the user backs all the way out of a restored exploration, switch to In Progress sub-tab
+  useEffect(() => {
+    if (step === 'ingredients' && wasRestoredRef.current) {
+      wasRestoredRef.current = false
+      onBackToInProgress?.()
+    }
+  }, [step]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (step !== 'loading') return
@@ -2935,27 +2945,49 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
   )
 }
 
-function InProgressScreen({ user, onOpenWhiteboard }) {
+function CreateScreen({ createSubTab, setCreateSubTab, inventory, inventoryText, onSaveOnDeck, user, pendingRestore, onRestoreConsumed, onBackToInProgress, onOpenWhiteboard }) {
   return (
     <div>
-      <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 20 }}>In Progress</div>
-      <WhiteboardsTab user={user} onOpen={onOpenWhiteboard} />
+      <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 16 }}>Create</div>
+      <div style={{ display: 'flex', borderBottom: `1px solid ${C.border}`, marginBottom: 24 }}>
+        {[{ id: 'new', label: 'New' }, { id: 'in_progress', label: 'In Progress' }].map(({ id, label }) => (
+          <button key={id} onClick={() => setCreateSubTab(id)}
+            style={{ background: 'none', border: 'none', borderBottom: createSubTab === id ? `2px solid ${C.gold}` : '2px solid transparent', color: createSubTab === id ? C.gold : C.textMuted, fontSize: 14, fontWeight: createSubTab === id ? 600 : 400, padding: '8px 16px', cursor: 'pointer', marginBottom: -1 }}>
+            {label}
+          </button>
+        ))}
+      </div>
+      {createSubTab === 'new' && (
+        <ExplorationsScreen
+          inventory={inventory}
+          inventoryText={inventoryText}
+          onSaveOnDeck={onSaveOnDeck}
+          user={user}
+          pendingRestore={pendingRestore}
+          onRestoreConsumed={onRestoreConsumed}
+          onBackToInProgress={onBackToInProgress}
+        />
+      )}
+      {createSubTab === 'in_progress' && (
+        <div>
+          <WhiteboardsTab user={user} onOpen={onOpenWhiteboard} />
+        </div>
+      )}
     </div>
   )
 }
 
 function BottomTabBar({ screen, onTab }) {
   const tabs = [
-    { id: 'analyze',      icon: '🔍', label: 'Analyze' },
-    { id: 'explorations', icon: '✨', label: 'Explore' },
-    { id: 'in_progress',  icon: '🗂️', label: 'In Progress' },
-    { id: 'saved',        icon: '🍸', label: 'Saved' },
-    { id: 'inventory',    icon: '📦', label: 'Inventory' },
+    { id: 'create',    icon: '✨', label: 'Create' },
+    { id: 'analyze',   icon: '🔍', label: 'Analyze' },
+    { id: 'saved',     icon: '🍸', label: 'Saved' },
+    { id: 'inventory', icon: '📦', label: 'Inventory' },
   ]
   return (
     <div style={{ position: 'fixed', bottom: 0, left: 0, right: 0, background: C.bg, borderTop: `1px solid ${C.border}`, display: 'flex', zIndex: 50, paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}>
       {tabs.map(({ id, icon, label }) => {
-        const active = screen === id || (id === 'in_progress' && screen === 'whiteboard')
+        const active = screen === id || (id === 'create' && screen === 'whiteboard')
         return (
           <button key={id} onClick={() => onTab(id)}
             style={{ flex: 1, background: 'none', border: 'none', color: active ? C.gold : C.textMuted, padding: '10px 4px 12px', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, transition: 'color 0.15s' }}>
@@ -2981,6 +3013,7 @@ export default function App() {
 
   // Navigation
   const [screen, setScreen] = useState('analyze')
+  const [createSubTab, setCreateSubTab] = useState('new')
   const [savedSubTab, setSavedSubTab] = useState('ondeck')
   const [pendingExplorationRestore, setPendingExplorationRestore] = useState(null)
   const [currentOpenWhiteboardId, setCurrentOpenWhiteboardId] = useState(null)
@@ -3578,22 +3611,18 @@ export default function App() {
         />
       )}
 
-      {/* Screen: Explorations */}
-      {screen === 'explorations' && (
-        <ExplorationsScreen
+      {/* Screen: Create */}
+      {screen === 'create' && (
+        <CreateScreen
+          createSubTab={createSubTab}
+          setCreateSubTab={setCreateSubTab}
           inventory={inventory}
           inventoryText={inventoryText}
           onSaveOnDeck={handleSaveOnDeckFromExploration}
           user={user}
           pendingRestore={pendingExplorationRestore}
           onRestoreConsumed={() => setPendingExplorationRestore(null)}
-        />
-      )}
-
-      {/* Screen: In Progress */}
-      {screen === 'in_progress' && (
-        <InProgressScreen
-          user={user}
+          onBackToInProgress={() => setCreateSubTab('in_progress')}
           onOpenWhiteboard={id => { setCurrentOpenWhiteboardId(id); setScreen('whiteboard') }}
         />
       )}
@@ -3602,8 +3631,8 @@ export default function App() {
       {screen === 'whiteboard' && currentOpenWhiteboardId && (
         <WhiteboardScreen
           whiteboardId={currentOpenWhiteboardId}
-          onBack={() => setScreen('in_progress')}
-          onContinueFromNode={restore => { setPendingExplorationRestore(restore); setScreen('explorations') }}
+          onBack={() => { setScreen('create'); setCreateSubTab('in_progress') }}
+          onContinueFromNode={restore => { setPendingExplorationRestore(restore); setCreateSubTab('new'); setScreen('create') }}
         />
       )}
 
