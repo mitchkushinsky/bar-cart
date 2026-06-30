@@ -2041,7 +2041,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
             if (wbId) {
               const { data: listNode } = await supabase
                 .from('exploration_nodes')
-                .insert({ whiteboard_id: wbId, parent_node_id: recipeListParentId ?? null, node_type: 'recipe_list', payload: { recipes: data.suggestions || [] } })
+                .insert({ whiteboard_id: wbId, parent_node_id: recipeListParentId ?? null, node_type: 'recipe_list', payload: { recipes: JSON.parse(JSON.stringify(data.suggestions || [])) } })
                 .select('id').single()
               setCurrentRecipeListNodeId(listNode?.id ?? null)
               setContinueFromNodeId(null)
@@ -2465,7 +2465,7 @@ Rules:
         </div>
       </label>
 
-      <button onClick={handleExplore} disabled={!style}
+      <button onClick={() => handleExplore()} disabled={!style}
         style={{ width: '100%', background: style ? C.gold : C.surface, border: `1px solid ${style ? C.gold : C.border}`, borderRadius: 10, color: style ? '#0f0f0f' : C.textFaint, fontWeight: 700, fontSize: 15, padding: '13px', cursor: style ? 'pointer' : 'default', transition: 'background 0.15s, color 0.15s' }}>
         ✨ Explore
       </button>
