@@ -1933,6 +1933,13 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Sync ref when eager recipe-node writes complete after cards have already rendered.
+  useEffect(() => {
+    if (!recipeNodeIdRef.current && recipeNodeIds?.[suggestion.recipe_name]) {
+      recipeNodeIdRef.current = recipeNodeIds[suggestion.recipe_name]
+    }
+  }, [recipeNodeIds]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const displayed = tweakedSuggestion || suggestion
 
   const handleOnDeck = () => {
@@ -2913,7 +2920,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
           supabase.from('exploration_nodes').select('*').eq('whiteboard_id', whiteboardId).order('created_at', { ascending: true }),
         ])
         setWhiteboard(wb)
-        const allNodes = nds || []
+        const allNodes = (nds || []).filter(n => n.whiteboard_id === whiteboardId)
         setNodes(allNodes)
         const notesMap = {}
         const triedInit = {}
@@ -3123,18 +3130,20 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
   // Build parent→children map once so each node occupies exactly one position in the
   // tree, regardless of what parent_node_id values exist in the DB.
   const { treeRoots, childrenMap } = useMemo(() => {
+    const ownNodes = nodes.filter(n => n.whiteboard_id === whiteboardId)
+    const idSet = new Set(ownNodes.map(n => n.id))
     const childrenMap = {}
-    nodes.forEach(n => { childrenMap[n.id] = [] })
+    ownNodes.forEach(n => { childrenMap[n.id] = [] })
     const roots = []
-    nodes.forEach(n => {
-      if (n.parent_node_id && childrenMap[n.parent_node_id] !== undefined) {
+    ownNodes.forEach(n => {
+      if (n.parent_node_id && idSet.has(n.parent_node_id)) {
         childrenMap[n.parent_node_id].push(n)
       } else {
         roots.push(n)
       }
     })
     return { treeRoots: roots, childrenMap }
-  }, [nodes])
+  }, [nodes, whiteboardId])
 
   const renderNode = (node, depth) => {
     const isExpanded = expandedIds.has(node.id)
