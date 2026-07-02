@@ -732,6 +732,47 @@ Return a revised version of just this one suggestion in the same JSON structure 
   }
 }
 
+async function converseTweakStep({ suggestion, affinityContext, tweakHistory, messages, isFinal }) {
+  const recipeSummary = [
+    `Recipe: ${suggestion.recipe_name}`,
+    suggestion.recipe?.length > 0 ? `Ingredients: ${suggestion.recipe.map(r => `${r.amount} ${r.ingredient}`).join(', ')}` : null,
+    suggestion.instructions ? `Method: ${suggestion.instructions}` : null,
+    suggestion.summary ? `Summary: ${suggestion.summary}` : null,
+  ].filter(Boolean).join('\n')
+
+  const system = `You are an expert craft bartender. Terse, direct, expert — no affirmations, no filler, no hedging. Max 2 sentences per response unless writing a final synthesis. If the user's idea won't work, say so plainly and suggest an alternative.
+
+${recipeSummary}${tweakHistory.length > 0 ? `\n\nPrior tweaks on this recipe:\n${tweakHistory.map(p => `- "${p}"`).join('\n')}` : ''}${affinityContext ? `\n\nAffinity reference:\n${affinityContext}` : ''}`
+
+  if (isFinal) {
+    const finalMessages = [
+      ...messages,
+      {
+        role: 'user',
+        content: `Synthesize this into a concrete tweak. Write one sentence starting with "Based on what you're describing, here's what I'd try: " Then write "---JSON---" on a new line followed by the complete revised recipe as valid JSON — same structure as the original with all fields: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes.`,
+      },
+    ]
+    const body = { model: MODEL, max_tokens: 1500, system, messages: finalMessages }
+    const text = await callClaudeText(body)
+    const sepIdx = text.indexOf('---JSON---')
+    const synthesisText = (sepIdx >= 0 ? text.slice(0, sepIdx) : text).trim()
+    const jsonPart = sepIdx >= 0 ? text.slice(sepIdx + 10).trim() : ''
+    let revised = null
+    if (jsonPart) { try { revised = extractJSON(jsonPart) } catch (_) {} }
+    if (!revised) {
+      const retryText = await callClaudeText({
+        model: MODEL, max_tokens: 1500, system,
+        messages: [...finalMessages, { role: 'assistant', content: text }, { role: 'user', content: 'Return ONLY the revised recipe as valid JSON, no other text.' }],
+      })
+      try { revised = extractJSON(retryText) } catch (_) {}
+    }
+    return { synthesisText, revised }
+  } else {
+    const text = await callClaudeText({ model: MODEL, max_tokens: 300, system, messages })
+    return { text }
+  }
+}
+
 // ─── Shared small components ──────────────────────────────────────────────────
 
 function Chip({ color, children }) {
@@ -1658,15 +1699,229 @@ function removeLocalExplorationHistory(searchKey) {
   return entries
 }
 
+function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, onClose, onApply }) {
+  const [mode, setMode] = useState('choose')
+  const [directText, setDirectText] = useState('')
+  const [directLoading, setDirectLoading] = useState(false)
+  const [directError, setDirectError] = useState(null)
+  const [convMessages, setConvMessages] = useState([])
+  const [convInput, setConvInput] = useState('')
+  const [exchangeCount, setExchangeCount] = useState(0)
+  const [isConvLoading, setIsConvLoading] = useState(false)
+  const [convError, setConvError] = useState(null)
+  const [synthesisText, setSynthesisText] = useState('')
+  const [proposedRevision, setProposedRevision] = useState(null)
+  const [affinities, setAffinities] = useState([])
+  const [affinitiesOpen, setAffinitiesOpen] = useState(false)
+  const [tweakHistory, setTweakHistory] = useState([])
+
+  useEffect(() => {
+    const fetchContext = async () => {
+      const ingredientNames = (suggestion.recipe || []).map(r => r.ingredient.trim().toLowerCase())
+      if (ingredientNames.length > 0) {
+        try {
+          const { data } = await supabase.from('ingredient_affinities').select('ingredient_name, flavor_affinities, spirit_tags, flavor_tags').in('ingredient_name', ingredientNames)
+          if (data?.length > 0) setAffinities(data)
+        } catch (_) {}
+      }
+      if (user && whiteboardId && recipeNodeId) {
+        try {
+          const { data } = await supabase.from('exploration_nodes').select('payload').eq('whiteboard_id', whiteboardId).eq('parent_node_id', recipeNodeId).eq('node_type', 'tweak')
+          if (data?.length > 0) setTweakHistory(data.map(n => n.payload?.prompt).filter(Boolean))
+        } catch (_) {}
+      }
+    }
+    fetchContext()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const affinityContext = affinities.map(a => `${a.ingredient_name}: ${[...(a.spirit_tags || []), ...(a.flavor_tags || [])].slice(0, 6).join(', ')}`).join('\n')
+
+  const handleDirectSubmit = async () => {
+    if (!directText.trim() || directLoading) return
+    setDirectLoading(true)
+    setDirectError(null)
+    const promptText = directText.trim()
+    try {
+      const revised = await tweakSingleSuggestion(suggestion, promptText)
+      onApply({ prompt: promptText, result: revised, conversation: null })
+      onClose()
+    } catch (err) {
+      setDirectError(err.message || 'Could not apply tweak. Please try again.')
+      setDirectLoading(false)
+    }
+  }
+
+  const handleConvSend = async () => {
+    if (!convInput.trim() || isConvLoading) return
+    setIsConvLoading(true)
+    setConvError(null)
+    const userMsg = { role: 'user', content: convInput.trim() }
+    const newMessages = [...convMessages, userMsg]
+    setConvMessages(newMessages)
+    setConvInput('')
+    const newCount = exchangeCount + 1
+    setExchangeCount(newCount)
+    try {
+      const isFinal = newCount >= 2
+      const res = await converseTweakStep({ suggestion, affinityContext, tweakHistory, messages: newMessages, isFinal })
+      if (isFinal) {
+        setConvMessages(prev => [...prev, { role: 'assistant', content: res.synthesisText }])
+        setSynthesisText(res.synthesisText)
+        setProposedRevision(res.revised)
+        setMode('synthesis')
+      } else {
+        setConvMessages(prev => [...prev, { role: 'assistant', content: res.text }])
+      }
+    } catch (err) {
+      setConvMessages(prev => prev.slice(0, -1))
+      setConvInput(userMsg.content)
+      setExchangeCount(newCount - 1)
+      setConvError(err.message || 'Something went wrong. Try again.')
+    } finally {
+      setIsConvLoading(false)
+    }
+  }
+
+  const handleRevise = () => {
+    setMode('chat')
+    setConvMessages([])
+    setConvInput('')
+    setExchangeCount(0)
+    setSynthesisText('')
+    setProposedRevision(null)
+  }
+
+  const affinitiesPanel = (
+    <div style={{ marginTop: 20, borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
+      <button onClick={() => setAffinitiesOpen(o => !o)}
+        style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0, display: 'flex', alignItems: 'center', gap: 5 }}>
+        What works with these ingredients {affinitiesOpen ? '▲' : '▼'}
+      </button>
+      {affinitiesOpen && (
+        <div style={{ marginTop: 10 }}>
+          {affinities.length === 0
+            ? <div style={{ fontSize: 12, color: C.textFaint }}>No affinity data available.</div>
+            : affinities.map(a => (
+              <div key={a.ingredient_name} style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: C.gold, marginBottom: 5, textTransform: 'capitalize' }}>{a.ingredient_name}</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                  {[...(a.spirit_tags || []), ...(a.flavor_tags || [])].slice(0, 8).map(tag => (
+                    <span key={tag} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, color: C.textMuted, fontSize: 11, padding: '2px 8px' }}>{tag}</span>
+                  ))}
+                </div>
+              </div>
+            ))
+          }
+        </div>
+      )}
+    </div>
+  )
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', zIndex: 900, display: 'flex', alignItems: 'flex-end' }} onClick={onClose}>
+      <div style={{ width: '100%', background: C.bg, borderRadius: '16px 16px 0 0', padding: '20px 20px 36px', maxHeight: '80vh', overflowY: 'auto', boxSizing: 'border-box' }} onClick={e => e.stopPropagation()}>
+
+        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 20 }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 2 }}>Tweaking</div>
+            <div style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{suggestion.recipe_name}</div>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 20, cursor: 'pointer', padding: 0, marginLeft: 'auto', lineHeight: 1 }}>✕</button>
+        </div>
+
+        {mode === 'choose' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <button onClick={() => setMode('direct')}
+              style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, fontSize: 14, fontWeight: 600, padding: '16px', cursor: 'pointer', textAlign: 'left' }}>
+              <div style={{ marginBottom: 3 }}>I know what I want</div>
+              <div style={{ fontSize: 12, color: C.textFaint, fontWeight: 400 }}>Type a direct instruction and apply immediately</div>
+            </button>
+            <button onClick={() => setMode('chat')}
+              style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, fontSize: 14, fontWeight: 600, padding: '16px', cursor: 'pointer', textAlign: 'left' }}>
+              <div style={{ marginBottom: 3 }}>Help me figure it out</div>
+              <div style={{ fontSize: 12, color: C.textFaint, fontWeight: 400 }}>Talk through the idea first, then apply</div>
+            </button>
+            {affinitiesPanel}
+          </div>
+        )}
+
+        {mode === 'direct' && (
+          <div>
+            <button onClick={() => setMode('choose')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 13, cursor: 'pointer', padding: '0 0 16px', display: 'block' }}>← Back</button>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <input type="text" value={directText} onChange={e => setDirectText(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleDirectSubmit()}
+                placeholder="e.g. make it less sweet, use bourbon instead" disabled={directLoading} autoFocus
+                style={{ flex: 1, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 14, padding: '10px 12px', outline: 'none', opacity: directLoading ? 0.5 : 1 }} />
+              <button onClick={handleDirectSubmit} disabled={!directText.trim() || directLoading}
+                style={{ background: directText.trim() && !directLoading ? C.gold : C.surface, border: `1px solid ${directText.trim() && !directLoading ? C.gold : C.border}`, borderRadius: 8, color: directText.trim() && !directLoading ? '#0f0f0f' : C.textFaint, fontSize: 13, fontWeight: 600, padding: '10px 14px', cursor: directText.trim() && !directLoading ? 'pointer' : 'default', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 5 }}>
+                {directLoading && <span style={{ display: 'inline-block', width: 11, height: 11, border: '2px solid currentColor', borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite', flexShrink: 0 }} />}
+                {directLoading ? 'Tweaking…' : 'Apply'}
+              </button>
+            </div>
+            {directError && <div style={{ fontSize: 12, color: C.red, marginTop: 8 }}>{directError}</div>}
+            {affinitiesPanel}
+          </div>
+        )}
+
+        {(mode === 'chat' || mode === 'synthesis') && (
+          <div>
+            <button onClick={() => setMode('choose')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 13, cursor: 'pointer', padding: '0 0 14px', display: 'block' }}>← Back</button>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 12 }}>
+              {convMessages.map((msg, i) => (
+                <div key={i} style={{ alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '85%', background: msg.role === 'user' ? C.gold + '22' : C.surface, border: `1px solid ${msg.role === 'user' ? C.gold + '44' : C.border}`, borderRadius: msg.role === 'user' ? '10px 10px 2px 10px' : '10px 10px 10px 2px', padding: '8px 12px', fontSize: 14, color: C.text, lineHeight: 1.5, display: 'block' }}>
+                  {msg.content}
+                </div>
+              ))}
+              {isConvLoading && (
+                <div style={{ alignSelf: 'flex-start', background: C.surface, border: `1px solid ${C.border}`, borderRadius: '10px 10px 10px 2px', padding: '10px 14px' }}>
+                  <span style={{ display: 'inline-block', width: 11, height: 11, border: `2px solid ${C.textFaint}`, borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite' }} />
+                </div>
+              )}
+            </div>
+
+            {mode === 'chat' && (
+              <div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <input type="text" value={convInput} onChange={e => setConvInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleConvSend()}
+                    placeholder={convMessages.length === 0 ? "What are you thinking about changing?" : "Reply…"} disabled={isConvLoading} autoFocus
+                    style={{ flex: 1, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 14, padding: '10px 12px', outline: 'none', opacity: isConvLoading ? 0.5 : 1 }} />
+                  <button onClick={handleConvSend} disabled={!convInput.trim() || isConvLoading}
+                    style={{ background: convInput.trim() && !isConvLoading ? C.gold : C.surface, border: `1px solid ${convInput.trim() && !isConvLoading ? C.gold : C.border}`, borderRadius: 8, color: convInput.trim() && !isConvLoading ? '#0f0f0f' : C.textFaint, fontSize: 16, fontWeight: 700, padding: '10px 16px', cursor: convInput.trim() && !isConvLoading ? 'pointer' : 'default' }}>
+                    →
+                  </button>
+                </div>
+                {convError && <div style={{ fontSize: 12, color: C.red, marginTop: 8 }}>{convError}</div>}
+              </div>
+            )}
+
+            {mode === 'synthesis' && (
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button onClick={() => { onApply({ prompt: synthesisText, result: proposedRevision, conversation: convMessages }); onClose() }}
+                  disabled={!proposedRevision}
+                  style={{ flex: 1, background: proposedRevision ? C.gold : C.surface, border: `1px solid ${proposedRevision ? C.gold : C.border}`, borderRadius: 8, color: proposedRevision ? '#0f0f0f' : C.textFaint, fontSize: 14, fontWeight: 700, padding: '12px', cursor: proposedRevision ? 'pointer' : 'default' }}>
+                  Apply Tweak
+                </button>
+                <button onClick={handleRevise}
+                  style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.textMuted, fontSize: 13, fontWeight: 500, padding: '12px 16px', cursor: 'pointer' }}>
+                  Revise
+                </button>
+              </div>
+            )}
+
+            {affinitiesPanel}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, user, whiteboardId, recipeListNodeId, autoExpand, restoreRecipeNodeId }) {
   const [expanded, setExpanded] = useState(!!autoExpand)
-  const [savedTo, setSavedTo] = useState(null) // null | 'ondeck'
+  const [savedTo, setSavedTo] = useState(null)
   const [tweakedSuggestion, setTweakedSuggestion] = useState(null)
-  const [isTweaking, setIsTweaking] = useState(false)
-  const [tweakText, setTweakText] = useState('')
-  const [isTweakLoading, setIsTweakLoading] = useState(false)
   const [tweakDone, setTweakDone] = useState(false)
-  const [tweakError, setTweakError] = useState(null)
+  const [tweakModalOpen, setTweakModalOpen] = useState(false)
   const recipeNodeIdRef = useRef(restoreRecipeNodeId || null)
   const cardRef = useRef(null)
 
@@ -1701,37 +1956,22 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
     }
   }
 
-  const handleTweakSubmit = async () => {
-    if (!tweakText.trim() || isTweakLoading) return
-    setIsTweakLoading(true)
-    setTweakError(null)
-    const promptText = tweakText.trim()
-    try {
-      const revised = await tweakSingleSuggestion(displayed, promptText)
-      setTweakedSuggestion(revised)
-      setTweakDone(true)
-      setIsTweaking(false)
-      setTweakText('')
-      if (user && whiteboardId && recipeNodeIdRef.current) {
-        try {
-          await supabase
-            .from('exploration_nodes')
-            .insert({ whiteboard_id: whiteboardId, parent_node_id: recipeNodeIdRef.current, node_type: 'tweak', payload: { prompt: promptText, result: revised } })
-          await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId)
-        } catch (err) {
-          console.warn('[whiteboard] tweak node write failed:', err.message)
-        }
+  const handleTweakApply = async ({ prompt, result, conversation }) => {
+    setTweakedSuggestion(result)
+    setTweakDone(true)
+    if (user && whiteboardId && recipeNodeIdRef.current) {
+      try {
+        const payload = conversation?.length > 0 ? { prompt, result, conversation } : { prompt, result }
+        await supabase.from('exploration_nodes').insert({ whiteboard_id: whiteboardId, parent_node_id: recipeNodeIdRef.current, node_type: 'tweak', payload })
+        await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId)
+      } catch (err) {
+        console.warn('[whiteboard] tweak node write failed:', err.message)
       }
-    } catch (err) {
-      setTweakError(err.message || 'Could not tweak this suggestion. Please try again.')
-    } finally {
-      setIsTweakLoading(false)
     }
   }
 
   return (
     <div ref={cardRef} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
-      <div style={{ opacity: isTweakLoading ? 0.4 : 1, transition: 'opacity 0.3s', pointerEvents: isTweakLoading ? 'none' : 'auto' }}>
       <div style={{ marginBottom: 8 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 5 }}>
           <span style={{ fontWeight: 700, fontSize: 16, color: C.gold }}>{displayed.recipe_name || 'Untitled suggestion'}</span>
@@ -1798,48 +2038,24 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
           <button onClick={handleOnDeck} style={{ background: 'none', border: `1px solid ${C.blue}`, borderRadius: 20, color: C.blue, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>🍹 On Deck</button>
         </div>
       )}
-      </div>
 
       <div style={{ marginTop: 10, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
-        {tweakDone && !isTweaking && (
-          <div style={{ fontSize: 12, color: C.green, marginBottom: 6 }}>✓ Tweaked</div>
-        )}
-        {!isTweaking ? (
-          <button onClick={() => { setIsTweaking(true); setTweakDone(false) }}
-            style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0 }}>
-            ✏️ Tweak this
-          </button>
-        ) : (
-          <div>
-            <div style={{ display: 'flex', gap: 6 }}>
-              <input
-                type="text"
-                value={tweakText}
-                onChange={e => setTweakText(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && handleTweakSubmit()}
-                placeholder="e.g. make it less sweet, use bourbon instead"
-                disabled={isTweakLoading}
-                autoFocus
-                style={{ flex: 1, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 12, padding: '7px 10px', outline: 'none', opacity: isTweakLoading ? 0.5 : 1 }}
-              />
-              <button
-                onClick={handleTweakSubmit}
-                disabled={!tweakText.trim() || isTweakLoading}
-                style={{ background: tweakText.trim() && !isTweakLoading ? C.gold : C.surface, border: `1px solid ${tweakText.trim() && !isTweakLoading ? C.gold : C.border}`, borderRadius: 6, color: tweakText.trim() && !isTweakLoading ? '#0f0f0f' : C.textFaint, fontSize: 12, fontWeight: 600, padding: '7px 12px', cursor: tweakText.trim() && !isTweakLoading ? 'pointer' : 'default', transition: 'background 0.15s, color 0.15s', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 5 }}>
-                {isTweakLoading && <span style={{ display: 'inline-block', width: 11, height: 11, border: '2px solid currentColor', borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite', flexShrink: 0 }} />}
-                {isTweakLoading ? 'Tweaking…' : 'Tweak'}
-              </button>
-              <button
-                onClick={() => { setIsTweaking(false); setTweakText(''); setTweakError(null) }}
-                disabled={isTweakLoading}
-                style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 6, color: C.textFaint, fontSize: 12, padding: '7px 10px', cursor: isTweakLoading ? 'default' : 'pointer' }}>
-                ✕
-              </button>
-            </div>
-            {tweakError && <div style={{ fontSize: 12, color: C.red, marginTop: 6 }}>{tweakError}</div>}
-          </div>
-        )}
+        {tweakDone && <div style={{ fontSize: 12, color: C.green, marginBottom: 6 }}>✓ Tweaked</div>}
+        <button onClick={() => setTweakModalOpen(true)}
+          style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0 }}>
+          ✏️ Tweak this
+        </button>
       </div>
+      {tweakModalOpen && (
+        <TweakModal
+          suggestion={displayed}
+          user={user}
+          whiteboardId={whiteboardId}
+          recipeNodeId={recipeNodeIdRef.current}
+          onClose={() => setTweakModalOpen(false)}
+          onApply={handleTweakApply}
+        />
+      )}
     </div>
   )
 }
@@ -2662,6 +2878,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
   const [expandedIds, setExpandedIds] = useState(new Set())
   const [nodeNotes, setNodeNotes] = useState({})
   const [triedMap, setTriedMap] = useState({})
+  const [viewConvMessages, setViewConvMessages] = useState(null)
 
   useEffect(() => {
     const load = async () => {
@@ -2843,6 +3060,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     }
     if (node.node_type === 'tweak') {
       const tried = !!triedMap[node.id]
+      const hasConv = node.payload?.conversation?.length > 0
       return (
       <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
@@ -2856,7 +3074,13 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
         {node.payload?.result?.recipe_name && (
           <div style={{ color: C.gold, fontWeight: 600, marginBottom: 4 }}>{node.payload.result.recipe_name}</div>
         )}
-        {node.payload?.result?.summary && <div style={{ marginBottom: 10 }}>{node.payload.result.summary}</div>}
+        {node.payload?.result?.summary && <div style={{ marginBottom: hasConv ? 6 : 10 }}>{node.payload.result.summary}</div>}
+        {hasConv && (
+          <button onClick={(e) => { e.stopPropagation(); setViewConvMessages(node.payload.conversation) }}
+            style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: '0 0 10px', textDecoration: 'underline' }}>
+            View conversation →
+          </button>
+        )}
         <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 6 }}>Tasting Notes</div>
         <textarea
           value={nodeNotes[node.id] ?? node.notes ?? ''}
@@ -2943,6 +3167,24 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
       {!loading && treeRoots.length > 0 && (
         <div style={{ paddingBottom: 40 }}>
           {treeRoots.map(root => renderNode(root, 0))}
+        </div>
+      )}
+
+      {viewConvMessages && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', zIndex: 950, display: 'flex', alignItems: 'flex-end' }} onClick={() => setViewConvMessages(null)}>
+          <div style={{ width: '100%', background: C.bg, borderRadius: '16px 16px 0 0', padding: '20px 20px 36px', maxHeight: '70vh', overflowY: 'auto', boxSizing: 'border-box' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16 }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: C.text, flex: 1 }}>Tweak conversation</div>
+              <button onClick={() => setViewConvMessages(null)} style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 20, cursor: 'pointer', padding: 0, lineHeight: 1 }}>✕</button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {viewConvMessages.map((msg, i) => (
+                <div key={i} style={{ alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '85%', background: msg.role === 'user' ? C.gold + '22' : C.surface, border: `1px solid ${msg.role === 'user' ? C.gold + '44' : C.border}`, borderRadius: msg.role === 'user' ? '10px 10px 2px 10px' : '10px 10px 10px 2px', padding: '8px 12px', fontSize: 14, color: C.text, lineHeight: 1.5, display: 'block' }}>
+                  {msg.content}
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       )}
     </div>
