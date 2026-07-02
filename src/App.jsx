@@ -740,7 +740,9 @@ async function converseTweakStep({ suggestion, affinityContext, tweakHistory, me
     suggestion.summary ? `Summary: ${suggestion.summary}` : null,
   ].filter(Boolean).join('\n')
 
-  const system = `You are an expert craft bartender. Terse, direct, expert — no affirmations, no filler, no hedging. Max 2 sentences per response unless writing a final synthesis. If the user's idea won't work, say so plainly and suggest an alternative.
+  const system = `You are an expert craft bartender diagnosing a cocktail. Terse, direct, expert — no affirmations, no filler, no hedging. Max 2 sentences per response unless writing a final synthesis.
+
+Maintain your diagnostic position across exchanges. If you identify a problem in exchange 1, don't abandon it just because the user asks something new in exchange 2 — connect their question back to your diagnosis or explain why it's a separate issue. Only change your position if the user gives a compelling reason, not just because they asked something different. If the user's second question is unrelated to what you flagged, say so briefly and address both. Never agree with a suggestion just because it was asked — evaluate it on its merits and push back plainly if it won't work.
 
 ${recipeSummary}${tweakHistory.length > 0 ? `\n\nPrior tweaks on this recipe:\n${tweakHistory.map(p => `- "${p}"`).join('\n')}` : ''}${affinityContext ? `\n\nAffinity reference:\n${affinityContext}` : ''}`
 
@@ -1818,8 +1820,8 @@ function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, onClose, onA
   )
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', zIndex: 900, display: 'flex', alignItems: 'flex-end' }} onClick={onClose}>
-      <div style={{ width: '100%', background: C.bg, borderRadius: '16px 16px 0 0', padding: '20px 20px 36px', maxHeight: '80vh', overflowY: 'auto', boxSizing: 'border-box' }} onClick={e => e.stopPropagation()}>
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', zIndex: 900, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }} onClick={onClose}>
+      <div style={{ width: '100%', maxWidth: 600, background: C.bg, borderRadius: '16px 16px 0 0', padding: '20px 20px 36px', maxHeight: '80vh', overflowY: 'auto', boxSizing: 'border-box' }} onClick={e => e.stopPropagation()}>
 
         <div style={{ display: 'flex', alignItems: 'center', marginBottom: 20 }}>
           <div>
@@ -2043,7 +2045,7 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
         {tweakDone && <div style={{ fontSize: 12, color: C.green, marginBottom: 6 }}>✓ Tweaked</div>}
         <button onClick={() => setTweakModalOpen(true)}
           style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0 }}>
-          ✏️ Tweak this
+          ✦ Refine this
         </button>
       </div>
       {tweakModalOpen && (
