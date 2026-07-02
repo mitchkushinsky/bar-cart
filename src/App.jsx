@@ -1918,13 +1918,13 @@ function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, onClose, onA
   )
 }
 
-function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, user, whiteboardId, recipeListNodeId, autoExpand, restoreRecipeNodeId }) {
+function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, user, whiteboardId, recipeListNodeId, recipeNodeIds, autoExpand, restoreRecipeNodeId }) {
   const [expanded, setExpanded] = useState(!!autoExpand)
   const [savedTo, setSavedTo] = useState(null)
   const [tweakedSuggestion, setTweakedSuggestion] = useState(null)
   const [tweakDone, setTweakDone] = useState(false)
   const [tweakModalOpen, setTweakModalOpen] = useState(false)
-  const recipeNodeIdRef = useRef(restoreRecipeNodeId || null)
+  const recipeNodeIdRef = useRef(restoreRecipeNodeId || recipeNodeIds?.[suggestion.recipe_name] || null)
   const cardRef = useRef(null)
 
   useEffect(() => {
@@ -2042,9 +2042,9 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
       )}
 
       <div style={{ marginTop: 10, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
-        {tweakDone && <div style={{ fontSize: 12, color: C.green, marginBottom: 6 }}>✓ Tweaked</div>}
+        {tweakDone && <div style={{ fontSize: 12, color: C.green, marginBottom: 6 }}>✓ Refined</div>}
         <button onClick={() => setTweakModalOpen(true)}
-          style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0 }}>
+          style={{ background: 'none', border: `1px solid ${C.gold}66`, borderRadius: 20, color: C.gold, fontSize: 12, fontWeight: 500, padding: '5px 12px', cursor: 'pointer' }}>
           ✦ Refine this
         </button>
       </div>
@@ -2099,6 +2099,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   const [resultsPreviousStep, setResultsPreviousStep] = useState('prefs')
   const [currentWhiteboardId, setCurrentWhiteboardId] = useState(null)
   const [currentRecipeListNodeId, setCurrentRecipeListNodeId] = useState(null)
+  const [currentRecipeNodeIds, setCurrentRecipeNodeIds] = useState({})
   const [continueFromNodeId, setContinueFromNodeId] = useState(null)
   const [autoExpandRecipeName, setAutoExpandRecipeName] = useState(null)
   const [autoExpandRecipeNodeId, setAutoExpandRecipeNodeId] = useState(null)
@@ -2257,12 +2258,33 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
             }
 
             if (wbId) {
+              const recipes = JSON.parse(JSON.stringify(data.suggestions || []))
               const { data: listNode } = await supabase
                 .from('exploration_nodes')
-                .insert({ whiteboard_id: wbId, parent_node_id: recipeListParentId ?? null, node_type: 'recipe_list', payload: { recipes: JSON.parse(JSON.stringify(data.suggestions || [])) } })
+                .insert({ whiteboard_id: wbId, parent_node_id: recipeListParentId ?? null, node_type: 'recipe_list', payload: { recipes } })
                 .select('id').single()
-              setCurrentRecipeListNodeId(listNode?.id ?? null)
+              const listNodeId = listNode?.id ?? null
+              setCurrentRecipeListNodeId(listNodeId)
               setContinueFromNodeId(null)
+
+              const recipeNodeIds = {}
+              if (listNodeId && recipes.length > 0) {
+                const settled = await Promise.allSettled(
+                  recipes.map(recipe =>
+                    supabase.from('exploration_nodes')
+                      .insert({ whiteboard_id: wbId, parent_node_id: listNodeId, node_type: 'recipe', payload: { recipe } })
+                      .select('id').single()
+                  )
+                )
+                recipes.forEach((recipe, i) => {
+                  const r = settled[i]
+                  if (r.status === 'fulfilled' && r.value?.data?.id && recipe.recipe_name) {
+                    recipeNodeIds[recipe.recipe_name] = r.value.data.id
+                  }
+                })
+              }
+              setCurrentRecipeNodeIds(recipeNodeIds)
+
               await supabase.from('exploration_whiteboards').update({ last_touched_at: now }).eq('id', wbId)
             }
           } catch (err) {
@@ -2276,7 +2298,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
-  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setResultsPreviousStep('prefs'); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setContinueFromNodeId(null); setAutoExpandRecipeName(null); setAutoExpandRecipeNodeId(null) }
+  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setResultsPreviousStep('prefs'); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeName(null); setAutoExpandRecipeNodeId(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2755,7 +2777,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} autoExpand={autoExpandRecipeName === s.recipe_name} restoreRecipeNodeId={autoExpandRecipeName === s.recipe_name ? autoExpandRecipeNodeId : null} />)}
+                {canMake.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={autoExpandRecipeName === s.recipe_name} restoreRecipeNodeId={autoExpandRecipeName === s.recipe_name ? autoExpandRecipeNodeId : null} />)}
               </div>
             </div>
           )}
@@ -2763,7 +2785,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Worth Buying For ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} autoExpand={autoExpandRecipeName === s.recipe_name} restoreRecipeNodeId={autoExpandRecipeName === s.recipe_name ? autoExpandRecipeNodeId : null} />)}
+                {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={autoExpandRecipeName === s.recipe_name} restoreRecipeNodeId={autoExpandRecipeName === s.recipe_name ? autoExpandRecipeNodeId : null} />)}
               </div>
             </div>
           )}
