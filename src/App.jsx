@@ -2509,7 +2509,10 @@ Rules:
     return (
       <div>
         <button onClick={() => setStep('ingredients')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
-        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 24 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
+        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 24, gap: 10 }}>
+          <div style={{ fontSize: 13, color: C.textMuted, flex: 1 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
+          <button onClick={() => setStep('prefs')} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '4px 12px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>Quick Build →</button>
+        </div>
         {affinityError && (
           <div style={{ background: C.amber + '15', border: `1px solid ${C.amber}44`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.amber, marginBottom: 20 }}>{affinityError}</div>
         )}
@@ -2562,26 +2565,48 @@ Rules:
             + Add an Ingredient
           </button>
         ) : (
-          <div style={{ marginTop: 8 }}>
+          <div style={{ marginTop: 8, position: 'relative' }}>
             <input
               autoFocus
               value={adderQuery}
               onChange={e => setAdderQuery(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && adderQuery.trim()) handleAddAndAnalyze(adderQuery.trim()) }}
+              onKeyDown={e => { if (e.key === 'Enter' && adderQuery.trim()) { setShowIngredientAdder(false); setAdderQuery(''); handleAddAndAnalyze(adderQuery.trim()) } }}
               placeholder="Type an ingredient..."
               style={{ width: '100%', background: C.surface, border: `1px solid ${C.gold}`, borderRadius: 10, color: C.text, fontSize: 15, padding: '13px 16px', boxSizing: 'border-box', outline: 'none' }}
             />
-            <div style={{ fontSize: 12, color: C.textFaint, marginTop: 6, paddingLeft: 4 }}>Refine or replace, then press Enter to add</div>
+            {adderQuery.trim().length > 0 && (() => {
+              const q = adderQuery.toLowerCase().trim()
+              const sugs = (inventory || []).filter(i => !selectedNorm.includes(i.spirit.trim().toLowerCase()) && i.spirit.toLowerCase().includes(q)).slice(0, 6)
+              const exact = sugs.some(s => s.spirit.toLowerCase() === q)
+              return (
+                <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#1c1c1c', border: `1px solid ${C.border}`, borderRadius: 8, zIndex: 20, overflow: 'hidden', marginTop: 4 }}>
+                  {sugs.map(item => (
+                    <div key={item.spirit} onClick={() => { setShowIngredientAdder(false); setAdderQuery(''); handleAddAndAnalyze(item.spirit) }}
+                      style={{ padding: '10px 14px', cursor: 'pointer', fontSize: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                      onMouseEnter={e => e.currentTarget.style.background = C.border}
+                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                      <span>{item.spirit}</span>
+                      {item.category && <span style={{ fontSize: 11, color: C.textFaint }}>{item.category}</span>}
+                    </div>
+                  ))}
+                  {!exact && (
+                    <div onClick={() => { setShowIngredientAdder(false); setAdderQuery(''); handleAddAndAnalyze(adderQuery.trim()) }}
+                      style={{ padding: '10px 14px', cursor: 'pointer', fontSize: 14, color: C.textMuted, borderTop: sugs.length ? `1px solid ${C.border}` : 'none' }}
+                      onMouseEnter={e => e.currentTarget.style.background = C.border}
+                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                      Use &quot;{adderQuery.trim()}&quot; →
+                    </div>
+                  )}
+                </div>
+              )
+            })()}
             <button
               onClick={() => { setShowIngredientAdder(false); setAdderQuery('') }}
-              style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 13, cursor: 'pointer', marginTop: 4, padding: '4px 0' }}>
+              style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 13, cursor: 'pointer', marginTop: 8, padding: '4px 0', display: 'block' }}>
               Cancel
             </button>
           </div>
         )}
-        <button onClick={() => setStep('prefs')} style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: 'pointer', marginTop: 8 }}>
-          Quick Build →
-        </button>
       </div>
     )
   }
