@@ -13,7 +13,13 @@
       "Bash(git -C /Users/mitchellkushinsky/bar-cart log --all --oneline --grep=\"fitbit\\\\|vitamin\\\\|nutrition\\\\|food\\\\|nutrient\" -i)",
       "Bash(git -C /Users/mitchellkushinsky/bar-cart log --all --oneline)",
       "Bash(git *)",
-      "Bash(curl -s \"https://docs.google.com/spreadsheets/d/e/2PACX-1vSWHwzLTItnOhFiPSAPObW6iJI1OVnpqiYgoaUzM_KYlzM2MgJsr4zFLpnaY_mB6kOVQLp6edO9xMIB/pub?output=csv\")"
+      "Bash(curl -s \"https://docs.google.com/spreadsheets/d/e/2PACX-1vSWHwzLTItnOhFiPSAPObW6iJI1OVnpqiYgoaUzM_KYlzM2MgJsr4zFLpnaY_mB6kOVQLp6edO9xMIB/pub?output=csv\")",
+      "Bash(vercel *)",
+      "Bash(npx vercel *)",
+      "Bash(grep -v \"^$\")",
+      "Bash(grep -n \"^  return null\\\\|^  return \\(<\\\\|^  return \\(\\\\s*$\" /Users/mitchellkushinsky/bar-cart/src/App.jsx)",
+      "Bash(awk -F: '$2 > 2560 && $2 < 2640 {print}')",
+      "Bash(curl -s http://localhost:5173)"
     ]
   }
 }

@@ -1022,6 +1022,7 @@ function DifficultyBadge({ difficulty }) {
 
 // ─── Results ──────────────────────────────────────────────────────────────────
 
+// TODO: unify with shared RecipeCard once the Analyze/Name/Menu flow is in scope (Session 1.5)
 function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, onFeedback, feedbackLoading, inventory }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
@@ -1061,10 +1062,10 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
   const isFav = favorites.some(f => f.recipeName === result.recipe_name)
   const isToMake = toMake.some(f => f.recipeName === result.recipe_name)
 
-  const handleFeedbackSubmit = () => {
+  const handleFeedbackSubmit = async () => {
     if (!feedbackText.trim()) return
-    onFeedback(feedbackText.trim())
-    setFeedbackText('')
+    const ok = await onFeedback(feedbackText.trim())
+    if (ok) setFeedbackText('')
   }
 
   return (
@@ -1918,14 +1919,34 @@ function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, onClose, onA
   )
 }
 
-function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, user, whiteboardId, recipeListNodeId, recipeNodeIds, autoExpand, restoreRecipeNodeId }) {
+function RecipeCard({
+  suggestion,
+  primaryIngredients = [],
+  onSaveOnDeck = null,
+  user = null,
+  whiteboardId = null,
+  recipeListNodeId = null,
+  recipeNodeIds = null,
+  autoExpand = false,
+  restoreRecipeNodeId = null,
+  initialTried = false,
+  initialNotes = '',
+  showSaveButtons = true,
+  showRefineCTA = true,
+  onTriedToggle = null,
+  onNotesSave = null,
+}) {
   const [expanded, setExpanded] = useState(!!autoExpand)
   const [savedTo, setSavedTo] = useState(null)
   const [tweakedSuggestion, setTweakedSuggestion] = useState(null)
   const [tweakDone, setTweakDone] = useState(false)
   const [tweakModalOpen, setTweakModalOpen] = useState(false)
+  const [tried, setTried] = useState(initialTried)
+  const [notes, setNotes] = useState(initialNotes)
   const recipeNodeIdRef = useRef(restoreRecipeNodeId || recipeNodeIds?.[suggestion.recipe_name] || null)
   const cardRef = useRef(null)
+  const pendingTriedRef = useRef(null)
+  const pendingNotesRef = useRef(null)
 
   useEffect(() => {
     if (autoExpand && cardRef.current) {
@@ -1934,9 +1955,21 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sync ref when eager recipe-node writes complete after cards have already rendered.
+  // Flush any tried/notes mutations that arrived before the ID was known.
   useEffect(() => {
     if (!recipeNodeIdRef.current && recipeNodeIds?.[suggestion.recipe_name]) {
       recipeNodeIdRef.current = recipeNodeIds[suggestion.recipe_name]
+      if (user) {
+        if (pendingTriedRef.current !== null) {
+          const p = pendingTriedRef.current
+          supabase.from('exploration_nodes').update({ tried: p.tried, tried_at: p.tried_at }).eq('id', recipeNodeIdRef.current).then()
+          pendingTriedRef.current = null
+        }
+        if (pendingNotesRef.current !== null) {
+          supabase.from('exploration_nodes').update({ notes: pendingNotesRef.current }).eq('id', recipeNodeIdRef.current).then()
+          pendingNotesRef.current = null
+        }
+      }
     }
   }, [recipeNodeIds]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1946,6 +1979,7 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
     onSaveOnDeck(displayed, primaryIngredients)
     setSavedTo('ondeck')
   }
+
   const handleToggleExpand = async () => {
     const next = !expanded
     setExpanded(next)
@@ -1965,6 +1999,29 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
     }
   }
 
+  const handleToggleTried = () => {
+    const next = !tried
+    const triedAt = next ? new Date().toISOString() : null
+    setTried(next)
+    if (onTriedToggle) {
+      onTriedToggle(next, triedAt)
+    } else if (recipeNodeIdRef.current && user) {
+      supabase.from('exploration_nodes').update({ tried: next, tried_at: triedAt }).eq('id', recipeNodeIdRef.current).then()
+    } else {
+      pendingTriedRef.current = { tried: next, tried_at: triedAt }
+    }
+  }
+
+  const handleNotesSave = (value) => {
+    if (onNotesSave) {
+      onNotesSave(value)
+    } else if (recipeNodeIdRef.current && user) {
+      supabase.from('exploration_nodes').update({ notes: value }).eq('id', recipeNodeIdRef.current).then()
+    } else {
+      pendingNotesRef.current = value
+    }
+  }
+
   const handleTweakApply = async ({ prompt, result, conversation }) => {
     setTweakedSuggestion(result)
     setTweakDone(true)
@@ -1980,17 +2037,19 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
   }
 
   return (
-    <div ref={cardRef} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
+    <div ref={cardRef} style={showSaveButtons ? { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' } : {}}>
       <div style={{ marginBottom: 8 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 5 }}>
-          <span style={{ fontWeight: 700, fontSize: 16, color: C.gold }}>{displayed.recipe_name || 'Untitled suggestion'}</span>
-          {displayed.glass_type && <GlassIcon type={displayed.glass_type} />}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: showSaveButtons ? 5 : 3 }}>
+          <span style={{ fontWeight: 700, fontSize: showSaveButtons ? 16 : 14, color: C.gold }}>{displayed.recipe_name || 'Untitled suggestion'}</span>
+          {showSaveButtons && displayed.glass_type && <GlassIcon type={displayed.glass_type} />}
         </div>
-        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 4 }}>
-          <OriginBadge originFlag={displayed.origin_flag} />
-          <DifficultyBadge difficulty={displayed.difficulty} />
-        </div>
-        {displayed.difficulty_note && <div style={{ fontSize: 12, color: C.textFaint, marginTop: 2 }}>{displayed.difficulty_note}</div>}
+        {showSaveButtons && (
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 4 }}>
+            <OriginBadge originFlag={displayed.origin_flag} />
+            <DifficultyBadge difficulty={displayed.difficulty} />
+          </div>
+        )}
+        {showSaveButtons && displayed.difficulty_note && <div style={{ fontSize: 12, color: C.textFaint, marginTop: 2 }}>{displayed.difficulty_note}</div>}
       </div>
 
       {displayed.summary && <p style={{ fontSize: 14, color: C.textMuted, lineHeight: 1.55, marginBottom: 10 }}>{displayed.summary}</p>}
@@ -2023,7 +2082,7 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
               🔧 {displayed.technique_notes}
             </div>
           )}
-          {displayed.ingredients && displayed.ingredients.length > 0 && (
+          {showSaveButtons && displayed.ingredients && displayed.ingredients.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
               {displayed.ingredients.filter(ing => ing.ingredient).map((ing, i) => (
                 <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13 }}>
@@ -2040,21 +2099,39 @@ function ExplorationResultCard({ suggestion, primaryIngredients, onSaveOnDeck, u
         </div>
       )}
 
-      {savedTo ? (
-        <div style={{ marginTop: 12, fontSize: 13, color: C.textFaint }}>✓ Saved to On Deck</div>
-      ) : (
-        <div style={{ display: 'flex', gap: 6, marginTop: 12, flexWrap: 'wrap' }}>
+      <div style={{ marginTop: 12 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 5 }}>Tasting Notes</div>
+        <textarea
+          value={notes}
+          onChange={e => setNotes(e.target.value)}
+          onBlur={e => handleNotesSave(e.target.value)}
+          placeholder="Add your tasting notes…"
+          rows={2}
+          style={{ width: '100%', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, padding: '8px 10px', resize: 'vertical', outline: 'none', boxSizing: 'border-box' }}
+        />
+      </div>
+
+      <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+        <button onClick={handleToggleTried}
+          style={{ background: tried ? C.green + '22' : 'none', border: `1px solid ${tried ? C.green : C.border}`, borderRadius: 20, color: tried ? C.green : C.textMuted, fontSize: 12, fontWeight: tried ? 700 : 400, padding: '4px 12px', cursor: 'pointer', transition: 'all 0.15s' }}>
+          {tried ? '✓ Tried' : 'Mark Tried'}
+        </button>
+        {showSaveButtons && (savedTo ? (
+          <div style={{ fontSize: 13, color: C.textFaint }}>✓ Saved to On Deck</div>
+        ) : (
           <button onClick={handleOnDeck} style={{ background: 'none', border: `1px solid ${C.blue}`, borderRadius: 20, color: C.blue, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>🍹 On Deck</button>
+        ))}
+      </div>
+
+      {showRefineCTA && (
+        <div style={{ marginTop: 10, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
+          {tweakDone && <div style={{ fontSize: 12, color: C.green, marginBottom: 6 }}>✓ Refined</div>}
+          <button onClick={() => setTweakModalOpen(true)}
+            style={{ background: 'none', border: `1px solid ${C.gold}66`, borderRadius: 20, color: C.gold, fontSize: 12, fontWeight: 500, padding: '5px 12px', cursor: 'pointer' }}>
+            ✦ Refine this
+          </button>
         </div>
       )}
-
-      <div style={{ marginTop: 10, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
-        {tweakDone && <div style={{ fontSize: 12, color: C.green, marginBottom: 6 }}>✓ Refined</div>}
-        <button onClick={() => setTweakModalOpen(true)}
-          style={{ background: 'none', border: `1px solid ${C.gold}66`, borderRadius: 20, color: C.gold, fontSize: 12, fontWeight: 500, padding: '5px 12px', cursor: 'pointer' }}>
-          ✦ Refine this
-        </button>
-      </div>
       {tweakModalOpen && (
         <TweakModal
           suggestion={displayed}
@@ -2076,10 +2153,9 @@ const EXPLORE_LOADING_MSGS = [
   'Almost there…',
 ]
 
-function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pendingRestore, onRestoreConsumed, onBackToInProgress }) {
+function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pendingRestore, onRestoreConsumed, onBackToInProgress, onOpenWhiteboard }) {
   const [step, setStep] = useState('ingredients')
-  const wasRestoredRef = useRef(false)
-  const stepEffectMountedRef = useRef(false)
+  const [navStack, setNavStack] = useState([])
   const [selected, setSelected] = useState([])
   const [style, setStyle] = useState(null)
   const [flavors, setFlavors] = useState([])
@@ -2103,13 +2179,13 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   const [combinationError, setCombinationError] = useState(null)
   const [showIngredientAdder, setShowIngredientAdder] = useState(false)
   const [adderQuery, setAdderQuery] = useState('')
-  const [resultsPreviousStep, setResultsPreviousStep] = useState('prefs')
   const [currentWhiteboardId, setCurrentWhiteboardId] = useState(null)
   const [currentRecipeListNodeId, setCurrentRecipeListNodeId] = useState(null)
   const [currentRecipeNodeIds, setCurrentRecipeNodeIds] = useState({})
   const [continueFromNodeId, setContinueFromNodeId] = useState(null)
   const [autoExpandRecipeName, setAutoExpandRecipeName] = useState(null)
   const [autoExpandRecipeNodeId, setAutoExpandRecipeNodeId] = useState(null)
+  const [restoreNodeData, setRestoreNodeData] = useState({}) // recipe_name → { nodeId, tried, notes }
 
   useEffect(() => {
     const load = async () => {
@@ -2145,21 +2221,22 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setContinueFromNodeId(pendingRestore.continueFromNodeId || null)
     setAutoExpandRecipeName(pendingRestore.autoExpandRecipeName || null)
     setAutoExpandRecipeNodeId(pendingRestore.restoreRecipeNodeId || null)
+    const nd = pendingRestore.restoreNodeData || {}
+    setRestoreNodeData(nd)
+    // Pre-populate node IDs so RecipeCards bind to existing rows instead of creating duplicates
+    const restoredNodeIds = {}
+    Object.entries(nd).forEach(([name, data]) => { if (data.nodeId) restoredNodeIds[name] = data.nodeId })
+    setCurrentRecipeNodeIds(restoredNodeIds)
+    // Seed navStack so Back from restored results → whiteboard → In Progress
+    const stack = []
+    if (pendingRestore.whiteboardId) {
+      stack.push({ type: 'inProgress' })
+      stack.push({ type: 'whiteboard', id: pendingRestore.whiteboardId })
+    }
+    setNavStack(stack)
     setStep(pendingRestore.resumeStep || (pendingRestore.result ? 'results' : 'ingredients'))
-    wasRestoredRef.current = true
     onRestoreConsumed?.()
   }, [pendingRestore]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  // When the user backs all the way out of a restored exploration, switch to In Progress sub-tab.
-  // Skip the initial mount: on mount the pendingRestore effect already set wasRestoredRef=true
-  // AND step is still 'ingredients', so without this guard the callback fires immediately.
-  useEffect(() => {
-    if (!stepEffectMountedRef.current) { stepEffectMountedRef.current = true; return }
-    if (step === 'ingredients' && wasRestoredRef.current) {
-      wasRestoredRef.current = false
-      onBackToInProgress?.()
-    }
-  }, [step]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (step !== 'loading') return
@@ -2214,7 +2291,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setFeedbackError(null)
     setFeedbackBanner(false)
     setPartialSource(null)
-    setStep('results')
+    goToStep('results')
   }
 
   const STYLES = [
@@ -2230,11 +2307,35 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
 
   const toggleFlavor = id => setFlavors(prev => prev.includes(id) ? prev.filter(f => f !== id) : prev.length < 3 ? [...prev, id] : prev)
 
+  // Navigation helpers — use these instead of bare setStep so all transitions go through the stack.
+  // goToStep pushes the current step and moves forward; goBack pops and moves backward.
+  const goToStep = (newStep) => {
+    const fromStep = stepRef.current
+    setNavStack(prev => [...prev, fromStep])
+    setStep(newStep)
+  }
+
+  const goBack = () => {
+    const top = navStack[navStack.length - 1]
+    if (!top) {
+      onBackToInProgress?.()
+      return
+    }
+    setNavStack(prev => prev.slice(0, -1))
+    if (typeof top === 'object') {
+      if (top.type === 'whiteboard') onOpenWhiteboard?.(top.id)
+      else if (top.type === 'inProgress') onBackToInProgress?.()
+    } else {
+      setStep(top)
+    }
+  }
+
   const handleExplore = async (styleOverride, fromCombination = false) => {
     const activeStyle = styleOverride !== undefined ? styleOverride : style
-    setResultsPreviousStep(fromCombination ? 'combination' : 'prefs')
+    setNavStack(prev => [...prev, stepRef.current])
     setStep('loading')
     setPartialSource(null)
+    setRestoreNodeData({})
     try {
       const { result: data, partialSource: ps } = await analyzeExplorations(selected, activeStyle, flavors, lowABV, inventoryText)
       setResult(data)
@@ -2305,7 +2406,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
-  const reset = () => { setStep('ingredients'); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setResultsPreviousStep('prefs'); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeName(null); setAutoExpandRecipeNodeId(null) }
+  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeName(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2376,7 +2477,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
       setAffinityError('Could not load affinity data. You can still continue.')
     } finally {
       setAffinityLoading(false)
-      setStep('affinities')
+      goToStep('affinities')
     }
   }
 
@@ -2441,7 +2542,7 @@ Rules:
     setCombinationLoading(true)
     setCombinationData(null)
     setCombinationError(null)
-    setStep('combination')
+    goToStep('combination')
 
     const normNew = trimmed.trim().toLowerCase()
     const mergedAffinityData = { ...affinityData }
@@ -2508,10 +2609,10 @@ Rules:
     }
     return (
       <div>
-        <button onClick={() => setStep('ingredients')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+        <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
         <div style={{ display: 'flex', alignItems: 'center', marginBottom: 24, gap: 10 }}>
           <div style={{ fontSize: 13, color: C.textMuted, flex: 1 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
-          <button onClick={() => setStep('prefs')} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '4px 12px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>Quick Build →</button>
+          <button onClick={() => goToStep('prefs')} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '4px 12px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>Quick Build →</button>
         </div>
         {affinityError && (
           <div style={{ background: C.amber + '15', border: `1px solid ${C.amber}44`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.amber, marginBottom: 20 }}>{affinityError}</div>
@@ -2621,7 +2722,7 @@ Rules:
 
     return (
       <div>
-        <button onClick={() => { setCombinationData(null); setCombinationError(null); setStep('affinities') }} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+        <button onClick={() => { setCombinationData(null); setCombinationError(null); goBack() }} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
         <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 24 }}>
           Building: <span style={{ color: C.gold }}>{selected.join(' + ')}</span>
         </div>
@@ -2697,7 +2798,7 @@ Rules:
 
   if (step === 'prefs') return (
     <div>
-      <button onClick={() => setStep('ingredients')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+      <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
       <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Style & Preferences</div>
       <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 24 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
 
@@ -2762,9 +2863,11 @@ Rules:
   )
 
   if (step === 'results' && result) {
+    const backLabel = navStack[navStack.length - 1]?.type === 'whiteboard' ? '← Whiteboard' : '← Back'
+
     if (result.incompatible) return (
       <div>
-        <button onClick={() => setStep(resultsPreviousStep)} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+        <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>{backLabel}</button>
         <div style={{ background: C.amber + '15', border: `1px solid ${C.amber}44`, borderRadius: 10, padding: '20px', marginBottom: 20 }}>
           <div style={{ fontSize: 18, fontWeight: 700, color: C.amber, marginBottom: 8 }}>These don't quite mix…</div>
           <div style={{ fontSize: 14, color: C.text, lineHeight: 1.6 }}>{result.incompatibility_reason}</div>
@@ -2778,7 +2881,7 @@ Rules:
 
     return (
       <div>
-        <button onClick={() => setStep(resultsPreviousStep)} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+        <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>{backLabel}</button>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
           <div style={{ flex: 1, fontSize: 18, fontWeight: 700, color: C.text }}>{selected.join(' + ')}</div>
           <button onClick={reset} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap' }}>Start over</button>
@@ -2809,7 +2912,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={autoExpandRecipeName === s.recipe_name} restoreRecipeNodeId={autoExpandRecipeName === s.recipe_name ? autoExpandRecipeNodeId : null} />)}
+                {canMake.map((s, i) => { const nd = restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={autoExpandRecipeName === s.recipe_name} restoreRecipeNodeId={autoExpandRecipeName === s.recipe_name ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} /> })}
               </div>
             </div>
           )}
@@ -2817,7 +2920,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Worth Buying For ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => <ExplorationResultCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={autoExpandRecipeName === s.recipe_name} restoreRecipeNodeId={autoExpandRecipeName === s.recipe_name ? autoExpandRecipeNodeId : null} />)}
+                {worthBuying.map((s, i) => { const nd = restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={autoExpandRecipeName === s.recipe_name} restoreRecipeNodeId={autoExpandRecipeName === s.recipe_name ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} /> })}
               </div>
             </div>
           )}
@@ -2983,9 +3086,10 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
 
   const handleToggleTried = async (nodeId) => {
     const next = !triedMap[nodeId]
+    const triedAt = next ? new Date().toISOString() : null
     setTriedMap(prev => ({ ...prev, [nodeId]: next }))
     try {
-      await supabase.from('exploration_nodes').update({ tried: next }).eq('id', nodeId)
+      await supabase.from('exploration_nodes').update({ tried: next, tried_at: triedAt }).eq('id', nodeId)
       await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId)
     } catch (err) {
       console.warn('[whiteboard] tried toggle failed:', err.message)
@@ -3039,6 +3143,24 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
 
     const result = isIngredients ? null : { incompatible: false, incompatibility_reason: null, flavor_profile_note: null, pairs_well_with: null, suggestions }
 
+    // Build a map of recipe_name → { nodeId, tried, notes } from existing recipe nodes.
+    // This hydrates RecipeCards on restore and prevents duplicate node inserts.
+    const restoreNodeData = {}
+    if (restoreRecipeListNodeId) {
+      nodes
+        .filter(n => n.parent_node_id === restoreRecipeListNodeId && n.node_type === 'recipe')
+        .forEach(n => {
+          const name = n.payload?.recipe?.recipe_name
+          if (name) restoreNodeData[name] = { nodeId: n.id, tried: triedMap[n.id] ?? !!n.tried, notes: nodeNotes[n.id] ?? n.notes ?? '' }
+        })
+    }
+    // For tweak restores the auto-expand recipe name may differ from the stored node name,
+    // so always ensure autoExpandRecipeName has an entry pointing to the correct node.
+    if (autoExpandRecipeName && restoreRecipeNodeId && !restoreNodeData[autoExpandRecipeName]) {
+      const autoNode = nodeMap[restoreRecipeNodeId]
+      if (autoNode) restoreNodeData[autoExpandRecipeName] = { nodeId: autoNode.id, tried: triedMap[autoNode.id] ?? !!autoNode.tried, notes: nodeNotes[autoNode.id] ?? autoNode.notes ?? '' }
+    }
+
     return {
       primary_ingredients: selected,
       cocktail_style: cocktailStyle,
@@ -3051,6 +3173,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
       restoreRecipeListNodeId,
       autoExpandRecipeName,
       restoreRecipeNodeId,
+      restoreNodeData,
     }
   }
 
@@ -3090,28 +3213,23 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     )
     if (node.node_type === 'recipe') {
       const r = node.payload?.recipe || {}
-      const tried = !!triedMap[node.id]
       return (
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: C.gold, flex: 1 }}>{r.recipe_name}</div>
-            <button
-              onClick={(e) => { e.stopPropagation(); handleToggleTried(node.id) }}
-              style={{ background: tried ? C.green + '22' : C.border + '66', border: `1px solid ${tried ? C.green : C.textFaint}`, borderRadius: 20, color: tried ? C.green : C.textMuted, fontSize: 12, fontWeight: tried ? 700 : 400, padding: '4px 12px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all 0.15s', flexShrink: 0 }}>
-              {tried ? '✓ Tried' : 'Mark Tried'}
-            </button>
-          </div>
-          {r.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, marginBottom: 10 }}>{r.summary}</div>}
-          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 6 }}>Tasting Notes</div>
-          <textarea
-            value={nodeNotes[node.id] ?? node.notes ?? ''}
-            onChange={e => setNodeNotes(prev => ({ ...prev, [node.id]: e.target.value }))}
-            onBlur={e => handleSaveNotes(node.id, e.target.value)}
-            placeholder="Add your tasting notes…"
-            rows={3}
-            style={{ width: '100%', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, padding: '8px 10px', resize: 'vertical', outline: 'none', boxSizing: 'border-box' }}
-          />
-        </div>
+        <RecipeCard
+          suggestion={r}
+          initialTried={!!triedMap[node.id]}
+          initialNotes={nodeNotes[node.id] ?? node.notes ?? ''}
+          showSaveButtons={false}
+          showRefineCTA={false}
+          onTriedToggle={(next, triedAt) => {
+            setTriedMap(prev => ({ ...prev, [node.id]: next }))
+            supabase.from('exploration_nodes').update({ tried: next, tried_at: triedAt }).eq('id', node.id).then()
+            supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId).then()
+          }}
+          onNotesSave={(value) => {
+            setNodeNotes(prev => ({ ...prev, [node.id]: value }))
+            handleSaveNotes(node.id, value)
+          }}
+        />
       )
     }
     if (node.node_type === 'tweak') {
@@ -3270,6 +3388,7 @@ function CreateScreen({ createSubTab, setCreateSubTab, inventory, inventoryText,
           pendingRestore={pendingRestore}
           onRestoreConsumed={onRestoreConsumed}
           onBackToInProgress={onBackToInProgress}
+          onOpenWhiteboard={onOpenWhiteboard}
         />
       )}
       {createSubTab === 'in_progress' && (
@@ -3774,27 +3893,33 @@ export default function App() {
     })
 
   const handleFeedback = async (feedbackText) => {
-    if (!lastRequestBody || !result) return
+    if (!result) return false
     setFeedbackLoading(true); setError(null)
     try {
-      const feedbackBody = {
-        model: MODEL,
-        max_tokens: MAX_TOKENS,
-        messages: [
-          ...stripInventoryFromMessages(lastRequestBody.messages),
-          { role: 'assistant', content: JSON.stringify(result) },
-          { role: 'user', content: `The user reviewed this analysis and provided this feedback: ${feedbackText}. Please revise your response accordingly and return the same JSON structure, with one additional field at the top level: "adjustment_note" — a 1-2 sentence plain English explanation of what specifically changed and why (e.g. "Scaled all amounts to a 4 oz total while maintaining the 1:1:1 Negroni ratio."). Do not include adjustment_note if nothing meaningful changed.` },
-        ],
+      let revised
+      if (lastRequestBody) {
+        const feedbackBody = {
+          model: MODEL,
+          max_tokens: MAX_TOKENS,
+          messages: [
+            ...stripInventoryFromMessages(lastRequestBody.messages),
+            { role: 'assistant', content: JSON.stringify(result) },
+            { role: 'user', content: `The user reviewed this analysis and provided this feedback: ${feedbackText}. Please revise your response accordingly and return the same JSON structure, with one additional field at the top level: "adjustment_note" — a 1-2 sentence plain English explanation of what specifically changed and why (e.g. "Scaled all amounts to a 4 oz total while maintaining the 1:1:1 Negroni ratio."). Do not include adjustment_note if nothing meaningful changed.` },
+          ],
+        }
+        revised = await callClaude(feedbackBody)
+        setLastRequestBody(feedbackBody)
+        setAdjustmentNote(revised.adjustment_note || null)
+      } else {
+        revised = await tweakSingleSuggestion(result, feedbackText)
+        setAdjustmentNote(null)
       }
-      const revised = await callClaude(feedbackBody)
-      setLastRequestBody(feedbackBody)
-      setAdjustmentNote(revised.adjustment_note || null)
       setError(null)
-
-
       setResult(processResult(revised))
+      return true
     } catch (err) {
       setError(err.message || 'Something went wrong. Please try again.')
+      return false
     } finally {
       setFeedbackLoading(false)
     }
