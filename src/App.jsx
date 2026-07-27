@@ -3563,7 +3563,7 @@ export default function App() {
   const [, setAffinityBackfillInProgress] = useState(false)
 
   // Navigation
-  const [screen, setScreen] = useState('analyze')
+  const [screen, setScreen] = useState('create')
   const [createSubTab, setCreateSubTab] = useState('new')
   const [savedSubTab, setSavedSubTab] = useState('ondeck')
   const [pendingExplorationRestore, setPendingExplorationRestore] = useState(null)
