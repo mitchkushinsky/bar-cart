@@ -167,6 +167,13 @@ function inventoryToText(items) {
 
 // ─── Claude API ───────────────────────────────────────────────────────────────
 
+function stripInternalFields(obj) {
+  if (!obj || typeof obj !== 'object') return obj
+  const out = {}
+  for (const k of Object.keys(obj)) if (!k.startsWith('__')) out[k] = obj[k]
+  return out
+}
+
 function stripCiteTags(val) {
   if (typeof val === 'string') return val.replace(/<cite[^>]*>(.*?)<\/cite>/gs, '$1')
   if (Array.isArray(val)) return val.map(stripCiteTags)
@@ -699,7 +706,7 @@ Return ONLY valid JSON with no markdown fences:
   }
 }
 
-async function tweakSingleSuggestion(suggestion, feedbackText) {
+async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, tastingContext) {
   const body = {
     model: MODEL,
     max_tokens: 1500,
@@ -708,11 +715,14 @@ async function tweakSingleSuggestion(suggestion, feedbackText) {
       content: `You are an expert craft bartender. The user wants this specific cocktail suggestion adjusted.
 
 Current suggestion:
-${JSON.stringify(suggestion, null, 2)}
+${JSON.stringify(stripInternalFields(suggestion), null, 2)}
 
-The user's feedback: "${feedbackText}"
+The user's feedback: "${feedbackText}"${tastingContext ? `\n\n${tastingContext}` : ''}
 
-Return a revised version of just this one suggestion in the same JSON structure as a single suggestion object. Return ONLY valid JSON with no markdown fences — a single object, not an array.`,
+BAR INVENTORY:
+${inventoryText}
+
+Return a revised version of just this one suggestion in the same JSON structure as a single suggestion object, re-checking every ingredient in the "ingredients" array (status: found | substitute | missing, location, substitute, substitute_location, flavor_impact) against the bar inventory above — do not leave stale or guessed status values from the original. Also include a "tweak_label" field: a short 3-6 word label summarizing what changed (e.g. "Sparkling rosé swap, soda removed"). Return ONLY valid JSON with no markdown fences — a single object, not an array.`,
     }],
   }
   const firstText = await callClaudeText(body)
@@ -732,7 +742,7 @@ Return a revised version of just this one suggestion in the same JSON structure 
   }
 }
 
-async function converseTweakStep({ suggestion, affinityContext, tweakHistory, messages, isFinal }) {
+async function converseTweakStep({ suggestion, affinityContext, tweakHistory, messages, isFinal, inventoryText, tastingContext }) {
   const recipeSummary = [
     `Recipe: ${suggestion.recipe_name}`,
     suggestion.recipe?.length > 0 ? `Ingredients: ${suggestion.recipe.map(r => `${r.amount} ${r.ingredient}`).join(', ')}` : null,
@@ -744,14 +754,14 @@ async function converseTweakStep({ suggestion, affinityContext, tweakHistory, me
 
 Maintain your diagnostic position across exchanges. If you identify a problem in exchange 1, don't abandon it just because the user asks something new in exchange 2 — connect their question back to your diagnosis or explain why it's a separate issue. Only change your position if the user gives a compelling reason, not just because they asked something different. If the user's second question is unrelated to what you flagged, say so briefly and address both. Never agree with a suggestion just because it was asked — evaluate it on its merits and push back plainly if it won't work.
 
-${recipeSummary}${tweakHistory.length > 0 ? `\n\nPrior tweaks on this recipe:\n${tweakHistory.map(p => `- "${p}"`).join('\n')}` : ''}${affinityContext ? `\n\nAffinity reference:\n${affinityContext}` : ''}`
+${recipeSummary}${tastingContext ? `\n\n${tastingContext}` : ''}${tweakHistory.length > 0 ? `\n\nPrior tweaks on this recipe's lineage:\n${tweakHistory.map(p => `- "${p}"`).join('\n')}` : ''}${affinityContext ? `\n\nAffinity reference:\n${affinityContext}` : ''}`
 
   if (isFinal) {
     const finalMessages = [
       ...messages,
       {
         role: 'user',
-        content: `Synthesize this into a concrete tweak. Write one sentence starting with "Based on what you're describing, here's what I'd try: " Then write "---JSON---" on a new line followed by the complete revised recipe as valid JSON — same structure as the original with all fields: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes.`,
+        content: `Synthesize this into a concrete tweak. Write one sentence starting with "Based on what you're describing, here's what I'd try: " Then write "---JSON---" on a new line followed by the complete revised recipe as valid JSON — same structure as the original with all fields: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes, tweak_label (a short 3-6 word label summarizing what changed, e.g. "Sparkling rosé swap, soda removed"). Re-check every ingredient's status/location/substitute against this bar inventory instead of leaving stale values from the original:\n\n${inventoryText}`,
       },
     ]
     const body = { model: MODEL, max_tokens: 1500, system, messages: finalMessages }
@@ -1702,7 +1712,7 @@ function removeLocalExplorationHistory(searchKey) {
   return entries
 }
 
-function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, onClose, onApply }) {
+function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, inventoryText, tried, notes, onClose, onApply }) {
   const [mode, setMode] = useState('choose')
   const [directText, setDirectText] = useState('')
   const [directLoading, setDirectLoading] = useState(false)
@@ -1729,8 +1739,19 @@ function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, onClose, onA
       }
       if (user && whiteboardId && recipeNodeId) {
         try {
-          const { data } = await supabase.from('exploration_nodes').select('payload').eq('whiteboard_id', whiteboardId).eq('parent_node_id', recipeNodeId).eq('node_type', 'tweak')
-          if (data?.length > 0) setTweakHistory(data.map(n => n.payload?.prompt).filter(Boolean))
+          // Walk the full parent chain (not just direct children) so prior tweaks
+          // anywhere in this recipe's lineage surface here, not only ones parented
+          // directly to the current node.
+          const { data: allNodes } = await supabase.from('exploration_nodes').select('id, parent_node_id, node_type, payload').eq('whiteboard_id', whiteboardId)
+          if (allNodes?.length > 0) {
+            const byId = {}
+            allNodes.forEach(n => { byId[n.id] = n })
+            const chain = []
+            let cur = byId[recipeNodeId]
+            while (cur) { chain.unshift(cur); cur = cur.parent_node_id ? byId[cur.parent_node_id] : null }
+            const priorTweaks = chain.filter(n => n.node_type === 'tweak').map(n => n.payload?.tweak_label || n.payload?.prompt).filter(Boolean)
+            if (priorTweaks.length > 0) setTweakHistory(priorTweaks)
+          }
         } catch (_) {}
       }
     }
@@ -1738,6 +1759,9 @@ function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, onClose, onA
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const affinityContext = affinities.map(a => `${a.ingredient_name}: ${[...(a.spirit_tags || []), ...(a.flavor_tags || [])].slice(0, 6).join(', ')}`).join('\n')
+  const tastingContext = (tried || notes)
+    ? [tried ? 'The user has tried this recipe.' : null, notes ? `Their tasting note: "${notes}"` : null].filter(Boolean).join(' ')
+    : null
 
   const handleDirectSubmit = async () => {
     if (!directText.trim() || directLoading) return
@@ -1745,8 +1769,8 @@ function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, onClose, onA
     setDirectError(null)
     const promptText = directText.trim()
     try {
-      const revised = await tweakSingleSuggestion(suggestion, promptText)
-      onApply({ prompt: promptText, result: revised, conversation: null })
+      const revised = await tweakSingleSuggestion(suggestion, promptText, inventoryText, tastingContext)
+      onApply({ prompt: promptText, result: revised, conversation: null, tweakLabel: revised?.tweak_label })
       onClose()
     } catch (err) {
       setDirectError(err.message || 'Could not apply tweak. Please try again.')
@@ -1766,7 +1790,7 @@ function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, onClose, onA
     setExchangeCount(newCount)
     try {
       const isFinal = newCount >= 2
-      const res = await converseTweakStep({ suggestion, affinityContext, tweakHistory, messages: newMessages, isFinal })
+      const res = await converseTweakStep({ suggestion, affinityContext, tweakHistory, messages: newMessages, isFinal, inventoryText, tastingContext })
       if (isFinal) {
         setConvMessages(prev => [...prev, { role: 'assistant', content: res.synthesisText }])
         setSynthesisText(res.synthesisText)
@@ -1899,7 +1923,7 @@ function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, onClose, onA
 
             {mode === 'synthesis' && (
               <div style={{ display: 'flex', gap: 8 }}>
-                <button onClick={() => { onApply({ prompt: synthesisText, result: proposedRevision, conversation: convMessages }); onClose() }}
+                <button onClick={() => { onApply({ prompt: synthesisText, result: proposedRevision, conversation: convMessages, tweakLabel: proposedRevision?.tweak_label }); onClose() }}
                   disabled={!proposedRevision}
                   style={{ flex: 1, background: proposedRevision ? C.gold : C.surface, border: `1px solid ${proposedRevision ? C.gold : C.border}`, borderRadius: 8, color: proposedRevision ? '#0f0f0f' : C.textFaint, fontSize: 14, fontWeight: 700, padding: '12px', cursor: proposedRevision ? 'pointer' : 'default' }}>
                   Apply Tweak
@@ -1935,6 +1959,7 @@ function RecipeCard({
   showRefineCTA = true,
   onTriedToggle = null,
   onNotesSave = null,
+  inventoryText = '',
 }) {
   const [expanded, setExpanded] = useState(!!autoExpand)
   const [savedTo, setSavedTo] = useState(null)
@@ -1943,10 +1968,19 @@ function RecipeCard({
   const [tweakModalOpen, setTweakModalOpen] = useState(false)
   const [tried, setTried] = useState(initialTried)
   const [notes, setNotes] = useState(initialNotes)
+  const [lineage, setLineage] = useState(null) // { parentName } once a tweak has been applied this session
+  const [showOriginal, setShowOriginal] = useState(false)
   const recipeNodeIdRef = useRef(restoreRecipeNodeId || recipeNodeIds?.[suggestion.recipe_name] || null)
   const cardRef = useRef(null)
   const pendingTriedRef = useRef(null)
   const pendingNotesRef = useRef(null)
+  // Textarea onChange keeps `notes` state current on every keystroke (only the DB write
+  // waits for blur) — mirror it into a ref so the unmount-flush effect below always sees
+  // the latest typed value, even though its own closure is fixed at mount.
+  const notesRef = useRef(notes)
+  useEffect(() => { notesRef.current = notes }, [notes])
+  const savedNotesRef = useRef(initialNotes)
+  const handleNotesSaveRef = useRef(null)
 
   useEffect(() => {
     if (autoExpand && cardRef.current) {
@@ -2013,6 +2047,7 @@ function RecipeCard({
   }
 
   const handleNotesSave = (value) => {
+    savedNotesRef.current = value
     if (onNotesSave) {
       onNotesSave(value)
     } else if (recipeNodeIdRef.current && user) {
@@ -2021,14 +2056,35 @@ function RecipeCard({
       pendingNotesRef.current = value
     }
   }
+  useEffect(() => { handleNotesSaveRef.current = handleNotesSave })
 
-  const handleTweakApply = async ({ prompt, result, conversation }) => {
+  // Notes only save on textarea blur — if the user navigates away (Back, tab switch, etc.)
+  // without blurring first, this flushes whatever was last typed so it isn't silently lost.
+  useEffect(() => {
+    return () => {
+      if (notesRef.current !== savedNotesRef.current) handleNotesSaveRef.current(notesRef.current)
+    }
+  }, [])
+
+  const handleTweakApply = async ({ prompt, result, conversation, tweakLabel }) => {
+    const parentNodeId = recipeNodeIdRef.current
+    const parentName = displayed.recipe_name || suggestion.recipe_name
     setTweakedSuggestion(result)
     setTweakDone(true)
-    if (user && whiteboardId && recipeNodeIdRef.current) {
+    // The tweak is a new, untasted version of the recipe — its own identity, own
+    // node id going forward. Tried/notes must never bleed over from the parent.
+    setTried(false)
+    setNotes('')
+    savedNotesRef.current = ''
+    setShowOriginal(false)
+    setLineage({ parentName })
+    if (user && whiteboardId && parentNodeId) {
       try {
-        const payload = conversation?.length > 0 ? { prompt, result, conversation } : { prompt, result }
-        await supabase.from('exploration_nodes').insert({ whiteboard_id: whiteboardId, parent_node_id: recipeNodeIdRef.current, node_type: 'tweak', payload })
+        const payload = conversation?.length > 0
+          ? { prompt, result, conversation, tweak_label: tweakLabel || null }
+          : { prompt, result, tweak_label: tweakLabel || null }
+        const { data } = await supabase.from('exploration_nodes').insert({ whiteboard_id: whiteboardId, parent_node_id: parentNodeId, node_type: 'tweak', payload }).select('id').single()
+        if (data?.id) recipeNodeIdRef.current = data.id
         await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId)
       } catch (err) {
         console.warn('[whiteboard] tweak node write failed:', err.message)
@@ -2053,6 +2109,23 @@ function RecipeCard({
       </div>
 
       {displayed.summary && <p style={{ fontSize: 14, color: C.textMuted, lineHeight: 1.55, marginBottom: 10 }}>{displayed.summary}</p>}
+
+      {lineage && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12, color: C.textFaint, marginBottom: 10 }}>
+          <span>↳ tweaked from <span style={{ color: C.textMuted }}>{lineage.parentName}</span></span>
+          <button onClick={() => setShowOriginal(o => !o)}
+            style={{ background: 'none', border: 'none', color: C.gold, fontSize: 12, cursor: 'pointer', padding: 0, textDecoration: 'underline' }}>
+            {showOriginal ? 'Hide original' : 'View original'}
+          </button>
+        </div>
+      )}
+      {lineage && showOriginal && (
+        <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', marginBottom: 10 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 6 }}>Original recipe</div>
+          <div style={{ fontWeight: 700, fontSize: 14, color: C.gold, marginBottom: 4 }}>{suggestion.recipe_name}</div>
+          {suggestion.summary && <p style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5 }}>{suggestion.summary}</p>}
+        </div>
+      )}
 
       <button onClick={handleToggleExpand}
         style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0, marginBottom: expanded ? 12 : 0 }}>
@@ -2138,6 +2211,9 @@ function RecipeCard({
           user={user}
           whiteboardId={whiteboardId}
           recipeNodeId={recipeNodeIdRef.current}
+          inventoryText={inventoryText}
+          tried={tried}
+          notes={notes}
           onClose={() => setTweakModalOpen(false)}
           onApply={handleTweakApply}
         />
@@ -2183,9 +2259,9 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   const [currentRecipeListNodeId, setCurrentRecipeListNodeId] = useState(null)
   const [currentRecipeNodeIds, setCurrentRecipeNodeIds] = useState({})
   const [continueFromNodeId, setContinueFromNodeId] = useState(null)
-  const [autoExpandRecipeName, setAutoExpandRecipeName] = useState(null)
   const [autoExpandRecipeNodeId, setAutoExpandRecipeNodeId] = useState(null)
-  const [restoreNodeData, setRestoreNodeData] = useState({}) // recipe_name → { nodeId, tried, notes }
+  const [restoreNodeData, setRestoreNodeData] = useState({}) // recipe_name → { nodeId, tried, notes } — siblings only, see buildContinueRestore
+  const [autoExpandNodeData, setAutoExpandNodeData] = useState(null) // { tried, notes } for the auto-expanded card, keyed by node id not name
 
   useEffect(() => {
     const load = async () => {
@@ -2219,10 +2295,10 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setCurrentWhiteboardId(pendingRestore.whiteboardId || null)
     setCurrentRecipeListNodeId(pendingRestore.restoreRecipeListNodeId || null)
     setContinueFromNodeId(pendingRestore.continueFromNodeId || null)
-    setAutoExpandRecipeName(pendingRestore.autoExpandRecipeName || null)
     setAutoExpandRecipeNodeId(pendingRestore.restoreRecipeNodeId || null)
     const nd = pendingRestore.restoreNodeData || {}
     setRestoreNodeData(nd)
+    setAutoExpandNodeData(pendingRestore.autoExpandNodeData || null)
     // Pre-populate node IDs so RecipeCards bind to existing rows instead of creating duplicates
     const restoredNodeIds = {}
     Object.entries(nd).forEach(([name, data]) => { if (data.nodeId) restoredNodeIds[name] = data.nodeId })
@@ -2336,6 +2412,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setStep('loading')
     setPartialSource(null)
     setRestoreNodeData({})
+    setAutoExpandNodeData(null)
     try {
       const { result: data, partialSource: ps } = await analyzeExplorations(selected, activeStyle, flavors, lowABV, inventoryText)
       setResult(data)
@@ -2406,7 +2483,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
-  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeName(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}) }
+  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2912,7 +2989,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => { const nd = restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={autoExpandRecipeName === s.recipe_name} restoreRecipeNodeId={autoExpandRecipeName === s.recipe_name ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} /> })}
+                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} /> })}
               </div>
             </div>
           )}
@@ -2920,7 +2997,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Worth Buying For ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => { const nd = restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={s} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={autoExpandRecipeName === s.recipe_name} restoreRecipeNodeId={autoExpandRecipeName === s.recipe_name ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} /> })}
+                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} /> })}
               </div>
             </div>
           )}
@@ -3038,6 +3115,9 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
   const [nodeNotes, setNodeNotes] = useState({})
   const [triedMap, setTriedMap] = useState({})
   const [viewConvMessages, setViewConvMessages] = useState(null)
+  const nodeNotesRef = useRef(nodeNotes)
+  useEffect(() => { nodeNotesRef.current = nodeNotes }, [nodeNotes])
+  const dirtyNoteIdsRef = useRef(new Set())
 
   useEffect(() => {
     const load = async () => {
@@ -3076,6 +3156,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
   }
 
   const handleSaveNotes = async (nodeId, notes) => {
+    dirtyNoteIdsRef.current.delete(nodeId)
     try {
       await supabase.from('exploration_nodes').update({ notes }).eq('id', nodeId)
       await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId)
@@ -3083,6 +3164,20 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
       console.warn('[whiteboard] note save failed:', err.message)
     }
   }
+
+  // Notes only save on textarea blur — if the user navigates away (Back, tab switch, etc.)
+  // without blurring first, flush whatever's still marked dirty so it isn't silently lost.
+  useEffect(() => {
+    return () => {
+      // Intentionally reading refs at unmount time (not a snapshot) — these are plain
+      // mutable data refs updated on every keystroke/save, not DOM node refs.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      dirtyNoteIdsRef.current.forEach(id => {
+        const value = nodeNotesRef.current[id]
+        if (value !== undefined) supabase.from('exploration_nodes').update({ notes: value }).eq('id', id).then()
+      })
+    }
+  }, [])
 
   const handleToggleTried = async (nodeId) => {
     const next = !triedMap[nodeId]
@@ -3138,13 +3233,33 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
       }
       // Prefer tweaked name; fall back to original so the card can still be found
       autoExpandRecipeName = tweakedResult?.recipe_name || originalName || null
-      restoreRecipeNodeId = recipeAncestor?.id ?? null
+      // The tweak node is its own identity going forward — Tried/notes/further tweaks
+      // must attach to it, not to the ancestor recipe node it happened to spring from.
+      restoreRecipeNodeId = node.id
+    }
+
+    // Tag the one suggestion entry that should auto-expand with its resolved node id
+    // directly, so the results screen can pick it out by id instead of by recipe_name —
+    // the last name-based lookup in this path (a tweak that keeps its parent's name would
+    // otherwise be indistinguishable from the parent by name alone).
+    if (restoreRecipeNodeId && autoExpandRecipeName && Array.isArray(suggestions)) {
+      let marked = false
+      suggestions = suggestions.map(r => {
+        if (!marked && r.recipe_name === autoExpandRecipeName) {
+          marked = true
+          return { ...r, __autoExpandNodeId: restoreRecipeNodeId }
+        }
+        return r
+      })
     }
 
     const result = isIngredients ? null : { incompatible: false, incompatibility_reason: null, flavor_profile_note: null, pairs_well_with: null, suggestions }
 
-    // Build a map of recipe_name → { nodeId, tried, notes } from existing recipe nodes.
-    // This hydrates RecipeCards on restore and prevents duplicate node inserts.
+    // Build a map of recipe_name → { nodeId, tried, notes } from SIBLING recipe nodes only
+    // (children of the recipe_list). This hydrates the non-auto-expanded RecipeCards in the
+    // list and prevents duplicate node inserts. It intentionally excludes the auto-expanded
+    // card below — that one is looked up by node id, never by name, so a tweak that keeps its
+    // parent's recipe_name can never collide with (or be masked by) a sibling entry here.
     const restoreNodeData = {}
     if (restoreRecipeListNodeId) {
       nodes
@@ -3154,12 +3269,12 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
           if (name) restoreNodeData[name] = { nodeId: n.id, tried: triedMap[n.id] ?? !!n.tried, notes: nodeNotes[n.id] ?? n.notes ?? '' }
         })
     }
-    // For tweak restores the auto-expand recipe name may differ from the stored node name,
-    // so always ensure autoExpandRecipeName has an entry pointing to the correct node.
-    if (autoExpandRecipeName && restoreRecipeNodeId && !restoreNodeData[autoExpandRecipeName]) {
-      const autoNode = nodeMap[restoreRecipeNodeId]
-      if (autoNode) restoreNodeData[autoExpandRecipeName] = { nodeId: autoNode.id, tried: triedMap[autoNode.id] ?? !!autoNode.tried, notes: nodeNotes[autoNode.id] ?? autoNode.notes ?? '' }
-    }
+    // Auto-expanded card's tried/notes are resolved directly by node id (never by name) so a
+    // tweak node sharing its parent's recipe_name is structurally impossible to collide with.
+    const autoExpandNode = restoreRecipeNodeId ? nodeMap[restoreRecipeNodeId] : null
+    const autoExpandNodeData = autoExpandNode
+      ? { tried: triedMap[autoExpandNode.id] ?? !!autoExpandNode.tried, notes: nodeNotes[autoExpandNode.id] ?? autoExpandNode.notes ?? '' }
+      : null
 
     return {
       primary_ingredients: selected,
@@ -3174,6 +3289,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
       autoExpandRecipeName,
       restoreRecipeNodeId,
       restoreNodeData,
+      autoExpandNodeData,
     }
   }
 
@@ -3188,6 +3304,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     if (node.node_type === 'recipe_list') return `${(node.payload?.recipes || []).length} recipes generated`
     if (node.node_type === 'recipe') return node.payload?.recipe?.recipe_name || 'Recipe'
     if (node.node_type === 'tweak') {
+      if (node.payload?.tweak_label) return node.payload.tweak_label
       const p = node.payload?.prompt || ''
       return p.length > 60 ? p.slice(0, 60) + '…' : p
     }
@@ -3202,15 +3319,24 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
         {node.payload?.flavor_profile?.length > 0 && <div><b>Flavors:</b> {node.payload.flavor_profile.join(', ')}</div>}
       </div>
     )
-    if (node.node_type === 'recipe_list') return (
+    if (node.node_type === 'recipe_list') {
+      // Read from the actual child 'recipe' nodes (real ids, real tried state) rather than
+      // the list's own payload snapshot, so tried status shown here is never stale.
+      const recipeChildren = (childrenMap[node.id] || []).filter(n => n.node_type === 'recipe')
+      return (
       <div style={{ fontSize: 13, color: C.textMuted }}>
-        {(node.payload?.recipes || []).map((r, i) => (
-          <div key={i} style={{ padding: '4px 0', borderBottom: i < node.payload.recipes.length - 1 ? `1px solid ${C.border}` : 'none' }}>
-            {r.recipe_name}
-          </div>
-        ))}
+        {recipeChildren.map((n, i) => {
+          const isTried = triedMap[n.id] ?? !!n.tried
+          return (
+            <div key={n.id} style={{ padding: '4px 0', borderBottom: i < recipeChildren.length - 1 ? `1px solid ${C.border}` : 'none', display: 'flex', alignItems: 'center', gap: 6 }}>
+              {isTried && <span style={{ color: C.green, fontSize: 12, flexShrink: 0 }}>✓</span>}
+              {n.payload?.recipe?.recipe_name}
+            </div>
+          )
+        })}
       </div>
-    )
+      )
+    }
     if (node.node_type === 'recipe') {
       const r = node.payload?.recipe || {}
       return (
@@ -3258,7 +3384,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
         <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 6 }}>Tasting Notes</div>
         <textarea
           value={nodeNotes[node.id] ?? node.notes ?? ''}
-          onChange={e => setNodeNotes(prev => ({ ...prev, [node.id]: e.target.value }))}
+          onChange={e => { setNodeNotes(prev => ({ ...prev, [node.id]: e.target.value })); dirtyNoteIdsRef.current.add(node.id) }}
           onBlur={e => handleSaveNotes(node.id, e.target.value)}
           placeholder="Add your tasting notes…"
           rows={3}
@@ -3292,6 +3418,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     const isExpanded = expandedIds.has(node.id)
     const isRoot = !node.parent_node_id
     const children = childrenMap[node.id] || []
+    const isTried = (node.node_type === 'recipe' || node.node_type === 'tweak') && (triedMap[node.id] ?? !!node.tried)
 
     return (
       <div key={node.id}>
@@ -3302,6 +3429,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
               <span style={{ fontSize: 10, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: '2px 7px', color: C.textFaint, fontWeight: 700, letterSpacing: '0.05em', textTransform: 'uppercase', flexShrink: 0 }}>
                 {NODE_LABELS[node.node_type] || node.node_type}
               </span>
+              {isTried && <span style={{ color: C.green, fontSize: 12, flexShrink: 0 }}>✓</span>}
               <span style={{ fontSize: 13, color: C.text, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{nodeSummary(node)}</span>
               <span style={{ color: C.textFaint, fontSize: 11, flexShrink: 0 }}>{isExpanded ? '▲' : '▼'}</span>
             </div>
