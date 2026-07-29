@@ -4,7 +4,6 @@
 //   user_id uuid references auth.users not null,
 //   search_key text not null,
 //   primary_ingredients text[] not null default '{}',
-//   cocktail_style text not null,
 //   flavor_profile text[] not null default '{}',
 //   low_abv boolean not null default false,
 //   result jsonb not null,
@@ -13,6 +12,12 @@
 // );
 // alter table explorations_history enable row level security;
 // create policy "Users own their explorations history" on explorations_history for all using (auth.uid() = user_id);
+//
+// Template picker reset (Pass 1 of 2): style is retired as a user-facing concept —
+// technique is now an output of the chosen template, not an input. Run against the
+// existing explorations_history table:
+// alter table explorations_history drop column if exists cocktail_style;
+// alter table explorations_history add column if not exists template text;
 //
 // alter table favorites add column if not exists source text default 'manual';
 // alter table favorites add column if not exists origin_flag text;
@@ -402,19 +407,18 @@ async function analyzeBarMenu(menuFile, cocktailName, inventoryText, cocktailPho
   return { data: await callClaude(body), body }
 }
 
-async function analyzeExplorationsRecipes(ingredients, style, flavors, lowABV, inventoryText) {
+async function analyzeExplorationsRecipes(ingredients, flavors, lowABV, inventoryText) {
   const body = {
     model: MODEL,
     max_tokens: 3000,
     tools: [{ type: 'web_search_20250305', name: 'web_search' }],
     messages: [{
       role: 'user',
-      content: `You are an expert craft bartender. Search the web for PUBLISHED cocktail recipes featuring the featured ingredients that match the selected style and flavor profile. Return ONLY real recipes found from published sources — do NOT invent original cocktails. Set origin_flag: "from_recipe" for ALL suggestions.
+      content: `You are an expert craft bartender. Search the web for PUBLISHED cocktail recipes featuring the featured ingredients that match the flavor profile. Return ONLY real recipes found from published sources — do NOT invent original cocktails. Set origin_flag: "from_recipe" for ALL suggestions.
 
 Today's date is ${TODAY}.
 
 FEATURED INGREDIENTS: ${ingredients.join(' and ')}
-COCKTAIL STYLE: ${style}
 FLAVOR PREFERENCES: ${flavors.length > 0 ? flavors.join(', ') : 'No specific preference'}
 LOW ALCOHOL: ${lowABV ? 'Yes — prioritize lower ABV options' : 'No preference'}
 
@@ -485,7 +489,7 @@ Return ONLY valid JSON with no markdown fences:
   }
 }
 
-async function analyzeExplorationsOriginals(ingredients, style, flavors, lowABV, inventoryText) {
+async function analyzeExplorationsOriginals(ingredients, flavors, lowABV, inventoryText) {
   const body = {
     model: MODEL,
     max_tokens: 3000,
@@ -498,7 +502,6 @@ The primary ingredient(s) for this exploration are: ${ingredients.join(', ')}. U
 Today's date is ${TODAY}.
 
 FEATURED INGREDIENTS: ${ingredients.join(' and ')}
-COCKTAIL STYLE: ${style}
 FLAVOR PREFERENCES: ${flavors.length > 0 ? flavors.join(', ') : 'No specific preference'}
 LOW ALCOHOL: ${lowABV ? 'Yes — prioritize lower ABV options' : 'No preference'}
 
@@ -568,7 +571,7 @@ Return ONLY valid JSON with no markdown fences:
   }
 }
 
-async function analyzeExplorations(ingredients, style, flavors, lowABV, inventoryText) {
+async function analyzeExplorations(ingredients, flavors, lowABV, inventoryText) {
   const slimInventoryText = inventoryText.split('\n').map((line, i) => {
     if (i === 0) return 'Spirit | Category | Status | Notes'
     const parts = line.split(' | ')
@@ -577,8 +580,8 @@ async function analyzeExplorations(ingredients, style, flavors, lowABV, inventor
   }).join('\n')
 
   const [recipesSettled, originalsSettled] = await Promise.allSettled([
-    analyzeExplorationsRecipes(ingredients, style, flavors, lowABV, inventoryText),
-    analyzeExplorationsOriginals(ingredients, style, flavors, lowABV, slimInventoryText),
+    analyzeExplorationsRecipes(ingredients, flavors, lowABV, inventoryText),
+    analyzeExplorationsOriginals(ingredients, flavors, lowABV, slimInventoryText),
   ])
 
   console.log('Web call result:', recipesSettled.status, recipesSettled.reason || 'ok')
@@ -623,7 +626,7 @@ async function analyzeExplorations(ingredients, style, flavors, lowABV, inventor
   }
 }
 
-async function refineExplorations(ingredients, style, flavors, lowABV, inventoryText, previousNames, feedbackText) {
+async function refineExplorations(ingredients, flavors, lowABV, inventoryText, previousNames, feedbackText) {
   const body = {
     model: MODEL,
     max_tokens: 6000,
@@ -634,7 +637,6 @@ async function refineExplorations(ingredients, style, flavors, lowABV, inventory
 Today's date is ${TODAY}.
 
 FEATURED INGREDIENTS: ${ingredients.join(' and ')}
-COCKTAIL STYLE: ${style}
 FLAVOR PREFERENCES: ${flavors.length > 0 ? flavors.join(', ') : 'No specific preference'}
 LOW ALCOHOL: ${lowABV ? 'Yes — prioritize lower ABV options' : 'No preference'}
 
@@ -1662,14 +1664,8 @@ function IngredientSearch({ inventory, selected, onSelect, onRemove }) {
 const EXPLORATION_LS_KEY = 'bar-cart-explorations-history'
 const EXPLORATION_HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
 
-const EXPLORATION_STYLE_EMOJI = {
-  'Stirred': '🥃', 'On the Rocks': '🧊', 'Shaken / Sours': '🍋',
-  'Highball': '🫧', 'Tiki / Swizzle': '🌺', 'Warm Drink': '☕',
-  'Spirit Forward / Dry': '🥃', 'Earthy / Smoky': '🍂',
-}
-
-function makeExplorationKey(ingredients, style, flavors, lowABV) {
-  return [[...ingredients].sort().join(','), style, [...flavors].sort().join(','), String(lowABV)].join('|')
+function makeExplorationKey(ingredients, flavors, lowABV) {
+  return [[...ingredients].sort().join(','), [...flavors].sort().join(','), String(lowABV)].join('|')
 }
 
 function relativeTime(iso) {
@@ -2233,7 +2229,6 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   const [step, setStep] = useState('ingredients')
   const [navStack, setNavStack] = useState([])
   const [selected, setSelected] = useState([])
-  const [style, setStyle] = useState(null)
   const [flavors, setFlavors] = useState([])
   const [lowABV, setLowABV] = useState(false)
   const [result, setResult] = useState(null)
@@ -2270,7 +2265,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
         await supabase.from('explorations_history').delete().eq('user_id', user.id).lt('updated_at', cutoff)
         const { data } = await supabase
           .from('explorations_history')
-          .select('search_key,primary_ingredients,cocktail_style,flavor_profile,low_abv,result,updated_at')
+          .select('search_key,primary_ingredients,flavor_profile,low_abv,result,updated_at')
           .eq('user_id', user.id)
           .order('updated_at', { ascending: false })
           .limit(20)
@@ -2287,7 +2282,6 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   useEffect(() => {
     if (!pendingRestore) return
     setSelected(pendingRestore.primary_ingredients || [])
-    setStyle(pendingRestore.cocktail_style || null)
     setFlavors(pendingRestore.flavor_profile || [])
     setLowABV(pendingRestore.low_abv || false)
     setResult(pendingRestore.result || null)
@@ -2321,11 +2315,10 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     return () => clearInterval(id)
   }, [step])
 
-  const upsertHistory = (ingredients, searchStyle, searchFlavors, searchLowABV, searchResult) => {
+  const upsertHistory = (ingredients, searchFlavors, searchLowABV, searchResult) => {
     const entry = {
-      search_key: makeExplorationKey(ingredients, searchStyle, searchFlavors, searchLowABV),
+      search_key: makeExplorationKey(ingredients, searchFlavors, searchLowABV),
       primary_ingredients: [...ingredients].sort(),
-      cocktail_style: searchStyle,
       flavor_profile: [...searchFlavors].sort(),
       low_abv: searchLowABV,
       result: searchResult,
@@ -2358,7 +2351,6 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
 
   const restoreFromHistory = (entry) => {
     setSelected(entry.primary_ingredients)
-    setStyle(entry.cocktail_style)
     setFlavors(entry.flavor_profile)
     setLowABV(entry.low_abv)
     setResult(entry.result)
@@ -2370,11 +2362,6 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     goToStep('results')
   }
 
-  const STYLES = [
-    { id: 'Stirred', emoji: '🥃' }, { id: 'On the Rocks', emoji: '🧊' },
-    { id: 'Shaken / Sours', emoji: '🍋' }, { id: 'Highball', emoji: '🫧' },
-    { id: 'Tiki / Swizzle', emoji: '🌺' }, { id: 'Warm Drink', emoji: '☕' },
-  ]
   const FLAVORS = [
     { id: 'Bright & Citrusy', emoji: '🍋' }, { id: 'Bitter / Herbal', emoji: '🌿' },
     { id: 'Spirit Forward / Dry', emoji: '🥃' }, { id: 'Earthy / Smoky', emoji: '🍂' },
@@ -2406,20 +2393,19 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
-  const handleExplore = async (styleOverride, fromCombination = false) => {
-    const activeStyle = styleOverride !== undefined ? styleOverride : style
+  const handleExplore = async () => {
     setNavStack(prev => [...prev, stepRef.current])
     setStep('loading')
     setPartialSource(null)
     setRestoreNodeData({})
     setAutoExpandNodeData(null)
     try {
-      const { result: data, partialSource: ps } = await analyzeExplorations(selected, activeStyle, flavors, lowABV, inventoryText)
+      const { result: data, partialSource: ps } = await analyzeExplorations(selected, flavors, lowABV, inventoryText)
       setResult(data)
       setPartialSource(ps)
       setStep('results')
       if (!data.incompatible) {
-        upsertHistory(selected, activeStyle, flavors, lowABV, data)
+        upsertHistory(selected, flavors, lowABV, data)
         if (user) {
           try {
             const now = new Date().toISOString()
@@ -2436,7 +2422,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
               if (wbId) {
                 const { data: ingNode } = await supabase
                   .from('exploration_nodes')
-                  .insert({ whiteboard_id: wbId, parent_node_id: null, node_type: 'ingredients', payload: { selected: selected.map(s => String(s)), style: fromCombination ? 'recommended' : 'overridden', cocktail_style: activeStyle != null ? String(activeStyle) : null, flavor_profile: flavors.map(f => String(f)), low_abv: Boolean(lowABV) } })
+                  .insert({ whiteboard_id: wbId, parent_node_id: null, node_type: 'ingredients', payload: { selected: selected.map(s => String(s)), flavor_profile: flavors.map(f => String(f)), low_abv: Boolean(lowABV) } })
                   .select('id').single()
                 recipeListParentId = ingNode?.id ?? null
               }
@@ -2483,7 +2469,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
-  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setStyle(null); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2491,13 +2477,13 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setFeedbackError(null)
     try {
       const previousNames = (result?.suggestions || []).map(s => s.recipe_name)
-      const data = await refineExplorations(selected, style, flavors, lowABV, inventoryText, previousNames, feedback.trim())
+      const data = await refineExplorations(selected, flavors, lowABV, inventoryText, previousNames, feedback.trim())
       setResult(data)
       setFeedback('')
       setFeedbackBanner(true)
       setTimeout(() => feedbackBannerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50)
       setTimeout(() => setFeedbackBanner(false), 4000)
-      upsertHistory(selected, style, flavors, lowABV, data)
+      upsertHistory(selected, flavors, lowABV, data)
     } catch (err) {
       setFeedbackError(err.message || 'Something went wrong. Please try again.')
     } finally {
@@ -2579,8 +2565,6 @@ ${affinityContext}
 Based on these ingredients and their affinity profiles, provide a combination analysis in this exact JSON format:
 {
   "combined_profile": "2-3 sentences describing the combined flavor profile of these ingredients together — what character the drink will have, what mood or occasion it suits",
-  "suggested_style": "one of: Stirred, On the Rocks, Shaken / Sours, Highball, Tiki / Swizzle, Warm Drink, Spirit Forward / Dry, Earthy / Smoky",
-  "style_reason": "one concise sentence explaining why this style fits this combination",
   "additional_suggestions": [
     { "name": "ingredient name", "reason": "one brief sentence why it would work" }
   ]
@@ -2588,7 +2572,6 @@ Based on these ingredients and their affinity profiles, provide a combination an
 
 Rules:
 - additional_suggestions should contain 1-2 items max — non-alcoholic modifiers, citrus, herbs, syrups, or specific spirits that would meaningfully complete this combination. Do NOT suggest ingredients already selected.
-- suggested_style must be EXACTLY one of the 8 style strings listed above, no variations.
 - Return ONLY valid JSON, no other text.`
 
       const parsed = await callClaude({
@@ -2790,13 +2773,6 @@ Rules:
   }
 
   if (step === 'combination') {
-    const COMBO_STYLES = [
-      { id: 'Stirred', emoji: '🥃' }, { id: 'On the Rocks', emoji: '🧊' },
-      { id: 'Shaken / Sours', emoji: '🍋' }, { id: 'Highball', emoji: '🫧' },
-      { id: 'Tiki / Swizzle', emoji: '🌺' }, { id: 'Warm Drink', emoji: '☕' },
-      { id: 'Spirit Forward / Dry', emoji: '🥃' }, { id: 'Earthy / Smoky', emoji: '🍂' },
-    ]
-
     return (
       <div>
         <button onClick={() => { setCombinationData(null); setCombinationError(null); goBack() }} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
@@ -2819,26 +2795,6 @@ Rules:
             <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Combined Profile</div>
             <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 20 }}>
               <div style={{ fontSize: 14, color: C.textMuted, lineHeight: 1.55 }}>{combinationData.combined_profile}</div>
-            </div>
-
-            <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Suggested Style</div>
-            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 8 }}>
-              <div style={{ fontSize: 15, fontWeight: 700, color: C.gold, marginBottom: 4 }}>
-                {EXPLORATION_STYLE_EMOJI[combinationData.suggested_style] || '✨'} {combinationData.suggested_style}
-              </div>
-              <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5 }}>{combinationData.style_reason}</div>
-            </div>
-
-            <div style={{ fontSize: 12, color: C.textFaint, marginBottom: 16, paddingLeft: 2 }}>Not the right vibe? Pick another:</div>
-            <div style={{ display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 4, marginBottom: 20 }}>
-              {COMBO_STYLES.filter(s => s.id !== combinationData.suggested_style).map(s => (
-                <button
-                  key={s.id}
-                  onClick={() => setCombinationData(prev => ({ ...prev, suggested_style: s.id, style_reason: 'Manually selected.' }))}
-                  style={{ flexShrink: 0, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 13, fontWeight: 500, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap' }}>
-                  {s.emoji} {s.id}
-                </button>
-              ))}
             </div>
 
             {combinationData.additional_suggestions?.length > 0 && (
@@ -2864,7 +2820,7 @@ Rules:
         ) : null}
 
         <button
-          onClick={() => !combinationLoading && handleExplore(combinationData?.suggested_style, true)}
+          onClick={() => !combinationLoading && handleExplore()}
           disabled={combinationLoading}
           style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: combinationLoading ? 'default' : 'pointer', marginTop: 8, opacity: combinationLoading ? 0.5 : 1, transition: 'opacity 0.2s' }}>
           Build Recipes →
@@ -2876,20 +2832,8 @@ Rules:
   if (step === 'prefs') return (
     <div>
       <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
-      <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Style & Preferences</div>
+      <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Preferences</div>
       <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 24 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
-
-      <div style={{ marginBottom: 24 }}>
-        <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 12 }}>Cocktail Style</div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-          {STYLES.map(s => (
-            <button key={s.id} onClick={() => setStyle(s.id)}
-              style={{ background: style === s.id ? C.gold + '22' : C.surface, border: `1px solid ${style === s.id ? C.gold + '66' : C.border}`, borderRadius: 10, color: style === s.id ? C.gold : C.text, fontSize: 14, fontWeight: style === s.id ? 600 : 400, padding: '12px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 8, transition: 'background 0.15s, color 0.15s' }}>
-              <span>{s.emoji}</span><span>{s.id}</span>
-            </button>
-          ))}
-        </div>
-      </div>
 
       <div style={{ marginBottom: 24 }}>
         <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 4 }}>Flavor Profile</div>
@@ -2915,8 +2859,8 @@ Rules:
         </div>
       </label>
 
-      <button onClick={() => handleExplore()} disabled={!style}
-        style={{ width: '100%', background: style ? C.gold : C.surface, border: `1px solid ${style ? C.gold : C.border}`, borderRadius: 10, color: style ? '#0f0f0f' : C.textFaint, fontWeight: 700, fontSize: 15, padding: '13px', cursor: style ? 'pointer' : 'default', transition: 'background 0.15s, color 0.15s' }}>
+      <button onClick={() => handleExplore()}
+        style={{ width: '100%', background: C.gold, border: `1px solid ${C.gold}`, borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: 'pointer', transition: 'background 0.15s, color 0.15s' }}>
         ✨ Explore
       </button>
     </div>
@@ -3204,7 +3148,6 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     const recipeListNode = selfAndAncestors.find(n => n.node_type === 'recipe_list')
 
     const selected = ingredientsNode?.payload?.selected || []
-    const cocktailStyle = ingredientsNode?.payload?.cocktail_style || null
     const flavorProfile = ingredientsNode?.payload?.flavor_profile || []
     const lowABV = ingredientsNode?.payload?.low_abv || false
 
@@ -3278,7 +3221,6 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
 
     return {
       primary_ingredients: selected,
-      cocktail_style: cocktailStyle,
       flavor_profile: flavorProfile,
       low_abv: lowABV,
       result,
@@ -3297,9 +3239,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
 
   const nodeSummary = (node) => {
     if (node.node_type === 'ingredients') {
-      const parts = [node.payload?.selected?.join(', ')]
-      if (node.payload?.cocktail_style) parts.push(node.payload.cocktail_style)
-      return parts.filter(Boolean).join(' · ')
+      return node.payload?.selected?.join(', ') || ''
     }
     if (node.node_type === 'recipe_list') return `${(node.payload?.recipes || []).length} recipes generated`
     if (node.node_type === 'recipe') return node.payload?.recipe?.recipe_name || 'Recipe'
@@ -3315,7 +3255,6 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     if (node.node_type === 'ingredients') return (
       <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.6 }}>
         <div><b>Ingredients:</b> {node.payload?.selected?.join(', ')}</div>
-        {node.payload?.cocktail_style && <div><b>Style:</b> {node.payload.cocktail_style}</div>}
         {node.payload?.flavor_profile?.length > 0 && <div><b>Flavors:</b> {node.payload.flavor_profile.join(', ')}</div>}
       </div>
     )
