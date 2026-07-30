@@ -4,7 +4,6 @@
 //   user_id uuid references auth.users not null,
 //   search_key text not null,
 //   primary_ingredients text[] not null default '{}',
-//   flavor_profile text[] not null default '{}',
 //   low_abv boolean not null default false,
 //   result jsonb not null,
 //   updated_at timestamptz default now(),
@@ -18,6 +17,14 @@
 // existing explorations_history table:
 // alter table explorations_history drop column if exists cocktail_style;
 // alter table explorations_history add column if not exists template text;
+//
+// Template picker (Pass 2): Flavor Profile is retired as a user input — flavor is now
+// an output the generator describes in each suggestion's summary, not a constraint the
+// user picks. Frozen/NA join Low-ABV as the three modifier chips. Run against the
+// existing explorations_history table:
+// alter table explorations_history drop column if exists flavor_profile;
+// alter table explorations_history add column if not exists frozen boolean default false;
+// alter table explorations_history add column if not exists na boolean default false;
 //
 // alter table favorites add column if not exists source text default 'manual';
 // alter table favorites add column if not exists origin_flag text;
@@ -117,6 +124,69 @@ const C = {
   text: '#f0ede8',
   textMuted: '#888',
   textFaint: '#555',
+}
+
+// ─── Cocktail Templates ─────────────────────────────────────────────────────
+// Fixed display order — do not sort dynamically. Groups structurally similar
+// templates adjacently (stirred spirit-forward → shaken citrus → lengthened →
+// specialized tail) so the order becomes learnable over repeated use.
+
+const TEMPLATES = [
+  { id: 'old_fashioned', name: 'Old Fashioned', emoji: '🥃', subtitle: 'like an Old Fashioned',
+    formula: 'usually 2 oz spirit : 0.25 oz rich syrup : bitters',
+    mechanic: 'Stirred. Softens spirit heat without masking core spirit identity.',
+    examples: ['Sazerac', "Ti' Punch", 'Monte Carlo', 'Oaxaca Old Fashioned'], frozenEligible: false },
+  { id: 'manhattan_martini', name: 'Manhattan / Martini', emoji: '🍸', subtitle: 'like a Manhattan',
+    formula: 'usually 2 oz spirit : 1 oz fortified wine : bitters',
+    mechanic: 'Stirred. Silky, spirit-driven texture using vermouth/fortified wine as the sweetener.',
+    examples: ['Dry Martini', 'Martinez', 'Rob Roy', 'Bamboo', 'Adonis'], frozenEligible: false },
+  { id: 'sour', name: 'Sour', emoji: '🍋', subtitle: 'like a Daiquiri',
+    formula: 'usually 2 oz spirit : 0.75 oz acid : 0.75 oz simple syrup — equal-parts variants swap the syrup for a second liqueur',
+    mechanic: 'Shaken. Aerated citrus and sugar balance.',
+    examples: ['Whiskey Sour', 'Gimlet', "Bee's Knees", 'Gold Rush', 'Last Word', 'Paper Plane', 'Naked & Famous', 'Division Bell', 'Final Ward'], frozenEligible: true },
+  { id: 'daisy', name: 'Daisy', emoji: '🌼', subtitle: 'like a Margarita',
+    formula: 'usually 2 oz spirit : 0.75 oz acid : 0.75 oz liqueur',
+    mechanic: 'Shaken. Fruit or botanical liqueur replaces simple syrup, contributing both sweetness and modifier flavor.',
+    examples: ['Sidecar', 'Cosmopolitan', 'White Lady', 'Aviation'], frozenEligible: true },
+  { id: 'highball', name: 'Highball', emoji: '🫧', subtitle: 'like a Tom Collins',
+    formula: 'usually 1.5–2 oz spirit : 0.75 oz acid : 0.75 oz sweet : soda',
+    mechanic: 'Built over ice. Lengthens sours or spirits with refreshing carbonation.',
+    examples: ['Paloma', 'Moscow Mule', "Dark 'n Stormy", 'Gin & Tonic', 'Mojito'], frozenEligible: false },
+  { id: 'tiki', name: 'Tiki', emoji: '🌺', subtitle: 'like a Mai Tai',
+    formula: 'usually 2 oz split rum : 0.75 oz lime : 0.75 oz layered syrups/liqueurs',
+    mechanic: 'Flash-blended or swizzled. Multi-spirit layering with complex spice syrups and heavy ice dilution.',
+    examples: ['Zombie', 'Navy Grog', 'Painkiller', 'Saturn', 'Jet Pilot'], frozenEligible: true },
+  { id: 'bittersweet', name: 'Bittersweet', emoji: '🧡', subtitle: 'like a Negroni',
+    formula: 'usually 1 oz spirit : 1 oz bittersweet aperitivo : 1 oz sweet vermouth',
+    mechanic: 'Stirred. High liqueur sugar content balances intense bitterness without citrus acid.',
+    examples: ['Boulevardier', 'Kingston Negroni', 'Old Pal', 'Lucien Gaudin'], frozenEligible: false },
+  { id: 'spritz', name: 'Spritz', emoji: '🥂', subtitle: 'like an Aperol Spritz',
+    formula: 'usually 3 oz prosecco : 2 oz aperitivo : 1 oz soda water',
+    mechanic: 'Built. Low-ABV effervescence; wine acidity replaces fresh citrus juice.',
+    examples: ['Venetian Spritz', 'Hugo Spritz', 'St-Germain Spritz', 'Bicicletta'], frozenEligible: false },
+  { id: 'hot_drinks', name: 'Hot Drinks', emoji: '☕', subtitle: 'like a Hot Toddy',
+    formula: 'usually 2 oz spirit : 0.5–0.75 oz sweet : 3–4 oz hot diluent + acid',
+    mechanic: 'Built hot. Heat enhances aromatic volatiles while hot liquid provides controlled dilution.',
+    examples: ['Irish Coffee', 'Hot Buttered Rum', 'Mulled Wine'], frozenEligible: false },
+  { id: 'flip', name: 'Flip', emoji: '🥚', subtitle: 'like a Brandy Flip',
+    formula: 'usually 2 oz spirit/wine : 0.5–0.75 oz syrup : 1 whole egg',
+    mechanic: 'Dry shaken. Emulsified egg fat and protein yield a rich dessert finish with zero citrus.',
+    examples: ['Sherry Flip', 'Port Flip', 'Rum Flip'], frozenEligible: false },
+]
+const TEMPLATE_MAP = Object.fromEntries(TEMPLATES.map(t => [t.id, t]))
+
+const NA_KEYWORDS = ['cucumber', 'mint', 'grapefruit', 'ginger', 'lemongrass', 'lime', 'lemon', 'juice', 'soda', 'tonic', 'syrup', 'tea']
+function isLikelyNonAlcoholic(name, inventory) {
+  const norm = name.trim().toLowerCase()
+  const item = (inventory || []).find(i => i.spirit.trim().toLowerCase() === norm)
+  if (item?.category) {
+    const cat = item.category.toLowerCase()
+    // Any other matched inventory category (spirit/liqueur/vermouth/amaro) is alcoholic.
+    return cat.includes('syrup') || cat.includes('juice') || cat.includes('soda') || cat.includes('bitters') || cat.includes('garnish')
+  }
+  // Free-text, unmatched — default to hiding NA (i.e. assume alcoholic) unless clearly NA.
+  // Never silently propose deleting an ingredient the user just chose as the exploration's premise.
+  return NA_KEYWORDS.some(k => norm.includes(k))
 }
 
 // ─── CSV Parser ───────────────────────────────────────────────────────────────
@@ -407,20 +477,35 @@ async function analyzeBarMenu(menuFile, cocktailName, inventoryText, cocktailPho
   return { data: await callClaude(body), body }
 }
 
-async function analyzeExplorationsRecipes(ingredients, flavors, lowABV, inventoryText) {
+function buildTemplateContext(templateId, modifiers) {
+  const t = TEMPLATE_MAP[templateId]
+  let block = `CHOSEN TEMPLATE: ${t.name}
+Usual formula: ${t.formula}
+Mechanic: ${t.mechanic}
+Classic examples: ${t.examples.join(', ')}
+
+Muddling is a construction step, not a template — if a classic muddled drink structurally belongs to this template (e.g. Mojito→Highball, Whiskey Smash→Sour, Mint Julep→Old Fashioned), treat it normally within the template; never invent a separate "muddled" category.
+A split base (two complementary spirits) is a valid output when the inventory and template support it (e.g. Oaxaca Old Fashioned, Mai Tai) — never present it as something the user chose.`
+  if (modifiers.frozen) block += `\n\nFROZEN: blend with crushed ice for a frozen/slushy texture appropriate to this template.`
+  if (modifiers.lowABV) block += `\n\nLOW ABV: reduce the spirit's proportion relative to the usual formula rather than eliminating it — the spirit should still be present, just lighter. A sherry-and-bitters Old Fashioned is a real drink, not a degraded one.`
+  if (modifiers.na) block += `\n\nNON-ALCOHOLIC: without ethanol there is no solvent for aromatics, no viscosity, no burn — build structure from strong tea, verjus, saline, bitter tinctures, and NA spirits rather than simply deleting the spirit. This is genuinely hard on spirit-forward templates (Old Fashioned, Manhattan/Martini, Bittersweet, Flip) — do not produce a result that reads as an apology for missing alcohol.`
+  return block
+}
+
+async function analyzeExplorationsRecipes(ingredients, template, modifiers, inventoryText) {
   const body = {
     model: MODEL,
     max_tokens: 3000,
     tools: [{ type: 'web_search_20250305', name: 'web_search' }],
     messages: [{
       role: 'user',
-      content: `You are an expert craft bartender. Search the web for PUBLISHED cocktail recipes featuring the featured ingredients that match the flavor profile. Return ONLY real recipes found from published sources — do NOT invent original cocktails. Set origin_flag: "from_recipe" for ALL suggestions.
+      content: `You are an expert craft bartender. Search the web for PUBLISHED cocktail recipes featuring the featured ingredients, within the family of the chosen template below. Return ONLY real recipes found from published sources — do NOT invent original cocktails. Set origin_flag: "from_recipe" for ALL suggestions.
 
 Today's date is ${TODAY}.
 
 FEATURED INGREDIENTS: ${ingredients.join(' and ')}
-FLAVOR PREFERENCES: ${flavors.length > 0 ? flavors.join(', ') : 'No specific preference'}
-LOW ALCOHOL: ${lowABV ? 'Yes — prioritize lower ABV options' : 'No preference'}
+
+${buildTemplateContext(template, modifiers)}
 
 BAR INVENTORY:
 ${inventoryText}
@@ -429,13 +514,15 @@ SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated
 
 First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
-Otherwise use web search to find 2–3 published cocktail recipes. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
+Otherwise use web search to find 2–3 published cocktail recipes within this template's family — prioritize the template's own named classics and close variants. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
 
 CRITICAL: Every recipe suggestion MUST include ALL featured ingredients (${ingredients.join(', ')}). Do NOT suggest recipes that omit any featured ingredient — even if fewer results are available as a result.
 
 If you cannot find 2–3 published recipes that include ALL featured ingredients, return as many as you can find (even 0 or 1). If no qualifying published recipes exist, return an empty suggestions array and set "no_recipes_found": true. Do NOT invent original recipes in this call — that is handled separately.
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+
+Separately, check whether these exact featured ingredients are also the basis of a different well-known published drink that belongs to a DIFFERENT template than the one chosen above. Only populate cross_template_suggestion if there's a genuine, well-known match — otherwise leave it null. Do not force one.
 
 Return ONLY valid JSON with no markdown fences:
 {
@@ -444,6 +531,7 @@ Return ONLY valid JSON with no markdown fences:
   "no_recipes_found": false,
   "flavor_profile_note": "1-2 sentences on why these ingredients work together",
   "pairs_well_with": "2-3 strongest flavor affinities only — one short sentence, not an exhaustive list",
+  "cross_template_suggestion": { "template": "one of: old_fashioned, manhattan_martini, sour, daisy, highball, tiki, bittersweet, spritz, hot_drinks, flip", "drink_name": "string", "reason": "one concise sentence" },
   "suggestions": [
     {
       "recipe_name": "string",
@@ -452,7 +540,7 @@ Return ONLY valid JSON with no markdown fences:
       "difficulty_note": "One sentence explaining difficulty",
       "can_make_now": true,
       "missing_ingredients": [],
-      "summary": "1-2 sentence description",
+      "summary": "1-2 sentence description including a flavor characterization",
       "recipe": [{ "ingredient": "string", "amount": "string" }],
       "instructions": "string",
       "glass_type": "coupe | rocks | tiki | collins | null",
@@ -469,7 +557,8 @@ Return ONLY valid JSON with no markdown fences:
       "technique_notes": "string or null"
     }
   ]
-}`,
+}
+cross_template_suggestion must be null (not omitted) when there is no genuine match.`,
     }],
   }
   const firstText = await callClaudeText(body)
@@ -489,21 +578,21 @@ Return ONLY valid JSON with no markdown fences:
   }
 }
 
-async function analyzeExplorationsOriginals(ingredients, flavors, lowABV, inventoryText) {
+async function analyzeExplorationsOriginals(ingredients, template, modifiers, inventoryText) {
   const body = {
     model: MODEL,
     max_tokens: 3000,
     messages: [{
       role: 'user',
-      content: `You are an expert craft bartender inventing ORIGINAL creative cocktails. Do NOT look up or reference published recipes — these should be entirely your own creative inventions. Set origin_flag: "original" for ALL suggestions. Think like a creative craft bartender — suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate.
+      content: `You are an expert craft bartender building cocktails within a chosen template. Do NOT look up or reference published recipes — these should be your own creative work. Set origin_flag: "original" for ALL suggestions.
 
 The primary ingredient(s) for this exploration are: ${ingredients.join(', ')}. Use these exact names when referencing them in your response.
 
 Today's date is ${TODAY}.
 
 FEATURED INGREDIENTS: ${ingredients.join(' and ')}
-FLAVOR PREFERENCES: ${flavors.length > 0 ? flavors.join(', ') : 'No specific preference'}
-LOW ALCOHOL: ${lowABV ? 'Yes — prioritize lower ABV options' : 'No preference'}
+
+${buildTemplateContext(template, modifiers)}
 
 BAR INVENTORY:
 ${inventoryText}
@@ -512,13 +601,16 @@ SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated
 
 First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
-Otherwise invent 2–3 original cocktails that showcase the featured ingredients. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
+Otherwise invent 2–3 cocktails that showcase the featured ingredients using this priority order:
+1. DEFAULT — template + substitution: take the template's usual formula above and substitute the featured ingredients (and available bar inventory) into its ratio slots. This is how most real cocktails are made and should be your primary approach for every suggestion.
+2. LAST RESORT — fully original invention: only when no reasonable substitution into the template's formula exists, invent an original drink that still honors the template's mechanic (stirred/shaken/built/etc.) and general spirit-forward-vs-lengthened character. Do not reach for this by default — it should be rare.
+For either path, suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate, and check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
 
-CRITICAL: Every original cocktail MUST feature ALL of the featured ingredients (${ingredients.join(', ')}). Do not omit any featured ingredient from any suggestion.
+CRITICAL: Every cocktail MUST feature ALL of the featured ingredients (${ingredients.join(', ')}). Do not omit any featured ingredient from any suggestion.
 
 Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false (something worth buying an ingredient for), unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists.
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
 Return ONLY valid JSON with no markdown fences:
 {
@@ -526,6 +618,7 @@ Return ONLY valid JSON with no markdown fences:
   "incompatibility_reason": null,
   "flavor_profile_note": "1-2 sentences on why these ingredients work together",
   "pairs_well_with": "2-3 strongest flavor affinities only — one short sentence, not an exhaustive list",
+  "cross_template_suggestion": null,
   "suggestions": [
     {
       "recipe_name": "string",
@@ -534,7 +627,7 @@ Return ONLY valid JSON with no markdown fences:
       "difficulty_note": "One sentence explaining difficulty",
       "can_make_now": true,
       "missing_ingredients": [],
-      "summary": "1-2 sentence description",
+      "summary": "1-2 sentence description including a flavor characterization",
       "recipe": [{ "ingredient": "string", "amount": "string" }],
       "instructions": "string",
       "glass_type": "coupe | rocks | tiki | collins | null",
@@ -551,7 +644,8 @@ Return ONLY valid JSON with no markdown fences:
       "technique_notes": "string or null"
     }
   ]
-}`,
+}
+cross_template_suggestion is always null from this call — leave it exactly as shown.`,
     }],
   }
   const firstText = await callClaudeText(body)
@@ -571,7 +665,7 @@ Return ONLY valid JSON with no markdown fences:
   }
 }
 
-async function analyzeExplorations(ingredients, flavors, lowABV, inventoryText) {
+async function analyzeExplorations(ingredients, template, modifiers, inventoryText) {
   const slimInventoryText = inventoryText.split('\n').map((line, i) => {
     if (i === 0) return 'Spirit | Category | Status | Notes'
     const parts = line.split(' | ')
@@ -580,8 +674,8 @@ async function analyzeExplorations(ingredients, flavors, lowABV, inventoryText) 
   }).join('\n')
 
   const [recipesSettled, originalsSettled] = await Promise.allSettled([
-    analyzeExplorationsRecipes(ingredients, flavors, lowABV, inventoryText),
-    analyzeExplorationsOriginals(ingredients, flavors, lowABV, slimInventoryText),
+    analyzeExplorationsRecipes(ingredients, template, modifiers, inventoryText),
+    analyzeExplorationsOriginals(ingredients, template, modifiers, slimInventoryText),
   ])
 
   console.log('Web call result:', recipesSettled.status, recipesSettled.reason || 'ok')
@@ -596,16 +690,25 @@ async function analyzeExplorations(ingredients, flavors, lowABV, inventoryText) 
 
   const partialSource = !recipeData ? 'web' : !originalData ? 'original' : null
   const allSuggestions = [...(recipeData?.suggestions || []), ...(originalData?.suggestions || [])]
-  const primaryData = recipeData || originalData
   const noPublishedRecipes = recipesSettled.status === 'fulfilled' && recipesSettled.value?.no_recipes_found === true
 
   if (allSuggestions.length === 0) {
+    // Only a call that actually completed gets to declare "these don't mix" — a call that
+    // rejected or timed out has no verdict at all, and must not be conflated with a genuine
+    // incompatibility finding from the other call. Without this guard, one failed call plus
+    // a zero-suggestion (but not-incompatible) result from the other renders as a confident
+    // "these don't quite mix" even though nothing about the ingredients was actually checked.
+    const incompatibleData = [recipeData, originalData].find(d => d?.incompatible === true)
+    if (!incompatibleData) {
+      throw new Error('Could not generate suggestions. Please try again.')
+    }
     return {
       result: stripCiteTags({
         incompatible: true,
-        incompatibility_reason: primaryData.incompatibility_reason,
+        incompatibility_reason: incompatibleData.incompatibility_reason,
         flavor_profile_note: null,
         pairs_well_with: null,
+        cross_template_suggestion: null,
         no_recipes_found: noPublishedRecipes,
         suggestions: [],
       }),
@@ -619,6 +722,7 @@ async function analyzeExplorations(ingredients, flavors, lowABV, inventoryText) 
       incompatibility_reason: null,
       flavor_profile_note: recipeData?.flavor_profile_note || originalData?.flavor_profile_note || null,
       pairs_well_with: recipeData?.pairs_well_with || originalData?.pairs_well_with || null,
+      cross_template_suggestion: recipeData?.cross_template_suggestion || originalData?.cross_template_suggestion || null,
       no_recipes_found: noPublishedRecipes,
       suggestions: allSuggestions,
     }),
@@ -626,7 +730,7 @@ async function analyzeExplorations(ingredients, flavors, lowABV, inventoryText) 
   }
 }
 
-async function refineExplorations(ingredients, flavors, lowABV, inventoryText, previousNames, feedbackText) {
+async function refineExplorations(ingredients, template, modifiers, inventoryText, previousNames, feedbackText) {
   const body = {
     model: MODEL,
     max_tokens: 6000,
@@ -637,8 +741,8 @@ async function refineExplorations(ingredients, flavors, lowABV, inventoryText, p
 Today's date is ${TODAY}.
 
 FEATURED INGREDIENTS: ${ingredients.join(' and ')}
-FLAVOR PREFERENCES: ${flavors.length > 0 ? flavors.join(', ') : 'No specific preference'}
-LOW ALCOHOL: ${lowABV ? 'Yes — prioritize lower ABV options' : 'No preference'}
+
+${buildTemplateContext(template, modifiers)}
 
 BAR INVENTORY:
 ${inventoryText}
@@ -651,7 +755,7 @@ The user provided feedback on the previous suggestions: "${feedbackText}". Based
 
 Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false, unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists. Return no more than 4 suggestions total.
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
 Return ONLY valid JSON with no markdown fences:
 {
@@ -667,7 +771,7 @@ Return ONLY valid JSON with no markdown fences:
       "difficulty_note": "One sentence explaining difficulty",
       "can_make_now": true,
       "missing_ingredients": [],
-      "summary": "1-2 sentence description",
+      "summary": "1-2 sentence description including a flavor characterization",
       "recipe": [{ "ingredient": "string", "amount": "string" }],
       "instructions": "string",
       "glass_type": "coupe | rocks | tiki | collins | null",
@@ -706,6 +810,38 @@ Return ONLY valid JSON with no markdown fences:
       throw new Error('Could not generate valid suggestions. Please try again.')
     }
   }
+}
+
+async function resolveTemplate(ingredients, affinityData) {
+  const affinityContext = ingredients.map(ing => {
+    const row = (affinityData || {})[ing.trim().toLowerCase()]
+    if (!row) return `${ing}: no affinity data available`
+    return `${ing}: ${row.flavor_affinities} Spirit affinities: ${row.spirit_tags?.join(', ')}. Flavor affinities: ${row.flavor_tags?.join(', ')}.`
+  }).join('\n\n')
+
+  const templateList = TEMPLATES.map(t => `${t.id} (${t.name} — ${t.formula})`).join('\n')
+
+  const prompt = `You are an expert craft bartender picking the best-fitting cocktail template for a seed ingredient, with no other input from the user.
+
+SEED INGREDIENT(S): ${ingredients.join(', ')}
+
+KNOWN AFFINITY DATA:
+${affinityContext}
+
+AVAILABLE TEMPLATES:
+${templateList}
+
+Pick exactly one template id that best fits these ingredients. Return ONLY valid JSON, no other text: { "template": "one of the ids listed above" }`
+
+  try {
+    const parsed = await callClaude({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: prompt }],
+    })
+    if (parsed?.template && TEMPLATE_MAP[parsed.template]) return parsed.template
+  } catch (_) { /* fall through to default */ }
+  return 'sour'
 }
 
 async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, tastingContext) {
@@ -1035,7 +1171,7 @@ function DifficultyBadge({ difficulty }) {
 // ─── Results ──────────────────────────────────────────────────────────────────
 
 // TODO: unify with shared RecipeCard once the Analyze/Name/Menu flow is in scope (Session 1.5)
-function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, onFeedback, feedbackLoading, inventory }) {
+function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, onFeedback, feedbackLoading, inventory, feedbackError }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
   const adjustmentNoteRef = useRef(null)
@@ -1204,6 +1340,7 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
             {feedbackLoading ? 'Revising…' : 'Something Off? Adjust'}
           </button>
         </div>
+        {feedbackError && <div style={{ fontSize: 13, color: C.red, marginTop: 8 }}>{feedbackError}</div>}
       </div>
     </div>
   )
@@ -1594,6 +1731,7 @@ function SavedScreen({ savedSubTab, setSavedSubTab, toMake, favorites, onRemoveT
 function IngredientSearch({ inventory, selected, onSelect, onRemove }) {
   const [query, setQuery] = useState('')
   const [suggestions, setSuggestions] = useState([])
+  const [showSecondInput, setShowSecondInput] = useState(false)
 
   useEffect(() => {
     if (!query.trim()) { setSuggestions([]); return }
@@ -1621,7 +1759,13 @@ function IngredientSearch({ inventory, selected, onSelect, onRemove }) {
           ))}
         </div>
       )}
-      {selected.length < 2 && (
+      {selected.length === 1 && !showSecondInput && (
+        <button onClick={() => setShowSecondInput(true)}
+          style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 13, cursor: 'pointer', padding: '4px 0', display: 'block' }}>
+          + add a second ingredient
+        </button>
+      )}
+      {(selected.length === 0 || (selected.length === 1 && showSecondInput)) && (
         <>
           <input
             type="text"
@@ -1664,8 +1808,8 @@ function IngredientSearch({ inventory, selected, onSelect, onRemove }) {
 const EXPLORATION_LS_KEY = 'bar-cart-explorations-history'
 const EXPLORATION_HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
 
-function makeExplorationKey(ingredients, flavors, lowABV) {
-  return [[...ingredients].sort().join(','), [...flavors].sort().join(','), String(lowABV)].join('|')
+function makeExplorationKey(ingredients, template, frozen, lowABV, na) {
+  return [[...ingredients].sort().join(','), template, String(frozen), String(lowABV), String(na)].join('|')
 }
 
 function relativeTime(iso) {
@@ -2225,12 +2369,34 @@ const EXPLORE_LOADING_MSGS = [
   'Almost there…',
 ]
 
+function TemplateInfoSheet({ template, onClose }) {
+  const t = TEMPLATE_MAP[template]
+  if (!t) return null
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', zIndex: 900, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }} onClick={onClose}>
+      <div style={{ width: '100%', maxWidth: 600, background: C.bg, borderRadius: '16px 16px 0 0', padding: '20px 20px 36px', maxHeight: '80vh', overflowY: 'auto', boxSizing: 'border-box' }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16 }}>
+          <div style={{ fontSize: 16, fontWeight: 700, color: C.text }}>{t.emoji} {t.name}</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 20, cursor: 'pointer', padding: 0, marginLeft: 'auto', lineHeight: 1 }}>✕</button>
+        </div>
+        <div style={{ fontSize: 14, color: C.gold, marginBottom: 10, lineHeight: 1.5 }}>{t.formula}</div>
+        <div style={{ fontSize: 14, color: C.text, marginBottom: 14, lineHeight: 1.5 }}>{t.mechanic}</div>
+        <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5 }}><b style={{ color: C.textFaint }}>Also:</b> {t.examples.join(', ')}</div>
+      </div>
+    </div>
+  )
+}
+
 function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pendingRestore, onRestoreConsumed, onBackToInProgress, onOpenWhiteboard }) {
   const [step, setStep] = useState('ingredients')
   const [navStack, setNavStack] = useState([])
   const [selected, setSelected] = useState([])
-  const [flavors, setFlavors] = useState([])
+  const [template, setTemplate] = useState(null)
+  const [frozen, setFrozen] = useState(false)
+  const [na, setNa] = useState(false)
   const [lowABV, setLowABV] = useState(false)
+  const [templatePickerLoading, setTemplatePickerLoading] = useState(false)
+  const [infoSheetTemplate, setInfoSheetTemplate] = useState(null)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [feedback, setFeedback] = useState('')
@@ -2241,6 +2407,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   const stepRef = useRef(step)
   const [history, setHistory] = useState([])
   const [partialSource, setPartialSource] = useState(null)
+  const [partialRetryLoading, setPartialRetryLoading] = useState(false)
   const [loadingMsgIdx, setLoadingMsgIdx] = useState(0)
   const [affinityData, setAffinityData] = useState({})
   const [affinityLoading, setAffinityLoading] = useState(false)
@@ -2251,6 +2418,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   const [showIngredientAdder, setShowIngredientAdder] = useState(false)
   const [adderQuery, setAdderQuery] = useState('')
   const [currentWhiteboardId, setCurrentWhiteboardId] = useState(null)
+  const [currentIngredientsNodeId, setCurrentIngredientsNodeId] = useState(null)
   const [currentRecipeListNodeId, setCurrentRecipeListNodeId] = useState(null)
   const [currentRecipeNodeIds, setCurrentRecipeNodeIds] = useState({})
   const [continueFromNodeId, setContinueFromNodeId] = useState(null)
@@ -2265,7 +2433,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
         await supabase.from('explorations_history').delete().eq('user_id', user.id).lt('updated_at', cutoff)
         const { data } = await supabase
           .from('explorations_history')
-          .select('search_key,primary_ingredients,flavor_profile,low_abv,result,updated_at')
+          .select('search_key,primary_ingredients,template,frozen,na,low_abv,result,updated_at')
           .eq('user_id', user.id)
           .order('updated_at', { ascending: false })
           .limit(20)
@@ -2282,11 +2450,14 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   useEffect(() => {
     if (!pendingRestore) return
     setSelected(pendingRestore.primary_ingredients || [])
-    setFlavors(pendingRestore.flavor_profile || [])
+    setTemplate(pendingRestore.template || null)
+    setFrozen(pendingRestore.frozen || false)
+    setNa(pendingRestore.na || false)
     setLowABV(pendingRestore.low_abv || false)
     setResult(pendingRestore.result || null)
     setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null)
     setCurrentWhiteboardId(pendingRestore.whiteboardId || null)
+    setCurrentIngredientsNodeId(pendingRestore.ingredientsNodeId || null)
     setCurrentRecipeListNodeId(pendingRestore.restoreRecipeListNodeId || null)
     setContinueFromNodeId(pendingRestore.continueFromNodeId || null)
     setAutoExpandRecipeNodeId(pendingRestore.restoreRecipeNodeId || null)
@@ -2315,12 +2486,14 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     return () => clearInterval(id)
   }, [step])
 
-  const upsertHistory = (ingredients, searchFlavors, searchLowABV, searchResult) => {
+  const upsertHistory = (ingredients, searchTemplate, searchFrozen, searchLowABV, searchNa, searchResult) => {
     const entry = {
-      search_key: makeExplorationKey(ingredients, searchFlavors, searchLowABV),
+      search_key: makeExplorationKey(ingredients, searchTemplate, searchFrozen, searchLowABV, searchNa),
       primary_ingredients: [...ingredients].sort(),
-      flavor_profile: [...searchFlavors].sort(),
+      template: searchTemplate,
+      frozen: searchFrozen,
       low_abv: searchLowABV,
+      na: searchNa,
       result: searchResult,
       updated_at: new Date().toISOString(),
     }
@@ -2351,8 +2524,10 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
 
   const restoreFromHistory = (entry) => {
     setSelected(entry.primary_ingredients)
-    setFlavors(entry.flavor_profile)
+    setTemplate(entry.template)
+    setFrozen(entry.frozen)
     setLowABV(entry.low_abv)
+    setNa(entry.na)
     setResult(entry.result)
     setError(null)
     setFeedback('')
@@ -2361,14 +2536,6 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setPartialSource(null)
     goToStep('results')
   }
-
-  const FLAVORS = [
-    { id: 'Bright & Citrusy', emoji: '🍋' }, { id: 'Bitter / Herbal', emoji: '🌿' },
-    { id: 'Spirit Forward / Dry', emoji: '🥃' }, { id: 'Earthy / Smoky', emoji: '🍂' },
-    { id: 'Fruity / Sweet', emoji: '🍓' },
-  ]
-
-  const toggleFlavor = id => setFlavors(prev => prev.includes(id) ? prev.filter(f => f !== id) : prev.length < 3 ? [...prev, id] : prev)
 
   // Navigation helpers — use these instead of bare setStep so all transitions go through the stack.
   // goToStep pushes the current step and moves forward; goBack pops and moves backward.
@@ -2393,24 +2560,28 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
-  const handleExplore = async () => {
-    setNavStack(prev => [...prev, stepRef.current])
+  const handleExplore = async (opts = {}) => {
+    const activeTemplate = opts.template ?? template
+    const activeContinueFromNodeId = opts.continueFromNodeId !== undefined ? opts.continueFromNodeId : continueFromNodeId
+    const fromStep = opts.fromStep !== undefined ? opts.fromStep : stepRef.current
+    setNavStack(prev => [...prev, fromStep])
     setStep('loading')
     setPartialSource(null)
     setRestoreNodeData({})
     setAutoExpandNodeData(null)
     try {
-      const { result: data, partialSource: ps } = await analyzeExplorations(selected, flavors, lowABV, inventoryText)
+      const modifiers = { frozen, lowABV, na }
+      const { result: data, partialSource: ps } = await analyzeExplorations(selected, activeTemplate, modifiers, inventoryText)
       setResult(data)
       setPartialSource(ps)
       setStep('results')
       if (!data.incompatible) {
-        upsertHistory(selected, flavors, lowABV, data)
+        upsertHistory(selected, activeTemplate, frozen, lowABV, na, data)
         if (user) {
           try {
             const now = new Date().toISOString()
             let wbId = currentWhiteboardId
-            let recipeListParentId = continueFromNodeId
+            let recipeListParentId = activeContinueFromNodeId
 
             if (!wbId) {
               const { data: wb } = await supabase
@@ -2422,9 +2593,10 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
               if (wbId) {
                 const { data: ingNode } = await supabase
                   .from('exploration_nodes')
-                  .insert({ whiteboard_id: wbId, parent_node_id: null, node_type: 'ingredients', payload: { selected: selected.map(s => String(s)), flavor_profile: flavors.map(f => String(f)), low_abv: Boolean(lowABV) } })
+                  .insert({ whiteboard_id: wbId, parent_node_id: null, node_type: 'ingredients', payload: { selected: selected.map(s => String(s)), template: activeTemplate, frozen: Boolean(frozen), low_abv: Boolean(lowABV), na: Boolean(na) } })
                   .select('id').single()
                 recipeListParentId = ingNode?.id ?? null
+                setCurrentIngredientsNodeId(ingNode?.id ?? null)
               }
             }
 
@@ -2469,7 +2641,75 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
-  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setFlavors([]); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  // Partial-failure banner's Retry: re-run only the call that failed (recipes or
+  // originals, per partialSource), and merge its suggestions into the existing list
+  // rather than discarding the suggestions that already succeeded. If this retry also
+  // fails, the catch below intentionally leaves the banner and partial results as-is —
+  // it must never escalate to the full error state, since the user still has usable
+  // suggestions on screen.
+  const handlePartialRetry = async () => {
+    if (!result || !partialSource || partialRetryLoading) return
+    setPartialRetryLoading(true)
+    try {
+      const modifiers = { frozen, lowABV, na }
+      const wasRecipesFailure = partialSource === 'web'
+      const freshData = stripCiteTags(
+        wasRecipesFailure
+          ? await analyzeExplorationsRecipes(selected, template, modifiers, inventoryText)
+          : await analyzeExplorationsOriginals(selected, template, modifiers, inventoryText)
+      )
+      const newSuggestions = freshData?.suggestions || []
+      const mergedSuggestions = wasRecipesFailure
+        ? [...newSuggestions, ...result.suggestions]
+        : [...result.suggestions, ...newSuggestions]
+
+      setResult(prev => ({
+        ...prev,
+        suggestions: mergedSuggestions,
+        flavor_profile_note: wasRecipesFailure
+          ? (freshData.flavor_profile_note || prev.flavor_profile_note)
+          : (prev.flavor_profile_note || freshData.flavor_profile_note),
+        pairs_well_with: wasRecipesFailure
+          ? (freshData.pairs_well_with || prev.pairs_well_with)
+          : (prev.pairs_well_with || freshData.pairs_well_with),
+        cross_template_suggestion: prev.cross_template_suggestion || freshData.cross_template_suggestion || null,
+        no_recipes_found: wasRecipesFailure ? freshData.no_recipes_found === true : prev.no_recipes_found,
+      }))
+      setPartialSource(null)
+
+      // Mirror handleExplore's node writes so the newly-filled-in suggestions persist
+      // to the whiteboard exactly as if they'd succeeded on the first attempt.
+      if (user && currentWhiteboardId && currentRecipeListNodeId && newSuggestions.length > 0) {
+        try {
+          const settled = await Promise.allSettled(
+            newSuggestions.map(recipe =>
+              supabase.from('exploration_nodes')
+                .insert({ whiteboard_id: currentWhiteboardId, parent_node_id: currentRecipeListNodeId, node_type: 'recipe', payload: { recipe } })
+                .select('id').single()
+            )
+          )
+          const newIds = {}
+          newSuggestions.forEach((recipe, i) => {
+            const r = settled[i]
+            if (r.status === 'fulfilled' && r.value?.data?.id && recipe.recipe_name) {
+              newIds[recipe.recipe_name] = r.value.data.id
+            }
+          })
+          setCurrentRecipeNodeIds(prev => ({ ...prev, ...newIds }))
+          await supabase.from('exploration_nodes').update({ payload: { recipes: mergedSuggestions } }).eq('id', currentRecipeListNodeId)
+          await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', currentWhiteboardId)
+        } catch (err) {
+          console.warn('[whiteboard] failed to persist retried suggestions:', err.message)
+        }
+      }
+    } catch (err) {
+      console.warn('[partial retry] failed:', err.message)
+    } finally {
+      setPartialRetryLoading(false)
+    }
+  }
+
+  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2477,13 +2717,13 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setFeedbackError(null)
     try {
       const previousNames = (result?.suggestions || []).map(s => s.recipe_name)
-      const data = await refineExplorations(selected, flavors, lowABV, inventoryText, previousNames, feedback.trim())
+      const data = await refineExplorations(selected, template, { frozen, lowABV, na }, inventoryText, previousNames, feedback.trim())
       setResult(data)
       setFeedback('')
       setFeedbackBanner(true)
       setTimeout(() => feedbackBannerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50)
       setTimeout(() => setFeedbackBanner(false), 4000)
-      upsertHistory(selected, flavors, lowABV, data)
+      upsertHistory(selected, template, frozen, lowABV, na, data)
     } catch (err) {
       setFeedbackError(err.message || 'Something went wrong. Please try again.')
     } finally {
@@ -2491,9 +2731,10 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
-  const handleNextFromIngredients = async () => {
+  const ensureAffinityData = async () => {
     setAffinityLoading(true)
     setAffinityError(null)
+    let map = {}
     try {
       const normalizedSelected = selected.map(s => s.trim().toLowerCase())
 
@@ -2504,7 +2745,6 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
         .in('ingredient_name', normalizedSelected)
       if (error) throw error
 
-      const map = {}
       ;(data || []).forEach(row => { map[row.ingredient_name] = row })
 
       // Step 2: Find selected ingredients with no affinity data
@@ -2536,12 +2776,53 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
       setAffinityData(map)
     } catch (err) {
       console.warn('[affinities] failed to load affinity data:', err.message)
+      map = {}
       setAffinityData({})
       setAffinityError('Could not load affinity data. You can still continue.')
     } finally {
       setAffinityLoading(false)
-      goToStep('affinities')
     }
+    return map
+  }
+
+  const handleNextFromIngredients = async () => {
+    await ensureAffinityData()
+    goToStep('template')
+  }
+
+  const handleQuickBuild = async () => {
+    const fromStep = stepRef.current
+    setTemplatePickerLoading(true)
+    setStep('loading') // covers the template-resolution round trip too, not just generation
+    try {
+      const affinityMap = await ensureAffinityData()
+      const resolved = await resolveTemplate(selected, affinityMap)
+      setTemplate(resolved)
+      await handleExplore({ template: resolved, fromStep })
+    } finally {
+      setTemplatePickerLoading(false)
+    }
+  }
+
+  const handleSurpriseMe = async () => {
+    const fromStep = stepRef.current
+    setTemplatePickerLoading(true)
+    setStep('loading') // covers the template-resolution round trip too, not just generation
+    try {
+      const resolved = await resolveTemplate(selected, affinityData)
+      setTemplate(resolved)
+      await handleExplore({ template: resolved, fromStep })
+    } finally {
+      setTemplatePickerLoading(false)
+    }
+  }
+
+  const handleCrossTemplateSuggestion = async (suggestedTemplate) => {
+    setTemplate(suggestedTemplate)
+    // Attach the new recipe_list as a sibling under the same ingredients node
+    // (not nested under the current recipe_list) so the whiteboard shows two
+    // parallel builds from the same seed ingredients rather than a chain.
+    await handleExplore({ template: suggestedTemplate, continueFromNodeId: currentIngredientsNodeId })
   }
 
   const analyzeCombination = async (ingredients, currentAffinityData) => {
@@ -2644,11 +2925,20 @@ Rules:
     <div>
       <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 4 }}>Explorations</div>
       <div style={{ fontSize: 14, color: C.textMuted, marginBottom: 24, lineHeight: 1.55 }}>Pick up to 2 ingredients and we'll suggest cocktails you can make — or inspire you to try something new.</div>
-      <IngredientSearch inventory={inventory} selected={selected} onSelect={ing => setSelected(p => [...p, ing])} onRemove={ing => setSelected(p => p.filter(i => i !== ing))} />
+      <IngredientSearch inventory={inventory} selected={selected}
+        onSelect={ing => { setSelected(p => [...p, ing]); setTemplate(null); setFrozen(false); setNa(false) }}
+        onRemove={ing => { setSelected(p => p.filter(i => i !== ing)); setTemplate(null); setFrozen(false); setNa(false) }} />
       {selected.length > 0 && (
-        <button onClick={handleNextFromIngredients} disabled={affinityLoading} style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: affinityLoading ? 'default' : 'pointer', marginTop: 24, opacity: affinityLoading ? 0.7 : 1 }}>
-          {affinityLoading ? 'Loading…' : 'Next →'}
-        </button>
+        <>
+          <button onClick={handleNextFromIngredients} disabled={affinityLoading || templatePickerLoading}
+            style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: (affinityLoading || templatePickerLoading) ? 'default' : 'pointer', marginTop: 24, opacity: (affinityLoading || templatePickerLoading) ? 0.7 : 1 }}>
+            {affinityLoading ? 'Loading…' : 'Choose a Template →'}
+          </button>
+          <button onClick={handleQuickBuild} disabled={affinityLoading || templatePickerLoading}
+            style={{ width: '100%', background: 'none', border: 'none', color: C.textFaint, fontWeight: 600, fontSize: 13, padding: '10px 0 0', cursor: (affinityLoading || templatePickerLoading) ? 'default' : 'pointer', display: 'block', textAlign: 'center' }}>
+            {templatePickerLoading ? 'Building…' : '✨ Quick Build'}
+          </button>
+        </>
       )}
     </div>
   )
@@ -2670,10 +2960,7 @@ Rules:
     return (
       <div>
         <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
-        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 24, gap: 10 }}>
-          <div style={{ fontSize: 13, color: C.textMuted, flex: 1 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
-          <button onClick={() => goToStep('prefs')} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '4px 12px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>Quick Build →</button>
-        </div>
+        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 24 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
         {affinityError && (
           <div style={{ background: C.amber + '15', border: `1px solid ${C.amber}44`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.amber, marginBottom: 20 }}>{affinityError}</div>
         )}
@@ -2768,6 +3055,10 @@ Rules:
             </button>
           </div>
         )}
+        <button onClick={() => handleExplore()}
+          style={{ width: '100%', background: C.gold, border: `1px solid ${C.gold}`, borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: 'pointer', marginTop: 24, transition: 'background 0.15s, color 0.15s' }}>
+          ✨ Build
+        </button>
       </div>
     )
   }
@@ -2829,42 +3120,57 @@ Rules:
     )
   }
 
-  if (step === 'prefs') return (
-    <div>
-      <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
-      <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Preferences</div>
-      <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 24 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
+  if (step === 'template') {
+    const showNaChip = selected.some(s => isLikelyNonAlcoholic(s, inventory))
+    const showFrozenChip = !!(template && TEMPLATE_MAP[template]?.frozenEligible)
+    const chip = (active, label, onClick) => (
+      <button key={label} onClick={onClick}
+        style={{ background: active ? C.gold + '22' : C.surface, border: `1px solid ${active ? C.gold + '66' : C.border}`, borderRadius: 20, color: active ? C.gold : C.text, fontSize: 13, fontWeight: active ? 600 : 400, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'background 0.15s, color 0.15s' }}>
+        {label}{active && ' ✓'}
+      </button>
+    )
+    return (
+      <div>
+        <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+        <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Choose a Template</div>
+        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 20 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
 
-      <div style={{ marginBottom: 24 }}>
-        <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 4 }}>Flavor Profile</div>
-        <div style={{ fontSize: 12, color: C.textFaint, marginBottom: 12 }}>Pick 1–3</div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {FLAVORS.map(f => {
-            const active = flavors.includes(f.id)
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 20 }}>
+          {chip(lowABV, 'Low-ABV', () => setLowABV(v => !v))}
+          {showNaChip && chip(na, 'NA', () => setNa(v => !v))}
+          {showFrozenChip && chip(frozen, 'Frozen', () => setFrozen(v => !v))}
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 10, marginBottom: 16 }}>
+          {TEMPLATES.map(t => {
+            const active = template === t.id
             return (
-              <button key={f.id} onClick={() => toggleFlavor(f.id)}
-                style={{ background: active ? C.gold + '22' : C.surface, border: `1px solid ${active ? C.gold + '66' : C.border}`, borderRadius: 10, color: active ? C.gold : C.text, fontSize: 14, fontWeight: active ? 600 : 400, padding: '12px 14px', cursor: 'pointer', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 10, transition: 'background 0.15s, color 0.15s' }}>
-                <span>{f.emoji}</span><span style={{ flex: 1 }}>{f.id}</span>{active && <span style={{ fontSize: 12 }}>✓</span>}
+              <button key={t.id} onClick={() => setTemplate(t.id)}
+                style={{ position: 'relative', background: active ? C.gold + '22' : C.surface, border: `1px solid ${active ? C.gold + '66' : C.border}`, borderRadius: 10, color: active ? C.gold : C.text, padding: '14px 12px', cursor: 'pointer', textAlign: 'left', transition: 'background 0.15s, color 0.15s' }}>
+                <span onClick={e => { e.stopPropagation(); setInfoSheetTemplate(t.id) }}
+                  style={{ position: 'absolute', top: 6, right: 6, width: 20, height: 20, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '50%', border: `1px solid ${C.border}`, color: C.textFaint, fontSize: 11, cursor: 'pointer' }}>i</span>
+                <div style={{ fontSize: 22, marginBottom: 6 }}>{t.emoji}</div>
+                <div style={{ fontSize: 14, fontWeight: active ? 700 : 600, lineHeight: 1.25, marginBottom: 2, paddingRight: 18 }}>{t.name}</div>
+                <div style={{ fontSize: 12, color: active ? C.gold : C.textFaint }}>{t.subtitle}</div>
               </button>
             )
           })}
         </div>
+
+        <button onClick={handleSurpriseMe} disabled={templatePickerLoading}
+          style={{ width: '100%', background: 'none', border: `1px solid ${C.border}`, borderRadius: 10, color: C.textMuted, fontWeight: 600, fontSize: 14, padding: '12px', cursor: templatePickerLoading ? 'default' : 'pointer', marginBottom: 16, opacity: templatePickerLoading ? 0.6 : 1 }}>
+          🎲 Surprise Me
+        </button>
+
+        <button onClick={() => goToStep('affinities')} disabled={!template}
+          style={{ width: '100%', background: template ? C.gold : C.surface, border: `1px solid ${template ? C.gold : C.border}`, borderRadius: 10, color: template ? '#0f0f0f' : C.textFaint, fontWeight: 700, fontSize: 15, padding: '13px', cursor: template ? 'pointer' : 'default', transition: 'background 0.15s, color 0.15s' }}>
+          Continue →
+        </button>
+
+        {infoSheetTemplate && <TemplateInfoSheet template={infoSheetTemplate} onClose={() => setInfoSheetTemplate(null)} />}
       </div>
-
-      <label style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 24 }}>
-        <input type="checkbox" checked={lowABV} onChange={e => setLowABV(e.target.checked)} style={{ width: 18, height: 18, accentColor: C.gold, cursor: 'pointer', flexShrink: 0 }} />
-        <div>
-          <div style={{ fontSize: 14, color: C.text }}>Keep it low ABV</div>
-          <div style={{ fontSize: 12, color: C.textFaint, marginTop: 2 }}>Prefer lighter, lower-alcohol options</div>
-        </div>
-      </label>
-
-      <button onClick={() => handleExplore()}
-        style={{ width: '100%', background: C.gold, border: `1px solid ${C.gold}`, borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: 'pointer', transition: 'background 0.15s, color 0.15s' }}>
-        ✨ Explore
-      </button>
-    </div>
-  )
+    )
+  }
 
   if (step === 'loading') return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '65vh', textAlign: 'center', padding: '0 24px' }}>
@@ -2878,8 +3184,13 @@ Rules:
 
   if (step === 'error') return (
     <div>
-      <div style={{ background: C.red + '15', border: `1px solid ${C.red}44`, borderRadius: 10, padding: '14px 16px', fontSize: 14, color: C.red, marginBottom: 16 }}>{error}</div>
-      <button onClick={reset} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.textMuted, fontSize: 13, padding: '8px 16px', cursor: 'pointer' }}>Try again</button>
+      <div style={{ background: C.red + '15', border: `1px solid ${C.red}44`, borderRadius: 10, padding: '14px 16px', fontSize: 14, color: C.red, marginBottom: 16 }}>
+        {error || 'Something went wrong generating suggestions.'}
+      </div>
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+        <button onClick={() => handleExplore()} style={{ background: C.gold, border: 'none', borderRadius: 8, color: '#0f0f0f', fontWeight: 700, fontSize: 13, padding: '9px 18px', cursor: 'pointer' }}>Retry</button>
+        <button onClick={reset} style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 13, cursor: 'pointer', padding: 0 }}>Start over</button>
+      </div>
     </div>
   )
 
@@ -2908,8 +3219,16 @@ Rules:
           <button onClick={reset} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap' }}>Start over</button>
         </div>
         {partialSource && (
-          <div style={{ background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 8, padding: '8px 14px', marginBottom: 16, fontSize: 13, color: C.textMuted }}>
-            Some results unavailable — showing {partialSource === 'web' ? 'original' : 'web'} suggestions only
+          <div style={{ background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 8, padding: '8px 14px', marginBottom: 16, fontSize: 13, color: C.textMuted, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+            <span>
+              {partialSource === 'web'
+                ? "Couldn't load published recipes — showing originals only."
+                : "Couldn't create original recipes — showing published recipes only."}
+            </span>
+            <button onClick={handlePartialRetry} disabled={partialRetryLoading}
+              style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.amber, fontSize: 12, fontWeight: 600, padding: '4px 12px', cursor: partialRetryLoading ? 'default' : 'pointer', whiteSpace: 'nowrap', flexShrink: 0, opacity: partialRetryLoading ? 0.6 : 1 }}>
+              {partialRetryLoading ? 'Retrying…' : 'Retry'}
+            </button>
           </div>
         )}
         {result.flavor_profile_note && (
@@ -2946,6 +3265,18 @@ Rules:
             </div>
           )}
         </div>
+        {result.cross_template_suggestion && TEMPLATE_MAP[result.cross_template_suggestion.template] && (
+          <div onClick={() => handleCrossTemplateSuggestion(result.cross_template_suggestion.template)}
+            style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 20, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 600, color: C.text, marginBottom: 2 }}>
+                {TEMPLATE_MAP[result.cross_template_suggestion.template].emoji} These ingredients are also the classic {result.cross_template_suggestion.drink_name} ({TEMPLATE_MAP[result.cross_template_suggestion.template].name})
+              </div>
+              <div style={{ fontSize: 12, color: C.textFaint, lineHeight: 1.4 }}>{result.cross_template_suggestion.reason}</div>
+            </div>
+            <span style={{ color: C.gold, fontSize: 18, flexShrink: 0 }}>→</span>
+          </div>
+        )}
         <div ref={feedbackBannerRef}>
           {feedbackBanner && (
             <div style={{ background: C.green + '15', border: `1px solid ${C.green}44`, borderRadius: 10, padding: '10px 16px', marginBottom: 16, fontSize: 14, color: C.green }}>
@@ -3148,8 +3479,10 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     const recipeListNode = selfAndAncestors.find(n => n.node_type === 'recipe_list')
 
     const selected = ingredientsNode?.payload?.selected || []
-    const flavorProfile = ingredientsNode?.payload?.flavor_profile || []
+    const template = ingredientsNode?.payload?.template || null
+    const frozen = ingredientsNode?.payload?.frozen || false
     const lowABV = ingredientsNode?.payload?.low_abv || false
+    const na = ingredientsNode?.payload?.na || false
 
     const isIngredients = node.node_type === 'ingredients'
     const restoreRecipeListNodeId = isIngredients ? null : (node.node_type === 'recipe_list' ? node.id : recipeListNode?.id ?? null)
@@ -3196,7 +3529,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
       })
     }
 
-    const result = isIngredients ? null : { incompatible: false, incompatibility_reason: null, flavor_profile_note: null, pairs_well_with: null, suggestions }
+    const result = isIngredients ? null : { incompatible: false, incompatibility_reason: null, flavor_profile_note: null, pairs_well_with: null, cross_template_suggestion: null, suggestions }
 
     // Build a map of recipe_name → { nodeId, tried, notes } from SIBLING recipe nodes only
     // (children of the recipe_list). This hydrates the non-auto-expanded RecipeCards in the
@@ -3221,11 +3554,14 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
 
     return {
       primary_ingredients: selected,
-      flavor_profile: flavorProfile,
+      template,
+      frozen,
       low_abv: lowABV,
+      na,
       result,
       resumeStep: isIngredients ? 'ingredients' : 'results',
       whiteboardId,
+      ingredientsNodeId: ingredientsNode?.id ?? null,
       continueFromNodeId: node.id,
       restoreRecipeListNodeId,
       autoExpandRecipeName,
@@ -3239,7 +3575,9 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
 
   const nodeSummary = (node) => {
     if (node.node_type === 'ingredients') {
-      return node.payload?.selected?.join(', ') || ''
+      const parts = [node.payload?.selected?.join(', ')]
+      if (node.payload?.template) parts.push(TEMPLATE_MAP[node.payload.template]?.name || node.payload.template)
+      return parts.filter(Boolean).join(' · ')
     }
     if (node.node_type === 'recipe_list') return `${(node.payload?.recipes || []).length} recipes generated`
     if (node.node_type === 'recipe') return node.payload?.recipe?.recipe_name || 'Recipe'
@@ -3252,12 +3590,20 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
   }
 
   const renderNodeDetail = (node) => {
-    if (node.node_type === 'ingredients') return (
-      <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.6 }}>
-        <div><b>Ingredients:</b> {node.payload?.selected?.join(', ')}</div>
-        {node.payload?.flavor_profile?.length > 0 && <div><b>Flavors:</b> {node.payload.flavor_profile.join(', ')}</div>}
-      </div>
-    )
+    if (node.node_type === 'ingredients') {
+      const modifierLabels = [
+        node.payload?.frozen && 'Frozen',
+        node.payload?.low_abv && 'Low-ABV',
+        node.payload?.na && 'NA',
+      ].filter(Boolean)
+      return (
+        <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.6 }}>
+          <div><b>Ingredients:</b> {node.payload?.selected?.join(', ')}</div>
+          {node.payload?.template && <div><b>Template:</b> {TEMPLATE_MAP[node.payload.template]?.name || node.payload.template}</div>}
+          {modifierLabels.length > 0 && <div><b>Modifiers:</b> {modifierLabels.join(', ')}</div>}
+        </div>
+      )
+    }
     if (node.node_type === 'recipe_list') {
       // Read from the actual child 'recipe' nodes (real ids, real tried state) rather than
       // the list's own payload snapshot, so tried status shown here is never stale.
@@ -4225,6 +4571,7 @@ export default function App() {
                 onFeedback={handleFeedback}
                 feedbackLoading={feedbackLoading}
                 inventory={inventory}
+                feedbackError={error}
               />
             </>
           )}
