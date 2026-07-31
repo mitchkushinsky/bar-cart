@@ -499,7 +499,7 @@ async function analyzeExplorationsRecipes(ingredients, template, modifiers, inve
     tools: [{ type: 'web_search_20250305', name: 'web_search' }],
     messages: [{
       role: 'user',
-      content: `You are an expert craft bartender. Search the web for PUBLISHED cocktail recipes featuring the featured ingredients, within the family of the chosen template below. Return ONLY real recipes found from published sources — do NOT invent original cocktails. Set origin_flag: "from_recipe" for ALL suggestions.
+      content: `You are an expert craft bartender. Search the web for PUBLISHED cocktail recipes featuring the featured ingredients, within the family of the chosen template below. Return ONLY real recipes found from published sources — do NOT invent original cocktails. Set origin: "published" for ALL suggestions — every suggestion from this call is an exact published recipe.
 
 Today's date is ${TODAY}.
 
@@ -520,7 +520,9 @@ CRITICAL: Every recipe suggestion MUST include ALL featured ingredients (${ingre
 
 If you cannot find 2–3 published recipes that include ALL featured ingredients, return as many as you can find (even 0 or 1). If no qualifying published recipes exist, return an empty suggestions array and set "no_recipes_found": true. Do NOT invent original recipes in this call — that is handled separately.
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+
+For each suggestion, also report the specific page you found it on as "citation": { "title": "string", "url": "string" }, using the exact title and URL from your search results for that suggestion. If you are not confident which specific page a suggestion came from, set citation to null — never invent or guess a title or URL.
 
 Separately, check whether these exact featured ingredients are also the basis of a different well-known published drink that belongs to a DIFFERENT template than the one chosen above. Only populate cross_template_suggestion if there's a genuine, well-known match — otherwise leave it null. Do not force one.
 
@@ -535,7 +537,7 @@ Return ONLY valid JSON with no markdown fences:
   "suggestions": [
     {
       "recipe_name": "string",
-      "origin_flag": "from_recipe",
+      "origin": "published",
       "difficulty": "easy | medium | hard",
       "difficulty_note": "One sentence explaining difficulty",
       "can_make_now": true,
@@ -554,16 +556,18 @@ Return ONLY valid JSON with no markdown fences:
           "flavor_impact": "string or null"
         }
       ],
-      "technique_notes": "string or null"
+      "technique_notes": "string or null",
+      "citation": { "title": "string", "url": "string" }
     }
   ]
 }
-cross_template_suggestion must be null (not omitted) when there is no genuine match.`,
+cross_template_suggestion must be null (not omitted) when there is no genuine match. citation must be null (not omitted) when you are not confident of the specific source page.`,
     }],
   }
   const firstText = await callClaudeText(body)
+  let data
   try {
-    return extractJSON(firstText)
+    data = extractJSON(firstText)
   } catch (_) {
     const retryText = await callClaudeText({
       model: MODEL,
@@ -574,8 +578,25 @@ cross_template_suggestion must be null (not omitted) when there is no genuine ma
         { role: 'user', content: 'Your previous response was cut off or invalid JSON. Please return ONLY the complete valid JSON object, no other text.' },
       ],
     })
-    return extractJSON(retryText)
+    data = extractJSON(retryText)
   }
+  // origin_flag is derived here rather than asked of the model — it's a legacy
+  // compatibility field consumed by Favorites/On Deck saves (a real DB column),
+  // and every suggestion from this call is always "from_recipe" regardless of
+  // the new self-reported origin value, so deriving it guarantees consistency.
+  // citation is validated rather than trusted as-is: the model is asked to self-report
+  // {title, url} per suggestion (Claude's API does not attach real citation metadata to
+  // text content when the prompt demands raw JSON output, confirmed by inspecting a raw
+  // response), so anything short of a complete, well-formed pair is treated as no citation
+  // rather than risking a fabricated or malformed source reaching the UI.
+  if (data?.suggestions) data.suggestions = data.suggestions.map(s => ({
+    ...s,
+    origin_flag: 'from_recipe',
+    citation: (s.citation && typeof s.citation.title === 'string' && s.citation.title.trim() && typeof s.citation.url === 'string' && s.citation.url.trim())
+      ? { title: s.citation.title.trim(), url: s.citation.url.trim() }
+      : null,
+  }))
+  return data
 }
 
 async function analyzeExplorationsOriginals(ingredients, template, modifiers, inventoryText) {
@@ -584,7 +605,7 @@ async function analyzeExplorationsOriginals(ingredients, template, modifiers, in
     max_tokens: 3000,
     messages: [{
       role: 'user',
-      content: `You are an expert craft bartender building cocktails within a chosen template. Do NOT look up or reference published recipes — these should be your own creative work. Set origin_flag: "original" for ALL suggestions.
+      content: `You are an expert craft bartender building cocktails within a chosen template. Do NOT look up or reference published recipes — these should be your own creative work.
 
 The primary ingredient(s) for this exploration are: ${ingredients.join(', ')}. Use these exact names when referencing them in your response.
 
@@ -601,16 +622,16 @@ SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated
 
 First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
-Otherwise invent 2–3 cocktails that showcase the featured ingredients using this priority order:
-1. DEFAULT — template + substitution: take the template's usual formula above and substitute the featured ingredients (and available bar inventory) into its ratio slots. This is how most real cocktails are made and should be your primary approach for every suggestion.
-2. LAST RESORT — fully original invention: only when no reasonable substitution into the template's formula exists, invent an original drink that still honors the template's mechanic (stirred/shaken/built/etc.) and general spirit-forward-vs-lengthened character. Do not reach for this by default — it should be rare.
+Otherwise invent 2–3 cocktails that showcase the featured ingredients using this priority order, and set each suggestion's "origin" field honestly to reflect which path you actually used — do not default every suggestion to the same value:
+1. DEFAULT — origin: "riff": take the template's usual formula above and substitute the featured ingredients (and available bar inventory) into its ratio slots. This is how most real cocktails are made and should be your primary approach for every suggestion.
+2. LAST RESORT — origin: "original": only when no reasonable substitution into the template's formula exists, invent a drink that still honors the template's mechanic (stirred/shaken/built/etc.) and general spirit-forward-vs-lengthened character. Do not reach for this by default — it should be rare, and you must set origin: "original" honestly rather than mislabeling an actual substitution as a riff.
 For either path, suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate, and check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
 
 CRITICAL: Every cocktail MUST feature ALL of the featured ingredients (${ingredients.join(', ')}). Do not omit any featured ingredient from any suggestion.
 
 Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false (something worth buying an ingredient for), unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists.
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
 Return ONLY valid JSON with no markdown fences:
 {
@@ -622,7 +643,7 @@ Return ONLY valid JSON with no markdown fences:
   "suggestions": [
     {
       "recipe_name": "string",
-      "origin_flag": "original",
+      "origin": "riff | original",
       "difficulty": "easy | medium | hard",
       "difficulty_note": "One sentence explaining difficulty",
       "can_make_now": true,
@@ -649,8 +670,9 @@ cross_template_suggestion is always null from this call — leave it exactly as 
     }],
   }
   const firstText = await callClaudeText(body)
+  let data
   try {
-    return extractJSON(firstText)
+    data = extractJSON(firstText)
   } catch (_) {
     const retryText = await callClaudeText({
       model: MODEL,
@@ -661,73 +683,15 @@ cross_template_suggestion is always null from this call — leave it exactly as 
         { role: 'user', content: 'Your previous response was cut off or invalid JSON. Please return ONLY the complete valid JSON object, no other text.' },
       ],
     })
-    return extractJSON(retryText)
+    data = extractJSON(retryText)
   }
-}
-
-async function analyzeExplorations(ingredients, template, modifiers, inventoryText) {
-  const slimInventoryText = inventoryText.split('\n').map((line, i) => {
-    if (i === 0) return 'Spirit | Category | Status | Notes'
-    const parts = line.split(' | ')
-    const notes = (parts[6] || '').trim()
-    return `${parts[0] || ''} | ${parts[3] || ''} | ${parts[5] || ''}${notes ? ` | ${notes}` : ''}`
-  }).join('\n')
-
-  const [recipesSettled, originalsSettled] = await Promise.allSettled([
-    analyzeExplorationsRecipes(ingredients, template, modifiers, inventoryText),
-    analyzeExplorationsOriginals(ingredients, template, modifiers, slimInventoryText),
-  ])
-
-  console.log('Web call result:', recipesSettled.status, recipesSettled.reason || 'ok')
-  console.log('Originals call result:', originalsSettled.status, originalsSettled.reason || 'ok')
-
-  const recipeData = recipesSettled.status === 'fulfilled' ? recipesSettled.value : null
-  const originalData = originalsSettled.status === 'fulfilled' ? originalsSettled.value : null
-
-  if (!recipeData && !originalData) {
-    throw new Error('Could not generate suggestions. Please try again.')
-  }
-
-  const partialSource = !recipeData ? 'web' : !originalData ? 'original' : null
-  const allSuggestions = [...(recipeData?.suggestions || []), ...(originalData?.suggestions || [])]
-  const noPublishedRecipes = recipesSettled.status === 'fulfilled' && recipesSettled.value?.no_recipes_found === true
-
-  if (allSuggestions.length === 0) {
-    // Only a call that actually completed gets to declare "these don't mix" — a call that
-    // rejected or timed out has no verdict at all, and must not be conflated with a genuine
-    // incompatibility finding from the other call. Without this guard, one failed call plus
-    // a zero-suggestion (but not-incompatible) result from the other renders as a confident
-    // "these don't quite mix" even though nothing about the ingredients was actually checked.
-    const incompatibleData = [recipeData, originalData].find(d => d?.incompatible === true)
-    if (!incompatibleData) {
-      throw new Error('Could not generate suggestions. Please try again.')
-    }
-    return {
-      result: stripCiteTags({
-        incompatible: true,
-        incompatibility_reason: incompatibleData.incompatibility_reason,
-        flavor_profile_note: null,
-        pairs_well_with: null,
-        cross_template_suggestion: null,
-        no_recipes_found: noPublishedRecipes,
-        suggestions: [],
-      }),
-      partialSource,
-    }
-  }
-
-  return {
-    result: stripCiteTags({
-      incompatible: false,
-      incompatibility_reason: null,
-      flavor_profile_note: recipeData?.flavor_profile_note || originalData?.flavor_profile_note || null,
-      pairs_well_with: recipeData?.pairs_well_with || originalData?.pairs_well_with || null,
-      cross_template_suggestion: recipeData?.cross_template_suggestion || originalData?.cross_template_suggestion || null,
-      no_recipes_found: noPublishedRecipes,
-      suggestions: allSuggestions,
-    }),
-    partialSource,
-  }
+  // Both riff and original map to the same legacy origin_flag value — that field
+  // only ever distinguished "from the web-search call" vs "from this call," and
+  // this call's suggestions were always origin_flag: "original" regardless of
+  // which internal tier the model used. Preserved exactly for Favorites/On Deck.
+  // citation is always null here — nothing from this call is a real published source.
+  if (data?.suggestions) data.suggestions = data.suggestions.map(s => ({ ...s, origin_flag: 'original', citation: null }))
+  return data
 }
 
 async function refineExplorations(ingredients, template, modifiers, inventoryText, previousNames, feedbackText) {
@@ -1147,11 +1111,25 @@ function VariationCard({ variation }) {
 
 // ─── Badge helpers ────────────────────────────────────────────────────────────
 
-function OriginBadge({ originFlag }) {
-  if (!originFlag) return null
+const ORIGIN_BADGE_LABELS = {
+  published: '📖 From a recipe',
+  riff: '🔁 Riff',
+  original: '✨ Original',
+}
+
+function OriginBadge({ origin, originFlag }) {
+  // Resolution order: real self-reported `origin` (3-way) first; then the legacy
+  // `origin_flag` (2-way, from suggestions generated before this field existed,
+  // or from Refine/Tweak which still only emit origin_flag) mapped losslessly
+  // where possible (from_recipe → published) and conservatively where not
+  // (anything else → original, since we can't recover whether an old
+  // "original"-flagged item was secretly a riff); no signal at all → no badge,
+  // matching prior behavior for Favorites/On Deck items with nothing set.
+  const resolved = origin || (originFlag ? (originFlag === 'from_recipe' ? 'published' : 'original') : null)
+  if (!resolved) return null
   return (
     <span style={{ fontSize: 11, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, padding: '2px 7px', color: C.textMuted }}>
-      {originFlag === 'from_recipe' ? '📖 From a recipe' : '✨ Original'}
+      {ORIGIN_BADGE_LABELS[resolved] || ORIGIN_BADGE_LABELS.original}
     </span>
   )
 }
@@ -2241,7 +2219,7 @@ function RecipeCard({
         </div>
         {showSaveButtons && (
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 4 }}>
-            <OriginBadge originFlag={displayed.origin_flag} />
+            <OriginBadge origin={displayed.origin} originFlag={displayed.origin_flag} />
             <DifficultyBadge difficulty={displayed.difficulty} />
           </div>
         )}
@@ -2249,6 +2227,13 @@ function RecipeCard({
       </div>
 
       {displayed.summary && <p style={{ fontSize: 14, color: C.textMuted, lineHeight: 1.55, marginBottom: 10 }}>{displayed.summary}</p>}
+
+      {displayed.citation?.url && (
+        <a href={displayed.citation.url} target="_blank" rel="noopener noreferrer"
+          style={{ display: 'inline-block', fontSize: 12, color: C.textFaint, marginBottom: 10, textDecoration: 'underline' }}>
+          📖 {displayed.citation.title || 'View source'}
+        </a>
+      )}
 
       {lineage && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12, color: C.textFaint, marginBottom: 10 }}>
@@ -2406,8 +2391,9 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   const feedbackBannerRef = useRef(null)
   const stepRef = useRef(step)
   const [history, setHistory] = useState([])
-  const [partialSource, setPartialSource] = useState(null)
-  const [partialRetryLoading, setPartialRetryLoading] = useState(false)
+  const [originalsFetched, setOriginalsFetched] = useState(false)
+  const [seeMoreLoading, setSeeMoreLoading] = useState(false)
+  const [seeMoreError, setSeeMoreError] = useState(null)
   const [loadingMsgIdx, setLoadingMsgIdx] = useState(0)
   const [affinityData, setAffinityData] = useState({})
   const [affinityLoading, setAffinityLoading] = useState(false)
@@ -2455,7 +2441,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setNa(pendingRestore.na || false)
     setLowABV(pendingRestore.low_abv || false)
     setResult(pendingRestore.result || null)
-    setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null)
+    setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(true)
     setCurrentWhiteboardId(pendingRestore.whiteboardId || null)
     setCurrentIngredientsNodeId(pendingRestore.ingredientsNodeId || null)
     setCurrentRecipeListNodeId(pendingRestore.restoreRecipeListNodeId || null)
@@ -2533,7 +2519,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setFeedback('')
     setFeedbackError(null)
     setFeedbackBanner(false)
-    setPartialSource(null)
+    setOriginalsFetched(true)
     goToStep('results')
   }
 
@@ -2560,28 +2546,37 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
+  // Tier-1 only: fires the published-recipe (web search) call and shows it immediately.
+  // Riffs/originals are not generated here — see handleSeeMore for the on-demand tier-2/3
+  // call. Returns { data, wbId, recipeListNodeId, ingredientsNodeId } (or null on full
+  // failure) so callers that need to chain a tier-2/3 fetch (Quick Build, Surprise Me —
+  // Decision B) can do so without depending on state that hasn't re-rendered yet.
   const handleExplore = async (opts = {}) => {
     const activeTemplate = opts.template ?? template
     const activeContinueFromNodeId = opts.continueFromNodeId !== undefined ? opts.continueFromNodeId : continueFromNodeId
     const fromStep = opts.fromStep !== undefined ? opts.fromStep : stepRef.current
     setNavStack(prev => [...prev, fromStep])
     setStep('loading')
-    setPartialSource(null)
+    setOriginalsFetched(false)
+    setSeeMoreError(null)
     setRestoreNodeData({})
     setAutoExpandNodeData(null)
     try {
       const modifiers = { frozen, lowABV, na }
-      const { result: data, partialSource: ps } = await analyzeExplorations(selected, activeTemplate, modifiers, inventoryText)
+      const data = stripCiteTags(await analyzeExplorationsRecipes(selected, activeTemplate, modifiers, inventoryText))
       setResult(data)
-      setPartialSource(ps)
       setStep('results')
+      let wbId = null
+      let recipeListNodeId = null
+      let ingredientsNodeId = null
       if (!data.incompatible) {
         upsertHistory(selected, activeTemplate, frozen, lowABV, na, data)
         if (user) {
           try {
             const now = new Date().toISOString()
-            let wbId = currentWhiteboardId
+            wbId = currentWhiteboardId
             let recipeListParentId = activeContinueFromNodeId
+            ingredientsNodeId = currentIngredientsNodeId
 
             if (!wbId) {
               const { data: wb } = await supabase
@@ -2596,7 +2591,8 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
                   .insert({ whiteboard_id: wbId, parent_node_id: null, node_type: 'ingredients', payload: { selected: selected.map(s => String(s)), template: activeTemplate, frozen: Boolean(frozen), low_abv: Boolean(lowABV), na: Boolean(na) } })
                   .select('id').single()
                 recipeListParentId = ingNode?.id ?? null
-                setCurrentIngredientsNodeId(ingNode?.id ?? null)
+                ingredientsNodeId = ingNode?.id ?? null
+                setCurrentIngredientsNodeId(ingredientsNodeId)
               }
             }
 
@@ -2606,16 +2602,16 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
                 .from('exploration_nodes')
                 .insert({ whiteboard_id: wbId, parent_node_id: recipeListParentId ?? null, node_type: 'recipe_list', payload: { recipes } })
                 .select('id').single()
-              const listNodeId = listNode?.id ?? null
-              setCurrentRecipeListNodeId(listNodeId)
+              recipeListNodeId = listNode?.id ?? null
+              setCurrentRecipeListNodeId(recipeListNodeId)
               setContinueFromNodeId(null)
 
               const recipeNodeIds = {}
-              if (listNodeId && recipes.length > 0) {
+              if (recipeListNodeId && recipes.length > 0) {
                 const settled = await Promise.allSettled(
                   recipes.map(recipe =>
                     supabase.from('exploration_nodes')
-                      .insert({ whiteboard_id: wbId, parent_node_id: listNodeId, node_type: 'recipe', payload: { recipe } })
+                      .insert({ whiteboard_id: wbId, parent_node_id: recipeListNodeId, node_type: 'recipe', payload: { recipe } })
                       .select('id').single()
                   )
                 )
@@ -2635,56 +2631,49 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
           }
         }
       }
+      return { data, wbId, recipeListNodeId, ingredientsNodeId }
     } catch (err) {
       setError(err.message || 'Something went wrong. Please try again.')
       setStep('error')
+      return null
     }
   }
 
-  // Partial-failure banner's Retry: re-run only the call that failed (recipes or
-  // originals, per partialSource), and merge its suggestions into the existing list
-  // rather than discarding the suggestions that already succeeded. If this retry also
-  // fails, the catch below intentionally leaves the banner and partial results as-is —
-  // it must never escalate to the full error state, since the user still has usable
-  // suggestions on screen.
-  const handlePartialRetry = async () => {
-    if (!result || !partialSource || partialRetryLoading) return
-    setPartialRetryLoading(true)
+  // On-demand tier-2/3 (riff/original) generation, triggered by the "See more ideas →"
+  // CTA — or pre-fired automatically right after tier-1 for Quick Build/Surprise Me
+  // (Decision B), which pass wbId/recipeListNodeId/baseSuggestions explicitly since
+  // handleExplore's state updates haven't rendered yet at that point in the chain.
+  // Mirrors the old handlePartialRetry's merge-and-persist pattern.
+  const handleSeeMore = async (opts = {}) => {
+    if (seeMoreLoading) return
+    const activeTemplate = opts.template ?? template
+    const wbId = opts.whiteboardId !== undefined ? opts.whiteboardId : currentWhiteboardId
+    const recipeListNodeId = opts.recipeListNodeId !== undefined ? opts.recipeListNodeId : currentRecipeListNodeId
+    const baseSuggestions = opts.baseSuggestions ?? result?.suggestions ?? []
+    setSeeMoreLoading(true)
+    setSeeMoreError(null)
     try {
       const modifiers = { frozen, lowABV, na }
-      const wasRecipesFailure = partialSource === 'web'
-      const freshData = stripCiteTags(
-        wasRecipesFailure
-          ? await analyzeExplorationsRecipes(selected, template, modifiers, inventoryText)
-          : await analyzeExplorationsOriginals(selected, template, modifiers, inventoryText)
-      )
+      const freshData = stripCiteTags(await analyzeExplorationsOriginals(selected, activeTemplate, modifiers, inventoryText))
       const newSuggestions = freshData?.suggestions || []
-      const mergedSuggestions = wasRecipesFailure
-        ? [...newSuggestions, ...result.suggestions]
-        : [...result.suggestions, ...newSuggestions]
+      const mergedSuggestions = [...baseSuggestions, ...newSuggestions]
 
       setResult(prev => ({
-        ...prev,
+        ...(prev || {}),
+        incompatible: false,
         suggestions: mergedSuggestions,
-        flavor_profile_note: wasRecipesFailure
-          ? (freshData.flavor_profile_note || prev.flavor_profile_note)
-          : (prev.flavor_profile_note || freshData.flavor_profile_note),
-        pairs_well_with: wasRecipesFailure
-          ? (freshData.pairs_well_with || prev.pairs_well_with)
-          : (prev.pairs_well_with || freshData.pairs_well_with),
-        cross_template_suggestion: prev.cross_template_suggestion || freshData.cross_template_suggestion || null,
-        no_recipes_found: wasRecipesFailure ? freshData.no_recipes_found === true : prev.no_recipes_found,
+        flavor_profile_note: prev?.flavor_profile_note || freshData.flavor_profile_note || null,
+        pairs_well_with: prev?.pairs_well_with || freshData.pairs_well_with || null,
+        cross_template_suggestion: prev?.cross_template_suggestion || freshData.cross_template_suggestion || null,
       }))
-      setPartialSource(null)
+      setOriginalsFetched(true)
 
-      // Mirror handleExplore's node writes so the newly-filled-in suggestions persist
-      // to the whiteboard exactly as if they'd succeeded on the first attempt.
-      if (user && currentWhiteboardId && currentRecipeListNodeId && newSuggestions.length > 0) {
+      if (user && wbId && recipeListNodeId && newSuggestions.length > 0) {
         try {
           const settled = await Promise.allSettled(
             newSuggestions.map(recipe =>
               supabase.from('exploration_nodes')
-                .insert({ whiteboard_id: currentWhiteboardId, parent_node_id: currentRecipeListNodeId, node_type: 'recipe', payload: { recipe } })
+                .insert({ whiteboard_id: wbId, parent_node_id: recipeListNodeId, node_type: 'recipe', payload: { recipe } })
                 .select('id').single()
             )
           )
@@ -2696,20 +2685,23 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
             }
           })
           setCurrentRecipeNodeIds(prev => ({ ...prev, ...newIds }))
-          await supabase.from('exploration_nodes').update({ payload: { recipes: mergedSuggestions } }).eq('id', currentRecipeListNodeId)
-          await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', currentWhiteboardId)
+          await supabase.from('exploration_nodes').update({ payload: { recipes: mergedSuggestions } }).eq('id', recipeListNodeId)
+          await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', wbId)
         } catch (err) {
-          console.warn('[whiteboard] failed to persist retried suggestions:', err.message)
+          console.warn('[whiteboard] failed to persist see-more suggestions:', err.message)
         }
       }
+      return { mergedSuggestions }
     } catch (err) {
-      console.warn('[partial retry] failed:', err.message)
+      console.warn('[see more] failed:', err.message)
+      setSeeMoreError('Could not load more ideas. Please try again.')
+      return null
     } finally {
-      setPartialRetryLoading(false)
+      setSeeMoreLoading(false)
     }
   }
 
-  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setPartialSource(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2719,6 +2711,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
       const previousNames = (result?.suggestions || []).map(s => s.recipe_name)
       const data = await refineExplorations(selected, template, { frozen, lowABV, na }, inventoryText, previousNames, feedback.trim())
       setResult(data)
+      setOriginalsFetched(true) // refine already returns a full revised set; the tier-1/2 split no longer applies
       setFeedback('')
       setFeedbackBanner(true)
       setTimeout(() => feedbackBannerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50)
@@ -2790,6 +2783,10 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     goToStep('template')
   }
 
+  // Quick Build and Surprise Me skip the deliberate template-picker flow entirely, so
+  // per Decision B they pre-fire the tier-2/3 "See more" call right after tier-1 completes
+  // — preserving their existing "full set immediately" behavior instead of adopting the
+  // tier-1-first-then-opt-in flow used by the deliberate template-picker path.
   const handleQuickBuild = async () => {
     const fromStep = stepRef.current
     setTemplatePickerLoading(true)
@@ -2798,7 +2795,10 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
       const affinityMap = await ensureAffinityData()
       const resolved = await resolveTemplate(selected, affinityMap)
       setTemplate(resolved)
-      await handleExplore({ template: resolved, fromStep })
+      const tier1 = await handleExplore({ template: resolved, fromStep })
+      if (tier1 && !tier1.data.incompatible) {
+        await handleSeeMore({ template: resolved, whiteboardId: tier1.wbId, recipeListNodeId: tier1.recipeListNodeId, baseSuggestions: tier1.data.suggestions || [] })
+      }
     } finally {
       setTemplatePickerLoading(false)
     }
@@ -2811,7 +2811,10 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     try {
       const resolved = await resolveTemplate(selected, affinityData)
       setTemplate(resolved)
-      await handleExplore({ template: resolved, fromStep })
+      const tier1 = await handleExplore({ template: resolved, fromStep })
+      if (tier1 && !tier1.data.incompatible) {
+        await handleSeeMore({ template: resolved, whiteboardId: tier1.wbId, recipeListNodeId: tier1.recipeListNodeId, baseSuggestions: tier1.data.suggestions || [] })
+      }
     } finally {
       setTemplatePickerLoading(false)
     }
@@ -3218,19 +3221,6 @@ Rules:
           <div style={{ flex: 1, fontSize: 18, fontWeight: 700, color: C.text }}>{selected.join(' + ')}</div>
           <button onClick={reset} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap' }}>Start over</button>
         </div>
-        {partialSource && (
-          <div style={{ background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 8, padding: '8px 14px', marginBottom: 16, fontSize: 13, color: C.textMuted, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-            <span>
-              {partialSource === 'web'
-                ? "Couldn't load published recipes — showing originals only."
-                : "Couldn't create original recipes — showing published recipes only."}
-            </span>
-            <button onClick={handlePartialRetry} disabled={partialRetryLoading}
-              style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.amber, fontSize: 12, fontWeight: 600, padding: '4px 12px', cursor: partialRetryLoading ? 'default' : 'pointer', whiteSpace: 'nowrap', flexShrink: 0, opacity: partialRetryLoading ? 0.6 : 1 }}>
-              {partialRetryLoading ? 'Retrying…' : 'Retry'}
-            </button>
-          </div>
-        )}
         {result.flavor_profile_note && (
           <div style={{ background: C.gold + '12', border: `1px solid ${C.gold}33`, borderRadius: 10, padding: '12px 16px', marginBottom: result.pairs_well_with ? 8 : 24, fontSize: 14, color: C.text, lineHeight: 1.6 }}>
             ✨ {result.flavor_profile_note}
@@ -3240,11 +3230,6 @@ Rules:
           <div style={{ background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 10, padding: '12px 16px', marginBottom: 24, fontSize: 14, color: C.text, lineHeight: 1.6 }}>
             <div style={{ fontWeight: 600, color: C.amber, marginBottom: 4 }}>🔗 Pairs Well With</div>
             {result.pairs_well_with}
-          </div>
-        )}
-        {result.no_recipes_found && (
-          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.textFaint, marginBottom: 20, lineHeight: 1.5 }}>
-            No published recipes were found featuring all of these ingredients together. Showing original creations only.
           </div>
         )}
         <div style={{ opacity: isFeedbackLoading ? 0.4 : 1, transition: 'opacity 0.3s', pointerEvents: isFeedbackLoading ? 'none' : 'auto' }}>
@@ -3275,6 +3260,20 @@ Rules:
               <div style={{ fontSize: 12, color: C.textFaint, lineHeight: 1.4 }}>{result.cross_template_suggestion.reason}</div>
             </div>
             <span style={{ color: C.gold, fontSize: 18, flexShrink: 0 }}>→</span>
+          </div>
+        )}
+        {!originalsFetched && (
+          <div style={{ marginBottom: 24 }}>
+            {(result.suggestions || []).length === 0 && (
+              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.textFaint, marginBottom: 12, lineHeight: 1.5 }}>
+                No published recipes matched — a riff or an original might still work well.
+              </div>
+            )}
+            <button onClick={() => handleSeeMore()} disabled={seeMoreLoading}
+              style={{ width: '100%', background: 'none', border: `1px dashed ${C.border}`, borderRadius: 10, color: C.gold, fontSize: 13, fontWeight: 600, padding: '12px 16px', cursor: seeMoreLoading ? 'default' : 'pointer', opacity: seeMoreLoading ? 0.6 : 1 }}>
+              {seeMoreLoading ? 'Finding more ideas…' : 'See more ideas →'}
+            </button>
+            {seeMoreError && <div style={{ fontSize: 13, color: C.red, marginTop: 8 }}>{seeMoreError}</div>}
           </div>
         )}
         <div ref={feedbackBannerRef}>
