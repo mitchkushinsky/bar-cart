@@ -175,6 +175,76 @@ const TEMPLATES = [
 ]
 const TEMPLATE_MAP = Object.fromEntries(TEMPLATES.map(t => [t.id, t]))
 
+// Per-ingredient functional role, self-reported by the model on every tier-2/3
+// suggestion's recipe array (see analyzeExplorationsOriginals). "citrus" means citrus
+// juice used structurally — a peel/twist garnish is role "garnish", never "citrus".
+const RECIPE_ROLES = ['base', 'citrus', 'sweetener', 'modifier', 'bitters', 'lengthener', 'egg', 'dairy', 'garnish']
+const ROLE_LABELS = {
+  base: 'a base spirit',
+  citrus: 'fresh citrus juice',
+  sweetener: 'a sweetening element (syrup/sugar)',
+  modifier: 'a modifying element (vermouth, liqueur, or bitter aperitivo)',
+  bitters: 'bitters',
+  lengthener: 'a lengthening element (soda, tonic, or hot liquid)',
+  egg: 'a whole egg',
+  dairy: 'dairy/cream',
+  garnish: 'a garnish',
+}
+
+// Each template's structural signature: roles a valid build MUST include, and roles
+// it must NEVER include. Deliberately a plain data table (not embedded in prompt
+// strings or validation logic) so these are tunable independently of both — expect
+// to retune after seeing real generation output, especially Sour vs. Daisy and Spritz.
+// Only tier-2 (riff) and tier-3 (original) suggestions are validated against this;
+// tier-1 (published) is exempt — see analyzeExplorationsRecipes.
+const TEMPLATE_SIGNATURES = {
+  old_fashioned: { requiredRoles: ['base', 'sweetener', 'bitters'], forbiddenRoles: ['citrus'] },
+  manhattan_martini: { requiredRoles: ['base', 'modifier'], forbiddenRoles: ['citrus'] },
+  sour: { requiredRoles: ['base', 'citrus', 'sweetener'], forbiddenRoles: [] },
+  daisy: { requiredRoles: ['base', 'citrus', 'modifier'], forbiddenRoles: [] },
+  highball: { requiredRoles: ['base', 'lengthener'], forbiddenRoles: [] },
+  tiki: { requiredRoles: ['base', 'citrus', 'sweetener', 'modifier'], forbiddenRoles: [] },
+  bittersweet: { requiredRoles: ['base', 'modifier'], forbiddenRoles: ['citrus'] },
+  spritz: { requiredRoles: ['modifier', 'lengthener'], forbiddenRoles: ['citrus'] },
+  hot_drinks: { requiredRoles: ['base', 'sweetener', 'lengthener'], forbiddenRoles: [] },
+  flip: { requiredRoles: ['base', 'egg', 'sweetener'], forbiddenRoles: ['citrus'] },
+}
+
+// Imperative structural constraint block for tier-2/3 generation (and its regeneration
+// pass) only — tier-1 stays on the softer, descriptive buildTemplateContext, since a
+// real published recipe is presented as published or not at all, never "corrected."
+function buildTemplateConstraint(templateId) {
+  const sig = TEMPLATE_SIGNATURES[templateId]
+  const t = TEMPLATE_MAP[templateId]
+  if (!sig || !t) return ''
+  const required = sig.requiredRoles.map(r => ROLE_LABELS[r] || r).join(', ')
+  let block = `TEMPLATE STRUCTURE IS MANDATORY, NOT A SUGGESTION: every suggestion MUST include, among its recipe ingredients: ${required}.`
+  if (sig.forbiddenRoles.length > 0) {
+    const forbidden = sig.forbiddenRoles.map(r => ROLE_LABELS[r] || r).join(', ')
+    block += ` It must NEVER include: ${forbidden} — a ${t.name} does not have that. (A citrus peel/twist used only as garnish is fine — that's role "garnish", not "citrus".)`
+  }
+  block += ` If the featured ingredients cannot honestly be built into this structure, return fewer suggestions — even zero — rather than bending the template to fit. Two honest ${t.name}s beat four things that drifted from it.`
+  block += ` When a flavored liqueur is doing the sweetening (rather than a plain syrup), label its role "modifier", not "sweetener" — that distinction is what separates a Daisy from a Sour.`
+  return block
+}
+
+// Structure-only check: are the template's required roles present and forbidden roles
+// absent among this suggestion's recipe ingredients? Ratios, glassware, and technique
+// are not validated. Returns { valid, violations: [human-readable strings] }.
+function validateSuggestionStructure(suggestion, templateId) {
+  const sig = TEMPLATE_SIGNATURES[templateId]
+  if (!sig) return { valid: true, violations: [] }
+  const roles = (suggestion?.recipe || []).map(r => r.role).filter(Boolean)
+  const violations = []
+  for (const req of sig.requiredRoles) {
+    if (!roles.includes(req)) violations.push(`missing required role "${req}" (${ROLE_LABELS[req] || req})`)
+  }
+  for (const forb of sig.forbiddenRoles) {
+    if (roles.includes(forb)) violations.push(`contains forbidden role "${forb}" (${ROLE_LABELS[forb] || forb})`)
+  }
+  return { valid: violations.length === 0, violations }
+}
+
 const NA_KEYWORDS = ['cucumber', 'mint', 'grapefruit', 'ginger', 'lemongrass', 'lime', 'lemon', 'juice', 'soda', 'tonic', 'syrup', 'tea']
 function isLikelyNonAlcoholic(name, inventory) {
   const norm = name.trim().toLowerCase()
@@ -514,15 +584,19 @@ SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated
 
 First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
-Otherwise use web search to find 2–3 published cocktail recipes within this template's family — prioritize the template's own named classics and close variants. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
+Otherwise, scope your web search itself to this template's family — search for terms like "published sour cocktail recipes with [ingredient]" or "[ingredient] Manhattan variation," not just "[ingredient] cocktail" — to find 2–3 published recipes that genuinely belong to this template. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
+
+If a published recipe you find doesn't genuinely belong to this template's family, leave it out of your results rather than including it anyway — never rewrite, restructure, or "correct" a real published recipe to make it fit. A published recipe is presented exactly as published, or not at all.
 
 CRITICAL: Every recipe suggestion MUST include ALL featured ingredients (${ingredients.join(', ')}). Do NOT suggest recipes that omit any featured ingredient — even if fewer results are available as a result.
 
 If you cannot find 2–3 published recipes that include ALL featured ingredients, return as many as you can find (even 0 or 1). If no qualifying published recipes exist, return an empty suggestions array and set "no_recipes_found": true. Do NOT invent original recipes in this call — that is handled separately.
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
-For each suggestion, also report the specific page you found it on as "citation": { "title": "string", "url": "string" }, using the exact title and URL from your search results for that suggestion. If you are not confident which specific page a suggestion came from, set citation to null — never invent or guess a title or URL.
+If — and only if — you are genuinely confident of the recipe's origin (who created it, and where/when), weave that attribution into the summary prose, e.g. "Created by Audrey Saunders at Pegu Club, 2005." Most published recipes don't have a confidently attributable origin — when you don't know, simply don't mention it. Never guess or imply an origin you're not sure of; staying silent is always better than a wrong or invented attribution.
+
+Every entry in each suggestion's "recipe" array must include a "role" field from this fixed enum, describing its functional role in the build: base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish. "citrus" means citrus juice used as a structural component — a citrus peel or twist used only as garnish is role "garnish", not "citrus". Every ingredient in the recipe gets exactly one role.
 
 Separately, check whether these exact featured ingredients are also the basis of a different well-known published drink that belongs to a DIFFERENT template than the one chosen above. Only populate cross_template_suggestion if there's a genuine, well-known match — otherwise leave it null. Do not force one.
 
@@ -543,7 +617,7 @@ Return ONLY valid JSON with no markdown fences:
       "can_make_now": true,
       "missing_ingredients": [],
       "summary": "1-2 sentence description including a flavor characterization",
-      "recipe": [{ "ingredient": "string", "amount": "string" }],
+      "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }],
       "instructions": "string",
       "glass_type": "coupe | rocks | tiki | collins | null",
       "ingredients": [
@@ -556,12 +630,11 @@ Return ONLY valid JSON with no markdown fences:
           "flavor_impact": "string or null"
         }
       ],
-      "technique_notes": "string or null",
-      "citation": { "title": "string", "url": "string" }
+      "technique_notes": "string or null"
     }
   ]
 }
-cross_template_suggestion must be null (not omitted) when there is no genuine match. citation must be null (not omitted) when you are not confident of the specific source page.`,
+cross_template_suggestion must be null (not omitted) when there is no genuine match.`,
     }],
   }
   const firstText = await callClaudeText(body)
@@ -584,19 +657,62 @@ cross_template_suggestion must be null (not omitted) when there is no genuine ma
   // compatibility field consumed by Favorites/On Deck saves (a real DB column),
   // and every suggestion from this call is always "from_recipe" regardless of
   // the new self-reported origin value, so deriving it guarantees consistency.
-  // citation is validated rather than trusted as-is: the model is asked to self-report
-  // {title, url} per suggestion (Claude's API does not attach real citation metadata to
-  // text content when the prompt demands raw JSON output, confirmed by inspecting a raw
-  // response), so anything short of a complete, well-formed pair is treated as no citation
-  // rather than risking a fabricated or malformed source reaching the UI.
-  if (data?.suggestions) data.suggestions = data.suggestions.map(s => ({
-    ...s,
-    origin_flag: 'from_recipe',
-    citation: (s.citation && typeof s.citation.title === 'string' && s.citation.title.trim() && typeof s.citation.url === 'string' && s.citation.url.trim())
-      ? { title: s.citation.title.trim(), url: s.citation.url.trim() }
-      : null,
-  }))
+  if (data?.suggestions) data.suggestions = data.suggestions.map(s => ({ ...s, origin_flag: 'from_recipe' }))
   return data
+}
+
+// Single-suggestion regeneration after a template-structure validation failure (Change
+// 5). Asks for exactly one corrected suggestion, naming the specific violation, and
+// allows the model to honestly decline (return null) rather than force a bad fit.
+async function regenerateOriginalSuggestion(ingredients, template, modifiers, inventoryText, failedSuggestion, violations) {
+  const t = TEMPLATE_MAP[template]
+  const body = {
+    model: MODEL,
+    max_tokens: 1200,
+    messages: [{
+      role: 'user',
+      content: `You are an expert craft bartender. Your previous suggestion "${failedSuggestion?.recipe_name || 'suggestion'}" violated the ${t?.name || template} template's structure: ${violations.join('; ')}.
+
+FEATURED INGREDIENTS: ${ingredients.join(' and ')}
+
+${buildTemplateContext(template, modifiers)}
+
+${buildTemplateConstraint(template)}
+
+BAR INVENTORY:
+${inventoryText}
+
+Regenerate ONE corrected cocktail suggestion for the featured ingredients that genuinely fits this template's structure. If no honest fit exists even after correcting for the violation above, return {"suggestion": null} — do not force a bad fit.
+
+Set "origin" honestly ("riff" if it's a substitution into the template's usual formula, "original" only as a rare last resort). Every entry in the "recipe" array must include a "role" field from this fixed enum: ${RECIPE_ROLES.join(' | ')}. "citrus" means citrus juice used structurally; a peel/twist garnish is role "garnish".
+
+Return ONLY valid JSON, no markdown fences:
+{
+  "suggestion": {
+    "recipe_name": "string",
+    "origin": "riff | original",
+    "difficulty": "easy | medium | hard",
+    "difficulty_note": "string",
+    "can_make_now": true,
+    "missing_ingredients": [],
+    "summary": "string",
+    "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }],
+    "instructions": "string",
+    "glass_type": "coupe | rocks | tiki | collins | null",
+    "ingredients": [{ "ingredient": "string", "status": "found | substitute | missing", "location": "string or null", "substitute": "string or null", "substitute_location": "string or null", "flavor_impact": "string or null" }],
+    "technique_notes": "string or null"
+  }
+}
+"suggestion" must be null (not omitted) if no honest fit exists.`,
+    }],
+  }
+  const text = await callClaudeText(body)
+  try {
+    const parsed = extractJSON(text)
+    return parsed?.suggestion || null
+  } catch (_) {
+    return null
+  }
 }
 
 async function analyzeExplorationsOriginals(ingredients, template, modifiers, inventoryText) {
@@ -615,6 +731,8 @@ FEATURED INGREDIENTS: ${ingredients.join(' and ')}
 
 ${buildTemplateContext(template, modifiers)}
 
+${buildTemplateConstraint(template)}
+
 BAR INVENTORY:
 ${inventoryText}
 
@@ -622,7 +740,7 @@ SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated
 
 First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
-Otherwise invent 2–3 cocktails that showcase the featured ingredients using this priority order, and set each suggestion's "origin" field honestly to reflect which path you actually used — do not default every suggestion to the same value:
+Otherwise invent up to 2–3 cocktails that showcase the featured ingredients using this priority order, and set each suggestion's "origin" field honestly to reflect which path you actually used — do not default every suggestion to the same value:
 1. DEFAULT — origin: "riff": take the template's usual formula above and substitute the featured ingredients (and available bar inventory) into its ratio slots. This is how most real cocktails are made and should be your primary approach for every suggestion.
 2. LAST RESORT — origin: "original": only when no reasonable substitution into the template's formula exists, invent a drink that still honors the template's mechanic (stirred/shaken/built/etc.) and general spirit-forward-vs-lengthened character. Do not reach for this by default — it should be rare, and you must set origin: "original" honestly rather than mislabeling an actual substitution as a riff.
 For either path, suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate, and check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
@@ -631,7 +749,9 @@ CRITICAL: Every cocktail MUST feature ALL of the featured ingredients (${ingredi
 
 Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false (something worth buying an ingredient for), unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists.
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+
+Every entry in each suggestion's "recipe" array must include a "role" field from this fixed enum, describing its functional role in the build: ${RECIPE_ROLES.join(' | ')}. "citrus" means citrus juice used as a structural component — a citrus peel or twist used only as garnish is role "garnish", not "citrus". Every ingredient in the recipe gets exactly one role.
 
 Return ONLY valid JSON with no markdown fences:
 {
@@ -649,7 +769,7 @@ Return ONLY valid JSON with no markdown fences:
       "can_make_now": true,
       "missing_ingredients": [],
       "summary": "1-2 sentence description including a flavor characterization",
-      "recipe": [{ "ingredient": "string", "amount": "string" }],
+      "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }],
       "instructions": "string",
       "glass_type": "coupe | rocks | tiki | collins | null",
       "ingredients": [
@@ -685,12 +805,38 @@ cross_template_suggestion is always null from this call — leave it exactly as 
     })
     data = extractJSON(retryText)
   }
+
+  // Change 4/5: code-side structural validation against the chosen template's signature.
+  // Every suggestion here is tier-2/3 (riff/original) — tier-1 published recipes never
+  // pass through this function. On failure, regenerate that one suggestion once with the
+  // specific violation named; if it fails again, drop it. Partial results are expected
+  // and fine — never let validation empty a result set that had valid members.
+  if (data?.suggestions?.length > 0) {
+    const validated = []
+    for (const s of data.suggestions) {
+      const check = validateSuggestionStructure(s, template)
+      if (check.valid) { validated.push(s); continue }
+      console.warn('[template validation] failed, regenerating once:', { template, recipe_name: s.recipe_name, violations: check.violations, ingredients })
+      const regenerated = await regenerateOriginalSuggestion(ingredients, template, modifiers, inventoryText, s, check.violations)
+      if (!regenerated) {
+        console.warn('[template validation] regeneration declined, dropping suggestion:', { template, ingredients })
+        continue
+      }
+      const recheck = validateSuggestionStructure(regenerated, template)
+      if (recheck.valid) {
+        validated.push(regenerated)
+      } else {
+        console.warn('[template validation] regeneration still invalid, dropping suggestion:', { template, recipe_name: regenerated.recipe_name, violations: recheck.violations, ingredients })
+      }
+    }
+    data.suggestions = validated
+  }
+
   // Both riff and original map to the same legacy origin_flag value — that field
   // only ever distinguished "from the web-search call" vs "from this call," and
   // this call's suggestions were always origin_flag: "original" regardless of
   // which internal tier the model used. Preserved exactly for Favorites/On Deck.
-  // citation is always null here — nothing from this call is a real published source.
-  if (data?.suggestions) data.suggestions = data.suggestions.map(s => ({ ...s, origin_flag: 'original', citation: null }))
+  if (data?.suggestions) data.suggestions = data.suggestions.map(s => ({ ...s, origin_flag: 'original' }))
   return data
 }
 
@@ -2227,13 +2373,6 @@ function RecipeCard({
       </div>
 
       {displayed.summary && <p style={{ fontSize: 14, color: C.textMuted, lineHeight: 1.55, marginBottom: 10 }}>{displayed.summary}</p>}
-
-      {displayed.citation?.url && (
-        <a href={displayed.citation.url} target="_blank" rel="noopener noreferrer"
-          style={{ display: 'inline-block', fontSize: 12, color: C.textFaint, marginBottom: 10, textDecoration: 'underline' }}>
-          📖 {displayed.citation.title || 'View source'}
-        </a>
-      )}
 
       {lineage && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12, color: C.textFaint, marginBottom: 10 }}>
