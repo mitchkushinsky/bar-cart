@@ -38,6 +38,11 @@
 // alter table to_make add column if not exists status text default 'ondeck';
 // alter table to_make add column if not exists primary_ingredients jsonb default '[]';
 //
+// Session 3d: origin (published/riff/original) never persisted past the exploration —
+// only the legacy two-way origin_flag did. New rows only; no backfill of existing data.
+// alter table favorites add column if not exists origin text;
+// alter table to_make add column if not exists origin text;
+//
 // create table if not exists in_the_lab (
 //   id uuid default gen_random_uuid() primary key,
 //   user_id uuid references auth.users not null,
@@ -244,6 +249,15 @@ function validateSuggestionStructure(suggestion, templateId) {
   }
   return { valid: violations.length === 0, violations }
 }
+
+// Shared between analyzeExplorationsOriginals and regenerateOriginalSuggestion (both
+// tier-2/3 only — tier-1 published recipes are exempt) so the scope and voice can't
+// drift between the two call sites. Follows the same "only if genuinely worth saying,
+// otherwise null, do not force one" pattern already proven by cross_template_suggestion.
+const WATCH_OUTS_INSTRUCTION = `For each suggestion, also consider a "watch_outs" note — but only in two specific cases, and only when there's genuinely something worth saying:
+1. TEMPLATE DRIFT: the drink is structurally valid but stylistically pulls toward a different, specific classic outside this template's family (e.g. a vodka Manhattan/Martini whose coffee liqueur pulls it toward Black Manhattan territory).
+2. AFFINITY CLASH: a specific ingredient pairing likely to fight rather than complement, or one component likely to dominate and flatten the others.
+Do NOT use it for anything the template already conveys, anything visible in the ingredient list, technique difficulty (difficulty_note already covers that), or generic hedging like "adjust to taste." Most suggestions should get null — a watch-out means something because it's uncommon; if you find yourself writing one for nearly every suggestion, you're being too permissive. Voice: terse, direct, expert — like a colleague saying "heads up, the Cynar is going to fight the Carpano here," not a disclaimer. No affirmations, no hedging, no apology. Set "watch_outs" to null (not omitted) when there's nothing worth flagging.`
 
 const NA_KEYWORDS = ['cucumber', 'mint', 'grapefruit', 'ginger', 'lemongrass', 'lime', 'lemon', 'juice', 'soda', 'tonic', 'syrup', 'tea']
 function isLikelyNonAlcoholic(name, inventory) {
@@ -686,6 +700,8 @@ Regenerate ONE corrected cocktail suggestion for the featured ingredients that g
 
 Set "origin" honestly ("riff" if it's a substitution into the template's usual formula, "original" only as a rare last resort). Every entry in the "recipe" array must include a "role" field from this fixed enum: ${RECIPE_ROLES.join(' | ')}. "citrus" means citrus juice used structurally; a peel/twist garnish is role "garnish".
 
+${WATCH_OUTS_INSTRUCTION}
+
 Return ONLY valid JSON, no markdown fences:
 {
   "suggestion": {
@@ -700,10 +716,11 @@ Return ONLY valid JSON, no markdown fences:
     "instructions": "string",
     "glass_type": "coupe | rocks | tiki | collins | null",
     "ingredients": [{ "ingredient": "string", "status": "found | substitute | missing", "location": "string or null", "substitute": "string or null", "substitute_location": "string or null", "flavor_impact": "string or null" }],
-    "technique_notes": "string or null"
+    "technique_notes": "string or null",
+    "watch_outs": "string or null"
   }
 }
-"suggestion" must be null (not omitted) if no honest fit exists.`,
+"suggestion" must be null (not omitted) if no honest fit exists. watch_outs must be null (not omitted) when there's nothing worth flagging.`,
     }],
   }
   const text = await callClaudeText(body)
@@ -753,6 +770,8 @@ Each suggestion MUST include ALL of these fields with non-empty values: recipe_n
 
 Every entry in each suggestion's "recipe" array must include a "role" field from this fixed enum, describing its functional role in the build: ${RECIPE_ROLES.join(' | ')}. "citrus" means citrus juice used as a structural component — a citrus peel or twist used only as garnish is role "garnish", not "citrus". Every ingredient in the recipe gets exactly one role.
 
+${WATCH_OUTS_INSTRUCTION}
+
 Return ONLY valid JSON with no markdown fences:
 {
   "incompatible": false,
@@ -782,11 +801,12 @@ Return ONLY valid JSON with no markdown fences:
           "flavor_impact": "string or null"
         }
       ],
-      "technique_notes": "string or null"
+      "technique_notes": "string or null",
+      "watch_outs": "string or null"
     }
   ]
 }
-cross_template_suggestion is always null from this call — leave it exactly as shown.`,
+cross_template_suggestion is always null from this call — leave it exactly as shown. watch_outs must be null (not omitted) when there's nothing worth flagging.`,
     }],
   }
   const firstText = await callClaudeText(body)
@@ -1669,7 +1689,7 @@ function FavoriteCard({ fav, onRemove, onView, onUpdateNote }) {
           <div style={{ fontWeight: 700, fontSize: 16, color: C.gold, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 7 }}>{fav.recipeName}{fav.glassType && <GlassIcon type={fav.glassType} size={15} />}</div>
           {fav.source === 'Exploration' && (
             <div style={{ display: 'flex', gap: 6, marginBottom: 6, flexWrap: 'wrap' }}>
-              <OriginBadge originFlag={fav.originFlag} />
+              <OriginBadge origin={fav.origin} originFlag={fav.originFlag} />
               <DifficultyBadge difficulty={fav.difficulty} />
             </div>
           )}
@@ -1741,7 +1761,7 @@ function ToMakeCard({ item, onRemove, onView }) {
           <div style={{ fontWeight: 700, fontSize: 16, color: C.blue, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 7 }}>{item.recipeName}{item.glassType && <GlassIcon type={item.glassType} size={15} />}</div>
           {item.source === 'Exploration' && (
             <div style={{ display: 'flex', gap: 6, marginBottom: 6, flexWrap: 'wrap' }}>
-              <OriginBadge originFlag={item.originFlag} />
+              <OriginBadge origin={item.origin} originFlag={item.originFlag} />
               <DifficultyBadge difficulty={item.difficulty} />
             </div>
           )}
@@ -2333,7 +2353,18 @@ function RecipeCard({
   const handleTweakApply = async ({ prompt, result, conversation, tweakLabel }) => {
     const parentNodeId = recipeNodeIdRef.current
     const parentName = displayed.recipe_name || suggestion.recipe_name
-    setTweakedSuggestion(result)
+    // origin is derived from the parent, never asked of the model: once a drink leaves
+    // tier-1 it cannot return, so a published parent's tweak is a riff (a canonical
+    // formula with a part swapped is the definition of a riff), while a riff or original
+    // parent's tweak stays exactly what it was. `displayed.origin` is the current
+    // (possibly already-tweaked) state, so this derivation cascades correctly across
+    // repeated tweaks. A legacy parent with no origin leaves the tweak's origin unset,
+    // letting the origin_flag fallback in OriginBadge handle it.
+    const parentOrigin = displayed.origin
+    const stampedResult = parentOrigin
+      ? { ...result, origin: parentOrigin === 'published' ? 'riff' : parentOrigin }
+      : result
+    setTweakedSuggestion(stampedResult)
     setTweakDone(true)
     // The tweak is a new, untasted version of the recipe — its own identity, own
     // node id going forward. Tried/notes must never bleed over from the parent.
@@ -2345,8 +2376,8 @@ function RecipeCard({
     if (user && whiteboardId && parentNodeId) {
       try {
         const payload = conversation?.length > 0
-          ? { prompt, result, conversation, tweak_label: tweakLabel || null }
-          : { prompt, result, tweak_label: tweakLabel || null }
+          ? { prompt, result: stampedResult, conversation, tweak_label: tweakLabel || null }
+          : { prompt, result: stampedResult, tweak_label: tweakLabel || null }
         const { data } = await supabase.from('exploration_nodes').insert({ whiteboard_id: whiteboardId, parent_node_id: parentNodeId, node_type: 'tweak', payload }).select('id').single()
         if (data?.id) recipeNodeIdRef.current = data.id
         await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId)
@@ -2373,6 +2404,8 @@ function RecipeCard({
       </div>
 
       {displayed.summary && <p style={{ fontSize: 14, color: C.textMuted, lineHeight: 1.55, marginBottom: 10 }}>{displayed.summary}</p>}
+
+      {displayed.watch_outs && <p style={{ fontSize: 12, color: C.textFaint, fontStyle: 'italic', lineHeight: 1.5, marginTop: -4, marginBottom: 10 }}>{displayed.watch_outs}</p>}
 
       {lineage && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12, color: C.textFaint, marginBottom: 10 }}>
@@ -2533,6 +2566,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   const [originalsFetched, setOriginalsFetched] = useState(false)
   const [seeMoreLoading, setSeeMoreLoading] = useState(false)
   const [seeMoreError, setSeeMoreError] = useState(null)
+  const [viaSurpriseMe, setViaSurpriseMe] = useState(false)
   const [loadingMsgIdx, setLoadingMsgIdx] = useState(0)
   const [affinityData, setAffinityData] = useState({})
   const [affinityLoading, setAffinityLoading] = useState(false)
@@ -2698,6 +2732,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setStep('loading')
     setOriginalsFetched(false)
     setSeeMoreError(null)
+    setViaSurpriseMe(!!opts.viaSurpriseMe)
     setRestoreNodeData({})
     setAutoExpandNodeData(null)
     try {
@@ -2840,7 +2875,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
-  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2950,7 +2985,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     try {
       const resolved = await resolveTemplate(selected, affinityData)
       setTemplate(resolved)
-      const tier1 = await handleExplore({ template: resolved, fromStep })
+      const tier1 = await handleExplore({ template: resolved, fromStep, viaSurpriseMe: true })
       if (tier1 && !tier1.data.incompatible) {
         await handleSeeMore({ template: resolved, whiteboardId: tier1.wbId, recipeListNodeId: tier1.recipeListNodeId, baseSuggestions: tier1.data.suggestions || [] })
       }
@@ -3389,12 +3424,19 @@ Rules:
             </div>
           )}
         </div>
-        {result.cross_template_suggestion && TEMPLATE_MAP[result.cross_template_suggestion.template] && (
+        {/* Suppressed after Surprise Me (Change 5) — the model already picked the template
+            there, so a redirect a moment later reads as second-guessing its own choice. */}
+        {!viaSurpriseMe && result.cross_template_suggestion && TEMPLATE_MAP[result.cross_template_suggestion.template] && (
           <div onClick={() => handleCrossTemplateSuggestion(result.cross_template_suggestion.template)}
             style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 20, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
             <div>
-              <div style={{ fontSize: 14, fontWeight: 600, color: C.text, marginBottom: 2 }}>
-                {TEMPLATE_MAP[result.cross_template_suggestion.template].emoji} These ingredients are also the classic {result.cross_template_suggestion.drink_name} ({TEMPLATE_MAP[result.cross_template_suggestion.template].name})
+              <div style={{ fontSize: 14, fontWeight: 600, color: C.text, marginBottom: 6 }}>
+                These ingredients are the base of the classic {result.cross_template_suggestion.drink_name}
+              </div>
+              <div style={{ marginBottom: 6 }}>
+                <span style={{ fontSize: 11, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, padding: '2px 7px', color: C.textMuted }}>
+                  {TEMPLATE_MAP[result.cross_template_suggestion.template].emoji} {TEMPLATE_MAP[result.cross_template_suggestion.template].name}
+                </span>
               </div>
               <div style={{ fontSize: 12, color: C.textFaint, lineHeight: 1.4 }}>{result.cross_template_suggestion.reason}</div>
             </div>
@@ -4020,7 +4062,7 @@ export default function App() {
     recipe: row.recipe || [], instructions: row.instructions || null,
     ingredients: row.ingredients || [], variations: row.variations || [],
     glassType: row.glass_type || null, note: row.notes || '', mode: row.mode,
-    source: row.source || 'manual', originFlag: row.origin_flag || null,
+    source: row.source || 'manual', origin: row.origin || null, originFlag: row.origin_flag || null,
     difficulty: row.difficulty || null, primaryIngredients: row.primary_ingredients || [],
     savedAt: row.saved_at,
   })
@@ -4030,7 +4072,7 @@ export default function App() {
     recipe: row.recipe || [], instructions: row.instructions || null,
     ingredients: row.ingredients || [], variations: row.variations || [],
     glassType: row.glass_type || null, mode: row.mode,
-    source: row.source || 'manual', originFlag: row.origin_flag || null,
+    source: row.source || 'manual', origin: row.origin || null, originFlag: row.origin_flag || null,
     difficulty: row.difficulty || null, primaryIngredients: row.primary_ingredients || [],
     savedAt: row.saved_at,
   })
@@ -4265,7 +4307,7 @@ export default function App() {
 
   // Favorites helpers
   const toggleFavorite = async (res, extras = {}) => {
-    const { source = 'manual', originFlag = null, difficulty = null, primaryIngredients = [] } = extras
+    const { source = 'manual', origin = null, originFlag = null, difficulty = null, primaryIngredients = [] } = extras
     if (user) {
       const existing = favorites.find(f => f.recipeName === res.recipe_name)
       if (existing) {
@@ -4276,7 +4318,7 @@ export default function App() {
           user_id: user.id, recipe_name: res.recipe_name, summary: res.summary || null,
           recipe: res.recipe || [], instructions: res.instructions || null,
           ingredients: res.ingredients || [], variations: res.variations || [],
-          glass_type: res.glass_type || null, source, origin_flag: originFlag,
+          glass_type: res.glass_type || null, source, origin, origin_flag: originFlag,
           difficulty, primary_ingredients: primaryIngredients, saved_at: new Date().toISOString(),
         }).select().single()
         if (!error && data) setFavorites(prev => [dbFavToLocal(data), ...prev])
@@ -4285,7 +4327,7 @@ export default function App() {
       setFavorites(prev => {
         const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
         if (existing >= 0) return prev.filter((_, i) => i !== existing)
-        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, note: '', source, originFlag, difficulty, primaryIngredients, savedAt: new Date().toISOString() }, ...prev]
+        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, note: '', source, origin, originFlag, difficulty, primaryIngredients, savedAt: new Date().toISOString() }, ...prev]
       })
     }
   }
@@ -4302,7 +4344,7 @@ export default function App() {
 
   // To Make helpers
   const toggleToMake = async (res, extras = {}) => {
-    const { source = 'manual', originFlag = null, difficulty = null, primaryIngredients = [] } = extras
+    const { source = 'manual', origin = null, originFlag = null, difficulty = null, primaryIngredients = [] } = extras
     if (user) {
       const existing = toMake.find(f => f.recipeName === res.recipe_name)
       if (existing) {
@@ -4313,7 +4355,7 @@ export default function App() {
           user_id: user.id, recipe_name: res.recipe_name, summary: res.summary || null,
           recipe: res.recipe || [], instructions: res.instructions || null,
           ingredients: res.ingredients || [], variations: res.variations || [],
-          glass_type: res.glass_type || null, source, origin_flag: originFlag,
+          glass_type: res.glass_type || null, source, origin, origin_flag: originFlag,
           difficulty, primary_ingredients: primaryIngredients, saved_at: new Date().toISOString(),
         }).select().single()
         if (!error && data) setToMake(prev => [dbToMakeToLocal(data), ...prev])
@@ -4322,7 +4364,7 @@ export default function App() {
       setToMake(prev => {
         const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
         if (existing >= 0) return prev.filter((_, i) => i !== existing)
-        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, source, originFlag, difficulty, primaryIngredients, savedAt: new Date().toISOString() }, ...prev]
+        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, source, origin, originFlag, difficulty, primaryIngredients, savedAt: new Date().toISOString() }, ...prev]
       })
     }
   }
@@ -4335,7 +4377,7 @@ export default function App() {
   const viewToMake = (item) => {
     sourceScrollRef.current = window.scrollY
     setError(null); setAdjustmentNote(null)
-    setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType })
+    setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType, origin: item.origin, origin_flag: item.originFlag, difficulty: item.difficulty, source: item.source })
     setResultSource('ondeck')
     setScreen('analyze')
   }
@@ -4343,7 +4385,7 @@ export default function App() {
   const viewFavorite = (fav) => {
     sourceScrollRef.current = window.scrollY
     setError(null); setAdjustmentNote(null)
-    setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType })
+    setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType, origin: fav.origin, origin_flag: fav.originFlag, difficulty: fav.difficulty, source: fav.source })
     setResultSource('favorites')
     setScreen('analyze')
   }
@@ -4502,7 +4544,7 @@ export default function App() {
   const inventoryText = inventory ? inventoryToText(inventory) : ''
 
   const handleSaveOnDeckFromExploration = (suggestion, primaryIngredients) => {
-    toggleToMake({ recipe_name: suggestion.recipe_name, summary: suggestion.summary, recipe: suggestion.recipe, instructions: suggestion.instructions, ingredients: suggestion.ingredients, variations: suggestion.variations || [], glass_type: suggestion.glass_type }, { source: 'Exploration', originFlag: suggestion.origin_flag, difficulty: suggestion.difficulty, primaryIngredients })
+    toggleToMake({ recipe_name: suggestion.recipe_name, summary: suggestion.summary, recipe: suggestion.recipe, instructions: suggestion.instructions, ingredients: suggestion.ingredients, variations: suggestion.variations || [], glass_type: suggestion.glass_type }, { source: 'Exploration', origin: suggestion.origin, originFlag: suggestion.origin_flag, difficulty: suggestion.difficulty, primaryIngredients })
   }
 
   return (
@@ -4703,9 +4745,9 @@ export default function App() {
                 shoppingList={shoppingList}
                 onAddToList={addToShopping}
                 favorites={favorites}
-                onToggleFavorite={res => toggleFavorite(res, { source: analysisModeSource })}
+                onToggleFavorite={res => toggleFavorite(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty })}
                 toMake={toMake}
-                onToggleToMake={res => toggleToMake(res, { source: analysisModeSource })}
+                onToggleToMake={res => toggleToMake(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty })}
                 onFeedback={handleFeedback}
                 feedbackLoading={feedbackLoading}
                 inventory={inventory}
