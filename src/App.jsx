@@ -259,6 +259,30 @@ const WATCH_OUTS_INSTRUCTION = `For each suggestion, also consider a "watch_outs
 2. AFFINITY CLASH: a specific ingredient pairing likely to fight rather than complement, or one component likely to dominate and flatten the others.
 Do NOT use it for anything the template already conveys, anything visible in the ingredient list, technique difficulty (difficulty_note already covers that), or generic hedging like "adjust to taste." Most suggestions should get null — a watch-out means something because it's uncommon; if you find yourself writing one for nearly every suggestion, you're being too permissive. Voice: terse, direct, expert — like a colleague saying "heads up, the Cynar is going to fight the Carpano here," not a disclaimer. No affirmations, no hedging, no apology. Set "watch_outs" to null (not omitted) when there's nothing worth flagging.`
 
+// Shared between analyzeExplorationsOriginals and regenerateOriginalSuggestion. The
+// failure mode this guards against: treating "generate riffs" as an enumeration task
+// (every constructible bottle swap) instead of a judgment task (only the swaps that
+// actually change the drink). Points 1-2 apply to any single riff/original; points
+// 3-4 (batch-only distinctness and the hard cap) are appended separately where a full
+// batch is being generated, not for a single corrective regeneration.
+const RIFF_DISCIPLINE_CORE = `RIFF DISCIPLINE — a riff is a judgment call, not an enumeration:
+1. MEANINGFUL SWAPS ONLY. A same-category, different-producer substitution is not a riff — Rittenhouse where a recipe calls for Sazerac Rye is the same drink, not a new one; that belongs to substitution/annotation, not generation. The test: does this swap change the drink enough that it would need its own name? Cynar for sweet vermouth in a Manhattan is a different drink. Carpano for Punt e Mes is a preference.
+2. AT MOST TWO REPLACEMENTS from the canonical formula. Beyond two, the result is closer to an original than a riff, and the lineage stops being legible.`
+
+const RIFF_DISCIPLINE_BATCH = `${RIFF_DISCIPLINE_CORE}
+3. DISTINCTNESS WITHIN THE SET. Two returned riffs that differ only by an interchangeable bottle are one riff — return the better one, not both.
+Above all three: generate as many riffs as are genuinely good, not as many as are constructible. Four good riffs beat twelve mechanical ones. If only two are genuinely distinct, two is the honest answer — the same principle as tier-1 returning an empty state rather than stretching.
+4. HARD CAP: at most 4 suggestions total in this batch, and fewer whenever fewer are genuinely distinct. This is a ceiling, not a quota — "return 4" is wrong when only 2 are genuinely good. Two good riffs is a correct and complete answer.`
+
+// Riffs are the middle rung of the ladder and should lead within each ownership
+// section (Can Make Now / Worth Buying For) — published items are already tier-1-first
+// by construction, so ranking them 0 just preserves that; this exists to fix riff-vs-
+// original ordering, which the model doesn't reliably emit in generation order.
+const ORIGIN_RANK = { published: 0, riff: 1, original: 2 }
+function sortByOriginRank(suggestions) {
+  return [...suggestions].sort((a, b) => (ORIGIN_RANK[a?.origin] ?? 3) - (ORIGIN_RANK[b?.origin] ?? 3))
+}
+
 const NA_KEYWORDS = ['cucumber', 'mint', 'grapefruit', 'ginger', 'lemongrass', 'lime', 'lemon', 'juice', 'soda', 'tonic', 'syrup', 'tea']
 function isLikelyNonAlcoholic(name, inventory) {
   const norm = name.trim().toLowerCase()
@@ -576,7 +600,7 @@ A split base (two complementary spirits) is a valid output when the inventory an
   return block
 }
 
-async function analyzeExplorationsRecipes(ingredients, template, modifiers, inventoryText) {
+async function analyzeExplorationsRecipes(ingredients, template, modifiers, inventoryText, excludeNames = []) {
   const body = {
     model: MODEL,
     max_tokens: 3000,
@@ -599,12 +623,14 @@ SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated
 First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
 Otherwise, scope your web search itself to this template's family — search for terms like "published sour cocktail recipes with [ingredient]" or "[ingredient] Manhattan variation," not just "[ingredient] cocktail" — to find 2–3 published recipes that genuinely belong to this template. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
-
+${excludeNames.length > 0 ? `\nALREADY SURFACED — the user has already seen these recipes, do not return them again, find genuinely different published recipes: ${excludeNames.join(', ')}.\n` : ''}
 If a published recipe you find doesn't genuinely belong to this template's family, leave it out of your results rather than including it anyway — never rewrite, restructure, or "correct" a real published recipe to make it fit. A published recipe is presented exactly as published, or not at all.
 
 CRITICAL: Every recipe suggestion MUST include ALL featured ingredients (${ingredients.join(', ')}). Do NOT suggest recipes that omit any featured ingredient — even if fewer results are available as a result.
 
 If you cannot find 2–3 published recipes that include ALL featured ingredients, return as many as you can find (even 0 or 1). If no qualifying published recipes exist, return an empty suggestions array and set "no_recipes_found": true. Do NOT invent original recipes in this call — that is handled separately.
+
+Separately from how many you return, report whether more genuinely exist: set "more_published_exist" to true only if you are aware of ADDITIONAL genuine published recipes for this ingredient/template combination beyond the ones you returned here — not ones you're merely guessing might exist. Set it false if these are all that genuinely exist, or if you found none at all. Do not set it true speculatively; false is a real and useful answer that tells the user something true about the canon. This field must be present on every response, including when no_recipes_found is true (where it should ordinarily be false).
 
 Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
@@ -619,6 +645,7 @@ Return ONLY valid JSON with no markdown fences:
   "incompatible": false,
   "incompatibility_reason": null,
   "no_recipes_found": false,
+  "more_published_exist": false,
   "flavor_profile_note": "1-2 sentences on why these ingredients work together",
   "pairs_well_with": "2-3 strongest flavor affinities only — one short sentence, not an exhaustive list",
   "cross_template_suggestion": { "template": "one of: old_fashioned, manhattan_martini, sour, daisy, highball, tiki, bittersweet, spritz, hot_drinks, flip", "drink_name": "string", "reason": "one concise sentence" },
@@ -648,7 +675,7 @@ Return ONLY valid JSON with no markdown fences:
     }
   ]
 }
-cross_template_suggestion must be null (not omitted) when there is no genuine match.`,
+cross_template_suggestion must be null (not omitted) when there is no genuine match. more_published_exist must be present (not omitted) on every response.`,
     }],
   }
   const firstText = await callClaudeText(body)
@@ -672,6 +699,10 @@ cross_template_suggestion must be null (not omitted) when there is no genuine ma
   // and every suggestion from this call is always "from_recipe" regardless of
   // the new self-reported origin value, so deriving it guarantees consistency.
   if (data?.suggestions) data.suggestions = data.suggestions.map(s => ({ ...s, origin_flag: 'from_recipe' }))
+  // Normalize to a strict boolean rather than trusting the model's JSON literally —
+  // anything short of an explicit true is treated as false, so a malformed or omitted
+  // field never accidentally shows a CTA the canon can't back up.
+  if (data) data.more_published_exist = data.more_published_exist === true
   return data
 }
 
@@ -699,6 +730,8 @@ ${inventoryText}
 Regenerate ONE corrected cocktail suggestion for the featured ingredients that genuinely fits this template's structure. If no honest fit exists even after correcting for the violation above, return {"suggestion": null} — do not force a bad fit.
 
 Set "origin" honestly ("riff" if it's a substitution into the template's usual formula, "original" only as a rare last resort). Every entry in the "recipe" array must include a "role" field from this fixed enum: ${RECIPE_ROLES.join(' | ')}. "citrus" means citrus juice used structurally; a peel/twist garnish is role "garnish".
+
+${RIFF_DISCIPLINE_CORE}
 
 ${WATCH_OUTS_INSTRUCTION}
 
@@ -732,7 +765,7 @@ Return ONLY valid JSON, no markdown fences:
   }
 }
 
-async function analyzeExplorationsOriginals(ingredients, template, modifiers, inventoryText) {
+async function analyzeExplorationsOriginals(ingredients, template, modifiers, inventoryText, excludeNames = []) {
   const body = {
     model: MODEL,
     max_tokens: 3000,
@@ -757,25 +790,30 @@ SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated
 
 First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
-Otherwise invent up to 2–3 cocktails that showcase the featured ingredients using this priority order, and set each suggestion's "origin" field honestly to reflect which path you actually used — do not default every suggestion to the same value:
+Otherwise invent cocktails that showcase the featured ingredients using this priority order, and set each suggestion's "origin" field honestly to reflect which path you actually used — do not default every suggestion to the same value:
 1. DEFAULT — origin: "riff": take the template's usual formula above and substitute the featured ingredients (and available bar inventory) into its ratio slots. This is how most real cocktails are made and should be your primary approach for every suggestion.
 2. LAST RESORT — origin: "original": only when no reasonable substitution into the template's formula exists, invent a drink that still honors the template's mechanic (stirred/shaken/built/etc.) and general spirit-forward-vs-lengthened character. Do not reach for this by default — it should be rare, and you must set origin: "original" honestly rather than mislabeling an actual substitution as a riff.
 For either path, suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate, and check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
-
+${excludeNames.length > 0 ? `\nALREADY SURFACED — the user has already seen these suggestions across earlier batches, each shown with its full ingredient list so you can recognize the underlying swap even under a new name — do not return the same swap again under a different invented name:\n${excludeNames.join('\n')}\nJudge distinctness (see below) against this full list, not just against what you're about to return.\n` : ''}
 CRITICAL: Every cocktail MUST feature ALL of the featured ingredients (${ingredients.join(', ')}). Do not omit any featured ingredient from any suggestion.
 
-Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false (something worth buying an ingredient for), unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists.
+When there are enough genuinely distinct suggestions to do so, include a mix of can_make_now: true and can_make_now: false results — at least 1 can_make_now: false (something worth buying an ingredient for) is ideal, but do not manufacture one that fails the distinctness bar below just to satisfy this. The quality gate always wins over the mix.
 
 Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
 Every entry in each suggestion's "recipe" array must include a "role" field from this fixed enum, describing its functional role in the build: ${RECIPE_ROLES.join(' | ')}. "citrus" means citrus juice used as a structural component — a citrus peel or twist used only as garnish is role "garnish", not "citrus". Every ingredient in the recipe gets exactly one role.
 
+${RIFF_DISCIPLINE_BATCH}
+
 ${WATCH_OUTS_INSTRUCTION}
+
+Separately from how many you return, report whether more genuinely distinct riffs or originals remain: set "more_ideas_exist" to true only if you are aware of additional swaps or inventions that would pass the riff-discipline bar above beyond what you returned here. Set it false once you've shown everything worth showing — at some point it is the bartender's call: the job is to surface the swaps worth knowing about and then stop, not to enumerate the space and leave the user to filter it. An honest "that's what's here" is a better answer than a longer list of progressively weaker variations. This field must be present on every response.
 
 Return ONLY valid JSON with no markdown fences:
 {
   "incompatible": false,
   "incompatibility_reason": null,
+  "more_ideas_exist": false,
   "flavor_profile_note": "1-2 sentences on why these ingredients work together",
   "pairs_well_with": "2-3 strongest flavor affinities only — one short sentence, not an exhaustive list",
   "cross_template_suggestion": null,
@@ -806,7 +844,7 @@ Return ONLY valid JSON with no markdown fences:
     }
   ]
 }
-cross_template_suggestion is always null from this call — leave it exactly as shown. watch_outs must be null (not omitted) when there's nothing worth flagging.`,
+cross_template_suggestion is always null from this call — leave it exactly as shown. watch_outs must be null (not omitted) when there's nothing worth flagging. more_ideas_exist must be present (not omitted) on every response.`,
     }],
   }
   const firstText = await callClaudeText(body)
@@ -857,6 +895,9 @@ cross_template_suggestion is always null from this call — leave it exactly as 
   // this call's suggestions were always origin_flag: "original" regardless of
   // which internal tier the model used. Preserved exactly for Favorites/On Deck.
   if (data?.suggestions) data.suggestions = data.suggestions.map(s => ({ ...s, origin_flag: 'original' }))
+  // Same normalization rationale as more_published_exist: never trust the literal value,
+  // coerce to strict boolean so a malformed/omitted field can't leave a CTA stuck visible.
+  if (data) data.more_ideas_exist = data.more_ideas_exist === true
   return data
 }
 
@@ -2566,6 +2607,10 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   const [originalsFetched, setOriginalsFetched] = useState(false)
   const [seeMoreLoading, setSeeMoreLoading] = useState(false)
   const [seeMoreError, setSeeMoreError] = useState(null)
+  const [moreIdeasExist, setMoreIdeasExist] = useState(false)
+  const [morePublishedExist, setMorePublishedExist] = useState(false)
+  const [seeMorePublishedLoading, setSeeMorePublishedLoading] = useState(false)
+  const [seeMorePublishedError, setSeeMorePublishedError] = useState(null)
   const [viaSurpriseMe, setViaSurpriseMe] = useState(false)
   const [loadingMsgIdx, setLoadingMsgIdx] = useState(0)
   const [affinityData, setAffinityData] = useState({})
@@ -2614,7 +2659,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setNa(pendingRestore.na || false)
     setLowABV(pendingRestore.low_abv || false)
     setResult(pendingRestore.result || null)
-    setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(true)
+    setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(true); setMoreIdeasExist(false); setMorePublishedExist(false)
     setCurrentWhiteboardId(pendingRestore.whiteboardId || null)
     setCurrentIngredientsNodeId(pendingRestore.ingredientsNodeId || null)
     setCurrentRecipeListNodeId(pendingRestore.restoreRecipeListNodeId || null)
@@ -2693,6 +2738,8 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setFeedbackError(null)
     setFeedbackBanner(false)
     setOriginalsFetched(true)
+    setMoreIdeasExist(false)
+    setMorePublishedExist(false)
     goToStep('results')
   }
 
@@ -2732,6 +2779,9 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setStep('loading')
     setOriginalsFetched(false)
     setSeeMoreError(null)
+    setMoreIdeasExist(false)
+    setMorePublishedExist(false)
+    setSeeMorePublishedError(null)
     setViaSurpriseMe(!!opts.viaSurpriseMe)
     setRestoreNodeData({})
     setAutoExpandNodeData(null)
@@ -2739,6 +2789,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
       const modifiers = { frozen, lowABV, na }
       const data = stripCiteTags(await analyzeExplorationsRecipes(selected, activeTemplate, modifiers, inventoryText))
       setResult(data)
+      setMorePublishedExist(data?.more_published_exist === true)
       setStep('results')
       let wbId = null
       let recipeListNodeId = null
@@ -2828,9 +2879,18 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setSeeMoreError(null)
     try {
       const modifiers = { frozen, lowABV, na }
-      const freshData = stripCiteTags(await analyzeExplorationsOriginals(selected, activeTemplate, modifiers, inventoryText))
+      // Prior riffs/originals only — tier-1 names aren't relevant to tier-2/3 distinctness.
+      // Bare recipe names aren't enough here: the model invents a new name each round, so
+      // a name alone can't tell it "this swap was already used" — it has to see the actual
+      // ingredients to judge substantive overlap (e.g. two different-round suggestions both
+      // swapping in Cardamaro under different invented names). Include each excluded
+      // suggestion's full ingredient list so distinctness is judged on the swap, not the name.
+      const excludeNames = baseSuggestions
+        .filter(s => s.origin === 'riff' || s.origin === 'original')
+        .map(s => `${s.recipe_name} (${(s.recipe || []).map(r => r.ingredient).join(', ')})`)
+      const freshData = stripCiteTags(await analyzeExplorationsOriginals(selected, activeTemplate, modifiers, inventoryText, excludeNames))
       const newSuggestions = freshData?.suggestions || []
-      const mergedSuggestions = [...baseSuggestions, ...newSuggestions]
+      const mergedSuggestions = sortByOriginRank([...baseSuggestions, ...newSuggestions])
 
       setResult(prev => ({
         ...(prev || {}),
@@ -2841,6 +2901,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
         cross_template_suggestion: prev?.cross_template_suggestion || freshData.cross_template_suggestion || null,
       }))
       setOriginalsFetched(true)
+      setMoreIdeasExist(freshData?.more_ideas_exist === true)
 
       if (user && wbId && recipeListNodeId && newSuggestions.length > 0) {
         try {
@@ -2875,7 +2936,69 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
-  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  // On-demand tier-1 (published) re-search, triggered by the "See More Published
+  // Recipes →" CTA (only rendered when more_published_exist is true). Passes the
+  // already-surfaced published names so the model finds genuinely different recipes
+  // instead of re-finding the same ones. Mirrors handleSeeMore's merge-and-persist
+  // pattern, but appends into the sorted list and re-derives more_published_exist from
+  // this call's own response, so the CTA can persist across several rounds and
+  // disappear once the canon is exhausted.
+  const handleSeeMorePublished = async () => {
+    if (seeMorePublishedLoading) return
+    const baseSuggestions = result?.suggestions ?? []
+    setSeeMorePublishedLoading(true)
+    setSeeMorePublishedError(null)
+    try {
+      const modifiers = { frozen, lowABV, na }
+      const excludeNames = baseSuggestions.filter(s => s.origin === 'published').map(s => s.recipe_name)
+      const freshData = stripCiteTags(await analyzeExplorationsRecipes(selected, template, modifiers, inventoryText, excludeNames))
+      const newSuggestions = freshData?.suggestions || []
+      const mergedSuggestions = sortByOriginRank([...baseSuggestions, ...newSuggestions])
+
+      setResult(prev => ({
+        ...(prev || {}),
+        incompatible: false,
+        suggestions: mergedSuggestions,
+        flavor_profile_note: prev?.flavor_profile_note || freshData.flavor_profile_note || null,
+        pairs_well_with: prev?.pairs_well_with || freshData.pairs_well_with || null,
+        cross_template_suggestion: prev?.cross_template_suggestion || freshData.cross_template_suggestion || null,
+      }))
+      setMorePublishedExist(freshData?.more_published_exist === true)
+
+      if (user && currentWhiteboardId && currentRecipeListNodeId && newSuggestions.length > 0) {
+        try {
+          const settled = await Promise.allSettled(
+            newSuggestions.map(recipe =>
+              supabase.from('exploration_nodes')
+                .insert({ whiteboard_id: currentWhiteboardId, parent_node_id: currentRecipeListNodeId, node_type: 'recipe', payload: { recipe } })
+                .select('id').single()
+            )
+          )
+          const newIds = {}
+          newSuggestions.forEach((recipe, i) => {
+            const r = settled[i]
+            if (r.status === 'fulfilled' && r.value?.data?.id && recipe.recipe_name) {
+              newIds[recipe.recipe_name] = r.value.data.id
+            }
+          })
+          setCurrentRecipeNodeIds(prev => ({ ...prev, ...newIds }))
+          await supabase.from('exploration_nodes').update({ payload: { recipes: mergedSuggestions } }).eq('id', currentRecipeListNodeId)
+          await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', currentWhiteboardId)
+        } catch (err) {
+          console.warn('[whiteboard] failed to persist see-more-published suggestions:', err.message)
+        }
+      }
+      return { mergedSuggestions }
+    } catch (err) {
+      console.warn('[see more published] failed:', err.message)
+      setSeeMorePublishedError('Could not load more published recipes. Please try again.')
+      return null
+    } finally {
+      setSeeMorePublishedLoading(false)
+    }
+  }
+
+  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -2886,6 +3009,8 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
       const data = await refineExplorations(selected, template, { frozen, lowABV, na }, inventoryText, previousNames, feedback.trim())
       setResult(data)
       setOriginalsFetched(true) // refine already returns a full revised set; the tier-1/2 split no longer applies
+      setMoreIdeasExist(false)
+      setMorePublishedExist(false)
       setFeedback('')
       setFeedbackBanner(true)
       setTimeout(() => feedbackBannerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50)
@@ -3443,13 +3568,28 @@ Rules:
             <span style={{ color: C.gold, fontSize: 18, flexShrink: 0 }}>→</span>
           </div>
         )}
-        {!originalsFetched && (
+        {!originalsFetched && (result.suggestions || []).length === 0 && (
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.textFaint, marginBottom: 12, lineHeight: 1.5 }}>
+            No published recipes matched — a riff or an original might still work well.
+          </div>
+        )}
+        {/* Tier-1 re-search — only rendered when the model has told us, this batch, that
+            genuine published matches remain beyond what it returned. Persists across
+            several taps and disappears once more_published_exist goes false. */}
+        {morePublishedExist && (
+          <div style={{ marginBottom: 12 }}>
+            <button onClick={() => handleSeeMorePublished()} disabled={seeMorePublishedLoading}
+              style={{ width: '100%', background: 'none', border: `1px dashed ${C.border}`, borderRadius: 10, color: C.gold, fontSize: 13, fontWeight: 600, padding: '12px 16px', cursor: seeMorePublishedLoading ? 'default' : 'pointer', opacity: seeMorePublishedLoading ? 0.6 : 1 }}>
+              {seeMorePublishedLoading ? 'Searching for more…' : 'See more published recipes →'}
+            </button>
+            {seeMorePublishedError && <div style={{ fontSize: 13, color: C.red, marginTop: 8 }}>{seeMorePublishedError}</div>}
+          </div>
+        )}
+        {/* Tier-2/3 — visible before the first fetch (we don't know yet what's there), then
+            gated on more_ideas_exist so it persists across taps and disappears once the
+            model has said it's shown everything worth showing. */}
+        {(!originalsFetched || moreIdeasExist) && (
           <div style={{ marginBottom: 24 }}>
-            {(result.suggestions || []).length === 0 && (
-              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.textFaint, marginBottom: 12, lineHeight: 1.5 }}>
-                No published recipes matched — a riff or an original might still work well.
-              </div>
-            )}
             <button onClick={() => handleSeeMore()} disabled={seeMoreLoading}
               style={{ width: '100%', background: 'none', border: `1px dashed ${C.border}`, borderRadius: 10, color: C.gold, fontSize: 13, fontWeight: 600, padding: '12px 16px', cursor: seeMoreLoading ? 'default' : 'pointer', opacity: seeMoreLoading ? 0.6 : 1 }}>
               {seeMoreLoading ? 'Finding more ideas…' : 'See more ideas →'}
