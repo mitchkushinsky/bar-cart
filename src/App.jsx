@@ -601,6 +601,8 @@ A split base (two complementary spirits) is a valid output when the inventory an
 }
 
 async function analyzeExplorationsRecipes(ingredients, template, modifiers, inventoryText, excludeNames = []) {
+  const t = TEMPLATE_MAP[template]
+  const ingredientPhrase = ingredients.join(' and ')
   const body = {
     model: MODEL,
     max_tokens: 3000,
@@ -622,11 +624,13 @@ SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated
 
 First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
-Otherwise, scope your web search itself to this template's family — search for terms like "published sour cocktail recipes with [ingredient]" or "[ingredient] Manhattan variation," not just "[ingredient] cocktail" — to find 2–3 published recipes that genuinely belong to this template. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
+Otherwise, scope your web search itself to this template's family — search for terms like "published ${t.name} cocktail recipes with ${ingredientPhrase}" or "${ingredientPhrase} ${t.name} variation," not just "${ingredientPhrase} cocktail" — to find 2–3 published recipes that genuinely belong to this template. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
 ${excludeNames.length > 0 ? `\nALREADY SURFACED — the user has already seen these recipes, do not return them again, find genuinely different published recipes: ${excludeNames.join(', ')}.\n` : ''}
 If a published recipe you find doesn't genuinely belong to this template's family, leave it out of your results rather than including it anyway — never rewrite, restructure, or "correct" a real published recipe to make it fit. A published recipe is presented exactly as published, or not at all.
 
-CRITICAL: Every recipe suggestion MUST include ALL featured ingredients (${ingredients.join(', ')}). Do NOT suggest recipes that omit any featured ingredient — even if fewer results are available as a result.
+Search both directions of category and brand for each featured ingredient. If it's a generic category (e.g. "coconut liqueur," "rye whiskey," "blanco tequila"), also search well-known specific products within that category (e.g. Malibu, Kalani, Coco Reàl for coconut liqueur) — published cocktail writing is overwhelmingly brand-specific, so a category-only search under-returns real matches. If it's a specific bottle (e.g. "Clement Mahina Coconut Rhum Liqueur"), also search the generic category term (e.g. "coconut liqueur") — a recipe published for the category is a genuine match for the specific bottle too, and category-level recipes are far more common than ones naming an exact product.
+
+CRITICAL: Every recipe suggestion MUST include ALL featured ingredients (${ingredients.join(', ')}), but treat category and brand as equivalent within the same ingredient: if a featured ingredient is a generic category, a recipe calling for a specific product within that category satisfies it — and if a featured ingredient is a specific product, a recipe calling for the generic category also satisfies it. This equivalence is strictly within-category — it is not license to accept a different ingredient just because it's related in flavor or use. For example, coconut cream is NOT a coconut liqueur (a different product, generally non-alcoholic) and does not satisfy a coconut liqueur request. Do NOT suggest recipes that omit any featured ingredient, accounting for this category/brand equivalence — even if fewer results are available as a result.
 
 If you cannot find 2–3 published recipes that include ALL featured ingredients, return as many as you can find (even 0 or 1). If no qualifying published recipes exist, return an empty suggestions array and set "no_recipes_found": true. Do NOT invent original recipes in this call — that is handled separately.
 
