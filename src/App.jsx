@@ -95,6 +95,20 @@
 // create policy "Users own their nodes" on exploration_nodes for all using (
 //   auth.uid() = (select user_id from exploration_whiteboards where id = whiteboard_id)
 // );
+//
+// Session 4: inventory semantic tagging. generic_type + aliases per bottle,
+// keyed by the inventory item's name (trimmed, lowercased) so a rename in the
+// source spreadsheet naturally orphans the old tag row — the renamed bottle
+// resurfaces as untagged on the next load rather than silently keeping a
+// stale tag. Shared, not user-scoped, same as ingredient_affinities: no RLS,
+// the tagging endpoint writes with the service-role key, the client reads
+// and manually-edits with the anon key.
+// create table if not exists inventory_tags (
+//   item_name text primary key,
+//   generic_type text not null,
+//   aliases jsonb not null default '[]',
+//   tagged_at timestamptz default now()
+// );
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import './App.css'
@@ -290,7 +304,7 @@ function isLikelyNonAlcoholic(name, inventory) {
   if (item?.category) {
     const cat = item.category.toLowerCase()
     // Any other matched inventory category (spirit/liqueur/vermouth/amaro) is alcoholic.
-    return cat.includes('syrup') || cat.includes('juice') || cat.includes('soda') || cat.includes('bitters') || cat.includes('garnish')
+    return cat.includes('syrup') || cat.includes('juice') || cat.includes('soda') || cat.includes('bitters') || cat.includes('garnish') || cat.includes('non alcohol')
   }
   // Free-text, unmatched — default to hiding NA (i.e. assume alcoholic) unless clearly NA.
   // Never silently propose deleting an ingredient the user just chose as the exploration's premise.
@@ -1193,12 +1207,17 @@ function UploadZone({ file, onFile, onRemove }) {
 
 // ─── Ingredient Drawer ────────────────────────────────────────────────────────
 
-function IngredientDrawer({ item, flavorProfile, loading, onClose, inventory }) {
+function IngredientDrawer({
+  item, flavorProfile, loading, onClose, inventory,
+  showFlavorProfile = true,
+  tags, distinctGenericTypes, onSetGenericType, onRetag, retagging,
+}) {
   const invMatch = inventory?.find(inv =>
     inv.spirit.toLowerCase() === item.ingredient.toLowerCase() ||
     item.ingredient.toLowerCase().includes(inv.spirit.toLowerCase()) ||
     inv.spirit.toLowerCase().includes(item.ingredient.toLowerCase())
   )
+  const tag = tags && invMatch ? tags[invMatch.spirit.trim().toLowerCase()] : null
 
   return (
     <>
@@ -1220,13 +1239,44 @@ function IngredientDrawer({ item, flavorProfile, loading, onClose, inventory }) 
         </div>
 
         {/* Flavor profile */}
-        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 14 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Flavor Profile</div>
-          {loading
-            ? <div style={{ color: C.textMuted, fontSize: 14 }}>Loading…</div>
-            : <p style={{ fontSize: 14, color: C.text, lineHeight: 1.65, margin: 0 }}>{flavorProfile || '—'}</p>
-          }
-        </div>
+        {showFlavorProfile && (
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 14 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Flavor Profile</div>
+            {loading
+              ? <div style={{ color: C.textMuted, fontSize: 14 }}>Loading…</div>
+              : <p style={{ fontSize: 14, color: C.text, lineHeight: 1.65, margin: 0 }}>{flavorProfile || '—'}</p>
+            }
+          </div>
+        )}
+
+        {/* Generic type (Session 4 semantic tagging) */}
+        {invMatch && onSetGenericType && (
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 14 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint }}>Generic Type</div>
+              {onRetag && (
+                <button onClick={() => onRetag(invMatch)} disabled={retagging} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 6, color: retagging ? C.textFaint : C.textMuted, fontSize: 11, padding: '3px 8px', cursor: retagging ? 'default' : 'pointer' }}>
+                  {retagging ? 'Retagging…' : '↻ Retag'}
+                </button>
+              )}
+            </div>
+            <select
+              value={tag?.generic_type || ''}
+              onChange={e => e.target.value && onSetGenericType(invMatch.spirit, e.target.value)}
+              style={{ width: '100%', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: '8px 10px', fontSize: 14 }}
+            >
+              <option value="" disabled>{tag ? tag.generic_type : '— untagged —'}</option>
+              {distinctGenericTypes?.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+            {tag?.aliases?.length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
+                {tag.aliases.map(a => (
+                  <span key={a} style={{ fontSize: 11, color: C.textFaint, background: C.border, borderRadius: 4, padding: '2px 6px' }}>{a}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {item.shelf_warning && (
           <div style={{ fontSize: 13, color: C.amber, background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 8, padding: '8px 12px', marginBottom: 10 }}>
@@ -1599,8 +1649,14 @@ function calcExpiry(item) {
   return expiry
 }
 
-function InventoryScreen({ inventory, inStockCount, oosCount }) {
+function InventoryScreen({
+  inventory, inStockCount, oosCount,
+  inventoryTags, inventoryTagsError, untaggedBottles, distinctGenericTypes,
+  tagSweepInProgress, tagSweepProgress, tagSweepError,
+  onTagSweep, onSetGenericType,
+}) {
   const [selectedCats, setSelectedCats] = useState(new Set())
+  const [drawerItem, setDrawerItem] = useState(null)
 
   if (!inventory) return <p style={{ color: C.textMuted, fontSize: 14 }}>Inventory not loaded.</p>
 
@@ -1627,6 +1683,7 @@ function InventoryScreen({ inventory, inStockCount, oosCount }) {
     groups[loc].push(item)
   }
   const sortedLocs = Object.keys(groups).sort()
+  const untaggedCount = untaggedBottles?.length || 0
 
   return (
     <div>
@@ -1634,6 +1691,33 @@ function InventoryScreen({ inventory, inStockCount, oosCount }) {
         <span style={{ fontSize: 13, background: C.green + '22', color: C.green, border: `1px solid ${C.green}44`, borderRadius: 20, padding: '3px 10px', fontWeight: 600 }}>{inStockCount} in stock</span>
         {oosCount > 0 && <span style={{ fontSize: 13, background: C.amber + '22', color: C.amber, border: `1px solid ${C.amber}44`, borderRadius: 20, padding: '3px 10px', fontWeight: 600 }}>{oosCount} OOS</span>}
       </div>
+
+      {/* Untagged banner — self-clearing at zero, so no stale control lingers */}
+      {inventoryTagsError && (
+        <div style={{ fontSize: 13, color: C.red, background: C.red + '12', border: `1px solid ${C.red}33`, borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
+          Tag storage unavailable: {inventoryTagsError} — has the inventory_tags migration been run?
+        </div>
+      )}
+      {untaggedCount > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', background: C.gold + '12', border: `1px solid ${C.gold}33`, borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
+          <span style={{ fontSize: 13, color: C.text }}>
+            {untaggedCount} bottle{untaggedCount === 1 ? '' : 's'} not yet tagged
+            {tagSweepInProgress && tagSweepProgress && ` — tagging ${tagSweepProgress.done}/${tagSweepProgress.total}…`}
+          </span>
+          <button
+            onClick={() => onTagSweep(untaggedBottles)}
+            disabled={tagSweepInProgress}
+            style={{ background: 'none', border: `1px solid ${C.gold}55`, borderRadius: 6, color: C.gold, fontSize: 12, fontWeight: 600, padding: '4px 10px', cursor: tagSweepInProgress ? 'default' : 'pointer', opacity: tagSweepInProgress ? 0.6 : 1 }}
+          >
+            {tagSweepInProgress ? 'Tagging…' : 'Tag now'}
+          </button>
+        </div>
+      )}
+      {tagSweepError && (
+        <div style={{ fontSize: 13, color: C.red, background: C.red + '12', border: `1px solid ${C.red}33`, borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
+          Tagging failed: {tagSweepError}
+        </div>
+      )}
 
       {/* Category filter pills */}
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 20 }}>
@@ -1661,12 +1745,14 @@ function InventoryScreen({ inventory, inStockCount, oosCount }) {
               const expiry = calcExpiry(item)
               const isExpired = expiry && expiry < now
               const expiringSoon = expiry && !isExpired && expiry <= in30
+              const genericType = inventoryTags?.[item.spirit.trim().toLowerCase()]?.generic_type
               return (
-                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', background: C.surface, borderRadius: 8, flexWrap: 'wrap' }}>
+                <div key={i} onClick={() => setDrawerItem({ ingredient: item.spirit, location: item.location })} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', background: C.surface, borderRadius: 8, flexWrap: 'wrap', cursor: 'pointer' }}>
                   <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: item.oos ? C.amber : C.green, flexShrink: 0 }} />
                   <span style={{ fontSize: 14, flex: 1, minWidth: 120 }}>{item.spirit}</span>
                   {item.subLocation && <span style={{ fontSize: 12, color: C.textMuted }}>{item.subLocation}</span>}
                   {item.category && <span style={{ fontSize: 11, color: C.textFaint, background: C.border, borderRadius: 4, padding: '2px 6px' }}>{item.category}</span>}
+                  {genericType && <span style={{ fontSize: 11, color: C.textFaint, background: C.border, borderRadius: 4, padding: '2px 6px' }}>{genericType}</span>}
                   {item.oos && <span style={{ fontSize: 11, fontWeight: 700, color: C.amber }}>OOS</span>}
                   {isExpired && <span style={{ fontSize: 11, fontWeight: 700, color: C.red, background: C.red + '18', border: `1px solid ${C.red}44`, borderRadius: 4, padding: '2px 6px' }}>Exp {expiry.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' })}</span>}
                   {expiringSoon && <span style={{ fontSize: 11, fontWeight: 700, color: C.amber, background: C.amber + '18', border: `1px solid ${C.amber}44`, borderRadius: 4, padding: '2px 6px' }}>Exp {expiry.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' })}</span>}
@@ -1676,6 +1762,20 @@ function InventoryScreen({ inventory, inStockCount, oosCount }) {
           </div>
         </div>
       ))}
+
+      {drawerItem && (
+        <IngredientDrawer
+          item={drawerItem}
+          onClose={() => setDrawerItem(null)}
+          inventory={inventory}
+          showFlavorProfile={false}
+          tags={inventoryTags}
+          distinctGenericTypes={distinctGenericTypes}
+          onSetGenericType={onSetGenericType}
+          onRetag={(invItem) => onTagSweep([invItem])}
+          retagging={tagSweepInProgress}
+        />
+      )}
     </div>
   )
 }
@@ -4175,6 +4275,13 @@ export default function App() {
   const [inventoryError, setInventoryError] = useState(null)
   const [, setAffinityBackfillInProgress] = useState(false)
 
+  // Inventory tags (Session 4: generic_type + aliases, keyed by item name)
+  const [inventoryTags, setInventoryTags] = useState({})
+  const [inventoryTagsError, setInventoryTagsError] = useState(null)
+  const [tagSweepInProgress, setTagSweepInProgress] = useState(false)
+  const [tagSweepProgress, setTagSweepProgress] = useState(null)
+  const [tagSweepError, setTagSweepError] = useState(null)
+
   // Navigation
   const [screen, setScreen] = useState('create')
   const [createSubTab, setCreateSubTab] = useState('new')
@@ -4320,6 +4427,24 @@ export default function App() {
       const parsed = parseInventory(await res.text())
       setInventory(parsed)
 
+      // Load inventory tags (generic_type + aliases) so the untagged count is
+      // accurate on first paint. Surface a clear error rather than silently
+      // showing zero untagged if the table is missing (unrun migration).
+      try {
+        const { data: tagRows, error: tagErr } = await supabase
+          .from('inventory_tags')
+          .select('item_name, generic_type, aliases, tagged_at')
+        if (tagErr) throw tagErr
+        const tagMap = {}
+        for (const row of tagRows || []) tagMap[row.item_name] = row
+        setInventoryTags(tagMap)
+        setInventoryTagsError(null)
+      } catch (err) {
+        console.error('[inventory tags] load failed:', err.message)
+        setInventoryTags({})
+        setInventoryTagsError(err.message)
+      }
+
       // Fire-and-forget affinity backfill for ingredients not yet analyzed
       ;(async () => {
         try {
@@ -4428,6 +4553,83 @@ export default function App() {
 
   const inStockCount = inventory ? inventory.filter(i => !i.oos).length : 0
   const oosCount = inventory ? inventory.filter(i => i.oos).length : 0
+
+  // Inventory tags: untagged bottles, distinct vocabulary already in use.
+  // Every inventory row is in scope — not just in-stock ones — since
+  // generic_type is a durable product classification independent of stock.
+  const untaggedBottles = useMemo(() => {
+    if (!inventory) return []
+    return inventory.filter(item => !inventoryTags[item.spirit.trim().toLowerCase()])
+  }, [inventory, inventoryTags])
+
+  const distinctGenericTypes = useMemo(() => (
+    Array.from(new Set(Object.values(inventoryTags).map(t => t.generic_type).filter(Boolean))).sort()
+  ), [inventoryTags])
+
+  // Tags a batch of bottles (a full sweep, or a single per-bottle retag).
+  // Chunked the same way the affinity backfill is, so one untagged bottle
+  // makes exactly one API call (and one Claude call) rather than a full sweep.
+  const runTagSweep = useCallback(async (bottlesToTag) => {
+    if (!bottlesToTag || bottlesToTag.length === 0) return
+    // Dedupe by normalized name before chunking — same reason as the affinity
+    // backfill: backup bottles share a name but need only one tag row, and two
+    // rows for the same name in one upsert batch is a hard Postgres ON CONFLICT
+    // error that fails the whole chunk, not just that one row.
+    const seenNames = new Set()
+    const deduped = bottlesToTag.filter(b => {
+      const key = b.spirit.trim().toLowerCase()
+      if (seenNames.has(key)) return false
+      seenNames.add(key)
+      return true
+    })
+    setTagSweepError(null)
+    setTagSweepInProgress(true)
+    setTagSweepProgress({ done: 0, total: deduped.length })
+    const CHUNK_SIZE = 20
+    const chunks = []
+    for (let i = 0; i < deduped.length; i += CHUNK_SIZE) chunks.push(deduped.slice(i, i + CHUNK_SIZE))
+    let done = 0
+    try {
+      for (const chunk of chunks) {
+        const response = await fetch('/api/tag-inventory', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ bottles: chunk.map(b => ({ name: b.spirit, category: b.category })) }),
+        })
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({ error: response.statusText }))
+          throw new Error(err.error || `HTTP ${response.status}`)
+        }
+        const result = await response.json()
+        setInventoryTags(prev => {
+          const next = { ...prev }
+          for (const row of result.tags || []) next[row.item_name] = row
+          return next
+        })
+        done += chunk.length
+        setTagSweepProgress({ done, total: deduped.length })
+      }
+    } catch (err) {
+      console.error('[tag sweep] failed:', err.message)
+      setTagSweepError(err.message)
+    } finally {
+      setTagSweepInProgress(false)
+    }
+  }, [])
+
+  // Manual dropdown edit — anon-key direct write, no service role. Restricted
+  // to values already in use is enforced by the dropdown UI, not here.
+  const setGenericTypeManually = useCallback(async (spiritName, newType) => {
+    const key = spiritName.trim().toLowerCase()
+    const { data, error } = await supabase
+      .from('inventory_tags')
+      .update({ generic_type: newType, tagged_at: new Date().toISOString() })
+      .eq('item_name', key)
+      .select()
+      .single()
+    if (error) { setTagSweepError(error.message); return }
+    setInventoryTags(prev => ({ ...prev, [key]: data }))
+  }, [])
 
   // Shopping list helpers
   const addToShopping = useCallback(async (name) => {
@@ -4762,7 +4964,20 @@ export default function App() {
 
       {/* Screen: Inventory */}
       {screen === 'inventory' && (
-        <InventoryScreen inventory={inventory} inStockCount={inStockCount} oosCount={oosCount} />
+        <InventoryScreen
+          inventory={inventory}
+          inStockCount={inStockCount}
+          oosCount={oosCount}
+          inventoryTags={inventoryTags}
+          inventoryTagsError={inventoryTagsError}
+          untaggedBottles={untaggedBottles}
+          distinctGenericTypes={distinctGenericTypes}
+          tagSweepInProgress={tagSweepInProgress}
+          tagSweepProgress={tagSweepProgress}
+          tagSweepError={tagSweepError}
+          onTagSweep={runTagSweep}
+          onSetGenericType={setGenericTypeManually}
+        />
       )}
 
       {/* Screen: Shopping */}
