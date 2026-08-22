@@ -139,6 +139,11 @@ const C = {
   green: '#4caf6b',
   amber: '#d4891a',
   red: '#d44f4f',
+  // Session 5: dedicated to the "missing" ownership status specifically — the
+  // general-purpose C.red (error banners, expired badges) reads too close to
+  // amber at dot size, and missing is the one status that costs money, so it
+  // gets its own louder, more saturated red rather than reusing C.red globally.
+  missing: '#ff4d4d',
   blue: '#5090d8',
   text: '#f0ede8',
   textMuted: '#888',
@@ -288,8 +293,28 @@ const RIFF_DISCIPLINE_BATCH = `${RIFF_DISCIPLINE_CORE}
 Above all three: generate as many riffs as are genuinely good, not as many as are constructible. Four good riffs beat twelve mechanical ones. If only two are genuinely distinct, two is the honest answer — the same principle as tier-1 returning an empty state rather than stretching.
 4. HARD CAP: at most 4 suggestions total in this batch, and fewer whenever fewer are genuinely distinct. This is a ceiling, not a quota — "return 4" is wrong when only 2 are genuinely good. Two good riffs is a correct and complete answer.`
 
+// Session 5: shared verbatim across every prompt that asks the model to set an
+// ingredient's "status" and a suggestion's can_make_now, so the two rules can't
+// drift out of sync between functions — a drift here would silently desync the
+// UI's dot colors from the Can Make Now / Shopping Required split. Mirrors the
+// same "product category, not flavor origin" boundary hotfix 9eef91e established
+// for tier-1 search matching, applied here to ownership instead of recipe search.
+const OWNERSHIP_STATUS_RULES = `OWNERSHIP STATUS — apply this rule identically to every ingredient's "status" field:
+- "found": the user owns this ingredient, either under its exact name or as a different producer's bottle of the SAME product type — Rittenhouse satisfies a recipe calling for Sazerac Rye, both are rye whiskey, no purchase needed. Keep the ingredient named as the recipe actually specifies it (e.g. "Sazerac Rye"), not the substitute brand, so the user can see what was intended.
+- "substitute": the user does not own this exact product, but owns something — including something makeable from ingredients already on hand, like a syrup — that will genuinely work in its place and still produce a recognizable version of the drink. Populate substitute, substitute_location, and flavor_impact, and be honest in flavor_impact about what changes.
+- "missing": the user owns nothing that will work. This ingredient requires a purchase. Never mark an ingredient "missing" while also populating a substitute for it — if a genuine workaround exists from the user's own bottles, that is "substitute," not "missing." Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) are always assumed available and must never be marked "missing."
+
+The found/substitute boundary is PRODUCT CATEGORY, not flavor similarity. Different brands of the same product are interchangeable — found or substitute. Different products that merely share a flavor origin are not, even if the user owns one: maraschino liqueur does not satisfy a cherry liqueur requirement, and cream of coconut does not satisfy a coconut liqueur requirement — different products, a meaningfully different drink, mark these "missing" regardless of what similar-sounding bottle the user owns. Most category-edge cases are softer than that: Campari standing in for a recipe that specifies Forthave Red is a legitimate swap — both are red bitter aperitivos filling the same role — so this is "found" or "substitute" depending on how distinct the two house styles taste, never "missing." Reserve the hard "missing" boundary for genuinely different products, not house-style variation within one category.`
+
+const CAN_MAKE_NOW_RULE = `Set can_make_now: true when every required ingredient OTHER than the featured ingredient(s) is "found" or "substitute" — the user can make a recognizable version of this drink tonight without buying anything. Set it false only when at least one non-featured ingredient is "missing." Judge this honestly for each suggestion on its own; do not aim for a particular mix of true/false results across a batch — if everything is genuinely makeable, every suggestion should say so.`
+
+// Placed adjacent to each prompt's "every featured ingredient must appear"
+// requirement, since that is where this carve-out and that requirement would
+// otherwise sit with no boundary between them.
+const SEED_INGREDIENT_EXEMPT = `The featured ingredient(s) are OUT OF SCOPE for ownership classification. The user chose to explore this ingredient deliberately and already knows whether they own it — it must never be the reason a suggestion is marked can_make_now: false, and it must never be the ingredient that lands a drink in the shopping-required bucket. Still report the featured ingredient's own "status" honestly in the ingredients list — the user can see whether they own it there — but exclude it entirely from the can_make_now determination: only a missing NON-featured ingredient can make can_make_now false.`
+
 // Riffs are the middle rung of the ladder and should lead within each ownership
-// section (Can Make Now / Worth Buying For) — published items are already tier-1-first
+// section (Can Make Now / Shopping Required) — published items are already tier-1-first
 // by construction, so ranking them 0 just preserves that; this exists to fix riff-vs-
 // original ordering, which the model doesn't reliably emit in generation order.
 const ORIGIN_RANK = { published: 0, riff: 1, original: 2 }
@@ -352,11 +377,20 @@ function parseInventory(csvText) {
   return items.filter((i) => i.spirit)
 }
 
-function inventoryToText(items) {
-  const lines = ['Spirit | Location | Sub Location | Category | Date Opened | Status | Notes']
+// Session 5: generic_type/aliases (Session 4's inventory_tags) ride alongside
+// category in the same block, so the model can match a recipe's generic ask
+// ("rye whiskey") against the user's specifically-named bottles without
+// re-deriving the equivalence itself. category is untouched — both fields ship
+// together and do different jobs. An untagged bottle just gets blank columns
+// here and falls back to name matching, same as before Session 4 existed.
+function inventoryToText(items, tags = {}) {
+  const lines = ['Spirit | Location | Sub Location | Category | Generic Type | Aliases | Date Opened | Status | Notes']
   for (const item of items) {
+    const tag = tags[item.spirit.trim().toLowerCase()]
+    const genericType = tag?.generic_type || ''
+    const aliases = tag?.aliases?.length > 0 ? tag.aliases.join(', ') : ''
     lines.push(
-      `${item.spirit} | ${item.location} | ${item.subLocation} | ${item.category} | ${item.dateOpened || 'N/A'} | ${item.oos ? 'OOS' : 'Available'} | ${item.notes}`
+      `${item.spirit} | ${item.location} | ${item.subLocation} | ${item.category} | ${genericType} | ${aliases} | ${item.dateOpened || 'N/A'} | ${item.oos ? 'OOS' : 'Available'} | ${item.notes}`
     )
   }
   return lines.join('\n')
@@ -491,6 +525,8 @@ For shelf warnings, always calculate and state the specific expiration date, not
 Never use the word "expired" when the date is still in the future. Never say "still good for X months" — always give the actual date.
 
 Common fresh garnishes (orange peel, lemon twist, lime wheel, citrus peels, fresh herbs) and pantry staples (sugar, salt, cream, milk, eggs, soda water) should appear in the recipe array with their amounts as normal, but must be excluded from the ingredients array entirely. Do not check them against inventory.
+
+${OWNERSHIP_STATUS_RULES}
 
 Return ONLY valid JSON with no markdown fences, no extra text. Use this exact structure:
 {
@@ -638,7 +674,7 @@ SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated
 
 First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
-Otherwise, scope your web search itself to this template's family — search for terms like "published ${t.name} cocktail recipes with ${ingredientPhrase}" or "${ingredientPhrase} ${t.name} variation," not just "${ingredientPhrase} cocktail" — to find 2–3 published recipes that genuinely belong to this template. For each, check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
+Otherwise, scope your web search itself to this template's family — search for terms like "published ${t.name} cocktail recipes with ${ingredientPhrase}" or "${ingredientPhrase} ${t.name} variation," not just "${ingredientPhrase} cocktail" — to find 2–3 published recipes that genuinely belong to this template.
 ${excludeNames.length > 0 ? `\nALREADY SURFACED — the user has already seen these recipes, do not return them again, find genuinely different published recipes: ${excludeNames.join(', ')}.\n` : ''}
 If a published recipe you find doesn't genuinely belong to this template's family, leave it out of your results rather than including it anyway — never rewrite, restructure, or "correct" a real published recipe to make it fit. A published recipe is presented exactly as published, or not at all.
 
@@ -646,15 +682,23 @@ Search both directions of category and brand for each featured ingredient. If it
 
 CRITICAL: Every featured ingredient (${ingredients.join(', ')}) must appear as an actual ingredient in the recipe's ingredient list — under its own name, a brand name within its category, or the generic category name. A drink that merely shares a flavor or theme with a featured ingredient, without actually containing it, does not satisfy the requirement.
 
+${SEED_INGREDIENT_EXEMPT}
+
 Category and brand are equivalent within the same product kind: a recipe calling for a specific product satisfies a generic category request, and a recipe calling for the generic category — or a different well-known product in that category — satisfies a specific-product request. A distinctive product remains a member of its category regardless of how distinctive it is (e.g. an agricole-based coconut liqueur is still a coconut liqueur); its distinctiveness belongs in the summary as a flavor note, not as grounds to reject other category members as non-matches. This equivalence covers different brands of the SAME product — not every product that merely shares a flavor origin or a source fruit. Maraschino liqueur is not cherry liqueur: despite both being cherry-derived, they are distinct, non-interchangeable products with different production methods and flavor profiles (maraschino is dry and almond-like from crushed cherry pits; cherry liqueur is sweet and fruity) — a recipe calling for one does not satisfy a request for the other.
 
 This equivalence is bound by product kind, not by flavor alone — but "kind" means alcoholic vs. non-alcoholic, not the specific spirit category a product's label files it under. Any alcoholic product built around the featured flavor as its defining character satisfies the requirement, regardless of whether its own label calls it a liqueur, a flavored rum, or something else — Malibu is legally a flavored rum, not a liqueur, but it is still a coconut liqueur for matching purposes here, exactly like Kalani or Clément Mahina. Do not disqualify a product on that technicality. What disqualifies a product is the absence of alcohol: a non-alcoholic product of the same flavor (juice, purée, water, cream, syrup, or milk) never satisfies the requirement, no matter how central it is to the recipe. This is a general rule, not specific to any one flavor: cherry liqueur is not satisfied by cherry juice, coffee liqueur is not satisfied by cold brew, peach liqueur is not satisfied by peach purée, and coconut liqueur is not satisfied by coconut water, coconut purée, cream of coconut, or coconut milk — but coconut liqueur IS satisfied by any alcoholic coconut product, including ones labeled "rum" rather than "liqueur." Do NOT suggest recipes that omit any featured ingredient under this standard — even if fewer results are available as a result.
+
+For each recipe you return, check every non-garnish, non-pantry-staple ingredient against the bar inventory below (note the generic type and aliases listed alongside each bottle — a bottle's generic type or an alias matching an ingredient the recipe calls for means the user owns it).
+
+${OWNERSHIP_STATUS_RULES}
+
+${CAN_MAKE_NOW_RULE}
 
 If you cannot find 2–3 published recipes that include ALL featured ingredients, return as many as you can find (even 0 or 1). If no qualifying published recipes exist, return an empty suggestions array and set "no_recipes_found": true. Do NOT invent original recipes in this call — that is handled separately.
 
 Separately from how many you return, report whether more genuinely exist: set "more_published_exist" to true only if you are aware of ADDITIONAL genuine published recipes for this ingredient/template combination beyond the ones you returned here — not ones you're merely guessing might exist. Set it false if these are all that genuinely exist, or if you found none at all. Do not set it true speculatively; false is a real and useful answer that tells the user something true about the canon. This field must be present on every response, including when no_recipes_found is true (where it should ordinarily be false).
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
 If — and only if — you are genuinely confident of the recipe's origin (who created it, and where/when), weave that attribution into the summary prose, e.g. "Created by Audrey Saunders at Pegu Club, 2005." Most published recipes don't have a confidently attributable origin — when you don't know, simply don't mention it. Never guess or imply an origin you're not sure of; staying silent is always better than a wrong or invented attribution.
 
@@ -678,7 +722,6 @@ Return ONLY valid JSON with no markdown fences:
       "difficulty": "easy | medium | hard",
       "difficulty_note": "One sentence explaining difficulty",
       "can_make_now": true,
-      "missing_ingredients": [],
       "summary": "1-2 sentence description including a flavor characterization",
       "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }],
       "instructions": "string",
@@ -751,6 +794,14 @@ ${inventoryText}
 
 Regenerate ONE corrected cocktail suggestion for the featured ingredients that genuinely fits this template's structure. If no honest fit exists even after correcting for the violation above, return {"suggestion": null} — do not force a bad fit.
 
+Check every non-garnish, non-pantry-staple ingredient against the bar inventory above (note the generic type and aliases listed alongside each bottle — a bottle's generic type or an alias matching an ingredient the recipe calls for means the user owns it).
+
+${SEED_INGREDIENT_EXEMPT}
+
+${OWNERSHIP_STATUS_RULES}
+
+${CAN_MAKE_NOW_RULE}
+
 Set "origin" honestly ("riff" if it's a substitution into the template's usual formula, "original" only as a rare last resort). Every entry in the "recipe" array must include a "role" field from this fixed enum: ${RECIPE_ROLES.join(' | ')}. "citrus" means citrus juice used structurally; a peel/twist garnish is role "garnish".
 
 ${RIFF_DISCIPLINE_CORE}
@@ -765,7 +816,6 @@ Return ONLY valid JSON, no markdown fences:
     "difficulty": "easy | medium | hard",
     "difficulty_note": "string",
     "can_make_now": true,
-    "missing_ingredients": [],
     "summary": "string",
     "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }],
     "instructions": "string",
@@ -815,13 +865,17 @@ First check if the featured ingredients fundamentally clash in cocktail contexts
 Otherwise invent cocktails that showcase the featured ingredients using this priority order, and set each suggestion's "origin" field honestly to reflect which path you actually used — do not default every suggestion to the same value:
 1. DEFAULT — origin: "riff": take the template's usual formula above and substitute the featured ingredients (and available bar inventory) into its ratio slots. This is how most real cocktails are made and should be your primary approach for every suggestion.
 2. LAST RESORT — origin: "original": only when no reasonable substitution into the template's formula exists, invent a drink that still honors the template's mechanic (stirred/shaken/built/etc.) and general spirit-forward-vs-lengthened character. Do not reach for this by default — it should be rare, and you must set origin: "original" honestly rather than mislabeling an actual substitution as a riff.
-For either path, suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate, and check all non-garnish, non-pantry-staple ingredients against the inventory. Set can_make_now: true only if all required spirits and liqueurs are available. Common fresh garnishes (citrus peels, mint, herbs) and pantry staples (sugar, salt, cream, eggs, soda water) must never appear in missing_ingredients.
+For either path, suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate, and check every non-garnish, non-pantry-staple ingredient against the bar inventory above (note the generic type and aliases listed alongside each bottle — a bottle's generic type or an alias matching an ingredient the recipe calls for means the user owns it).
 ${excludeNames.length > 0 ? `\nALREADY SURFACED — the user has already seen these suggestions across earlier batches, each shown with its full ingredient list so you can recognize the underlying swap even under a new name — do not return the same swap again under a different invented name:\n${excludeNames.join('\n')}\nJudge distinctness (see below) against this full list, not just against what you're about to return.\n` : ''}
 CRITICAL: Every cocktail MUST feature ALL of the featured ingredients (${ingredients.join(', ')}). Do not omit any featured ingredient from any suggestion.
 
-When there are enough genuinely distinct suggestions to do so, include a mix of can_make_now: true and can_make_now: false results — at least 1 can_make_now: false (something worth buying an ingredient for) is ideal, but do not manufacture one that fails the distinctness bar below just to satisfy this. The quality gate always wins over the mix.
+${SEED_INGREDIENT_EXEMPT}
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+${OWNERSHIP_STATUS_RULES}
+
+${CAN_MAKE_NOW_RULE}
+
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
 Every entry in each suggestion's "recipe" array must include a "role" field from this fixed enum, describing its functional role in the build: ${RECIPE_ROLES.join(' | ')}. "citrus" means citrus juice used as a structural component — a citrus peel or twist used only as garnish is role "garnish", not "citrus". Every ingredient in the recipe gets exactly one role.
 
@@ -846,7 +900,6 @@ Return ONLY valid JSON with no markdown fences:
       "difficulty": "easy | medium | hard",
       "difficulty_note": "One sentence explaining difficulty",
       "can_make_now": true,
-      "missing_ingredients": [],
       "summary": "1-2 sentence description including a flavor characterization",
       "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }],
       "instructions": "string",
@@ -946,9 +999,15 @@ Previous suggestions shown to the user: ${previousNames.join(', ')}
 
 The user provided feedback on the previous suggestions: "${feedbackText}". Based on this feedback, return a revised set of suggestions. If the feedback asks for 'more' or 'additional' results, include new suggestions not previously shown. If the feedback asks for something 'different' or describes a change to a specific recipe, revise accordingly. Return the same JSON structure as before, including updated flavor_profile_note and pairs_well_with if relevant.
 
-Include a mix of can_make_now: true and can_make_now: false results — at minimum, include at least 1 suggestion where can_make_now: false, unless the ingredient combination is so niche that no reasonable 'worth buying' suggestion exists. Return no more than 4 suggestions total.
+Return no more than 4 suggestions total.
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+${SEED_INGREDIENT_EXEMPT}
+
+${OWNERSHIP_STATUS_RULES}
+
+${CAN_MAKE_NOW_RULE}
+
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
 Return ONLY valid JSON with no markdown fences:
 {
@@ -963,7 +1022,6 @@ Return ONLY valid JSON with no markdown fences:
       "difficulty": "easy | medium | hard",
       "difficulty_note": "One sentence explaining difficulty",
       "can_make_now": true,
-      "missing_ingredients": [],
       "summary": "1-2 sentence description including a flavor characterization",
       "recipe": [{ "ingredient": "string", "amount": "string" }],
       "instructions": "string",
@@ -1053,7 +1111,9 @@ The user's feedback: "${feedbackText}"${tastingContext ? `\n\n${tastingContext}`
 BAR INVENTORY:
 ${inventoryText}
 
-Return a revised version of just this one suggestion in the same JSON structure as a single suggestion object, re-checking every ingredient in the "ingredients" array (status: found | substitute | missing, location, substitute, substitute_location, flavor_impact) against the bar inventory above — do not leave stale or guessed status values from the original. Also include a "tweak_label" field: a short 3-6 word label summarizing what changed (e.g. "Sparkling rosé swap, soda removed"). Return ONLY valid JSON with no markdown fences — a single object, not an array.`,
+${OWNERSHIP_STATUS_RULES}
+
+Return a revised version of just this one suggestion in the same JSON structure as a single suggestion object, re-checking every ingredient in the "ingredients" array (location, substitute, substitute_location, flavor_impact) against the bar inventory above per the ownership rule — do not leave stale or guessed status values from the original. Set can_make_now: true when every ingredient is "found" or "substitute", false only when at least one is "missing". Also include a "tweak_label" field: a short 3-6 word label summarizing what changed (e.g. "Sparkling rosé swap, soda removed"). Return ONLY valid JSON with no markdown fences — a single object, not an array.`,
     }],
   }
   const firstText = await callClaudeText(body)
@@ -1092,7 +1152,7 @@ ${recipeSummary}${tastingContext ? `\n\n${tastingContext}` : ''}${tweakHistory.l
       ...messages,
       {
         role: 'user',
-        content: `Synthesize this into a concrete tweak. Write one sentence starting with "Based on what you're describing, here's what I'd try: " Then write "---JSON---" on a new line followed by the complete revised recipe as valid JSON — same structure as the original with all fields: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, missing_ingredients, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes, tweak_label (a short 3-6 word label summarizing what changed, e.g. "Sparkling rosé swap, soda removed"). Re-check every ingredient's status/location/substitute against this bar inventory instead of leaving stale values from the original:\n\n${inventoryText}`,
+        content: `Synthesize this into a concrete tweak. Write one sentence starting with "Based on what you're describing, here's what I'd try: " Then write "---JSON---" on a new line followed by the complete revised recipe as valid JSON — same structure as the original with all fields: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes, tweak_label (a short 3-6 word label summarizing what changed, e.g. "Sparkling rosé swap, soda removed"). Re-check every ingredient's status/location/substitute against this bar inventory instead of leaving stale values from the original:\n\n${inventoryText}\n\n${OWNERSHIP_STATUS_RULES}\n\nSet can_make_now: true when every ingredient is "found" or "substitute", false only when at least one is "missing".`,
       },
     ]
     const body = { model: MODEL, max_tokens: 1500, system, messages: finalMessages }
@@ -1307,16 +1367,17 @@ function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer }) {
     return new Date(+match[3], +match[1] - 1, +match[2]) < now
   })()
   const inList = shoppingList.some(s => s.name.toLowerCase() === item.ingredient.toLowerCase())
-  const dotColor = item.status === 'found' ? C.green : item.status === 'substitute' ? C.amber : C.red
+  const isMissing = item.status === 'missing'
+  const dotColor = item.status === 'found' ? C.green : item.status === 'substitute' ? C.amber : C.missing
 
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 9 }}>
-        <span style={{ display: 'inline-block', width: 9, height: 9, borderRadius: '50%', background: dotColor, flexShrink: 0, marginTop: 3 }} />
+        <span style={{ display: 'inline-block', width: isMissing ? 10 : 9, height: isMissing ? 10 : 9, borderRadius: '50%', background: dotColor, boxShadow: isMissing ? `0 0 0 3px ${C.missing}33` : 'none', flexShrink: 0, marginTop: 3 }} />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 2 }}>
             <span onClick={() => onOpenDrawer(item)} style={{ fontWeight: 600, fontSize: 15, cursor: 'pointer', textDecoration: 'underline', textDecorationStyle: 'dotted', textUnderlineOffset: 3 }}>{item.ingredient}</span>
-            {item.status === 'missing' && <Chip color={C.red}>missing</Chip>}
+            {isMissing && <Chip color={C.missing}>missing</Chip>}
             {item.status === 'substitute' && <Chip color={C.amber}>substitute</Chip>}
             {(item.status === 'missing' || item.status === 'substitute') && !inList && (
               <button onClick={() => onAddToList(item.ingredient)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 4, color: C.textMuted, fontSize: 11, padding: '2px 7px', cursor: 'pointer' }}>
@@ -1751,8 +1812,8 @@ function InventoryScreen({
                   <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: item.oos ? C.amber : C.green, flexShrink: 0 }} />
                   <span style={{ fontSize: 14, flex: 1, minWidth: 120 }}>{item.spirit}</span>
                   {item.subLocation && <span style={{ fontSize: 12, color: C.textMuted }}>{item.subLocation}</span>}
-                  {item.category && <span style={{ fontSize: 11, color: C.textFaint, background: C.border, borderRadius: 4, padding: '2px 6px' }}>{item.category}</span>}
-                  {genericType && <span style={{ fontSize: 11, color: C.textFaint, background: C.border, borderRadius: 4, padding: '2px 6px' }}>{genericType}</span>}
+                  {item.category && <span style={{ fontSize: 11, color: C.textMuted, background: C.border, borderRadius: 4, padding: '2px 6px' }}>{item.category}</span>}
+                  {genericType && <span style={{ fontSize: 11, fontWeight: 600, color: C.gold, background: C.gold + '15', border: `1px solid ${C.gold}33`, borderRadius: 4, padding: '2px 6px' }}>{genericType}</span>}
                   {item.oos && <span style={{ fontSize: 11, fontWeight: 700, color: C.amber }}>OOS</span>}
                   {isExpired && <span style={{ fontSize: 11, fontWeight: 700, color: C.red, background: C.red + '18', border: `1px solid ${C.red}44`, borderRadius: 4, padding: '2px 6px' }}>Exp {expiry.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' })}</span>}
                   {expiringSoon && <span style={{ fontSize: 11, fontWeight: 700, color: C.amber, background: C.amber + '18', border: `1px solid ${C.amber}44`, borderRadius: 4, padding: '2px 6px' }}>Exp {expiry.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' })}</span>}
@@ -2603,16 +2664,19 @@ function RecipeCard({
           )}
           {showSaveButtons && displayed.ingredients && displayed.ingredients.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-              {displayed.ingredients.filter(ing => ing.ingredient).map((ing, i) => (
-                <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13 }}>
-                  <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: ing.status === 'found' ? C.green : ing.status === 'substitute' ? C.amber : C.red, flexShrink: 0, marginTop: 4 }} />
-                  <div>
-                    <span style={{ color: C.text }}>{ing.ingredient}</span>
-                    {ing.location && <span style={{ color: C.textMuted }}> · 📍 {ing.location}</span>}
-                    {ing.substitute && <div style={{ color: C.textFaint, fontStyle: 'italic', marginTop: 2 }}>Sub: {ing.substitute}{ing.flavor_impact ? ` — ${ing.flavor_impact}` : ''}</div>}
+              {displayed.ingredients.filter(ing => ing.ingredient).map((ing, i) => {
+                const ingMissing = ing.status === 'missing'
+                return (
+                  <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13 }}>
+                    <span style={{ display: 'inline-block', width: ingMissing ? 8 : 7, height: ingMissing ? 8 : 7, borderRadius: '50%', background: ing.status === 'found' ? C.green : ing.status === 'substitute' ? C.amber : C.missing, boxShadow: ingMissing ? `0 0 0 3px ${C.missing}33` : 'none', flexShrink: 0, marginTop: 4 }} />
+                    <div>
+                      <span style={{ color: C.text }}>{ing.ingredient}</span>
+                      {ing.location && <span style={{ color: C.textMuted }}> · 📍 {ing.location}</span>}
+                      {ing.substitute && <div style={{ color: C.textFaint, fontStyle: 'italic', marginTop: 2 }}>Sub: {ing.substitute}{ing.flavor_impact ? ` — ${ing.flavor_impact}` : ''}</div>}
+                    </div>
                   </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           )}
         </div>
@@ -3650,7 +3714,7 @@ Rules:
           )}
           {worthBuying.length > 0 && (
             <div style={{ marginBottom: 28 }}>
-              <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Worth Buying For ({worthBuying.length})</div>
+              <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Shopping Required ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} /> })}
               </div>
@@ -4891,7 +4955,7 @@ export default function App() {
 
   const analysisModeSource = mode === 'photo' ? 'Recipe Screenshot' : mode === 'name' ? 'Cocktail Name' : 'Bar Menu'
 
-  const inventoryText = inventory ? inventoryToText(inventory) : ''
+  const inventoryText = inventory ? inventoryToText(inventory, inventoryTags) : ''
 
   const handleSaveOnDeckFromExploration = (suggestion, primaryIngredients) => {
     toggleToMake({ recipe_name: suggestion.recipe_name, summary: suggestion.summary, recipe: suggestion.recipe, instructions: suggestion.instructions, ingredients: suggestion.ingredients, variations: suggestion.variations || [], glass_type: suggestion.glass_type }, { source: 'Exploration', origin: suggestion.origin, originFlag: suggestion.origin_flag, difficulty: suggestion.difficulty, primaryIngredients })
