@@ -1095,6 +1095,62 @@ Pick exactly one template id that best fits these ingredients. Return ONLY valid
   return 'sour'
 }
 
+// Session 6: the contextual affinity layer — how these ingredients behave in
+// THIS chosen template with THESE modifiers. Generated fresh every call,
+// never persisted or cached: ingredient_affinities already covers the
+// stable, template-independent character (the base layer); this covers the
+// part that genuinely changes per exploration, so caching it would just go
+// stale the moment this prompt changes. Ownership is deliberately absent
+// from this prompt — resolved client-side from inventory_tags and applied
+// as presentation only, never as a filter on what gets generated here.
+async function analyzeContextualAffinities(ingredients, template, modifiers, baseAffinityData) {
+  const t = TEMPLATE_MAP[template]
+  const sig = TEMPLATE_SIGNATURES[template]
+  const baseContext = ingredients.map(ing => {
+    const row = (baseAffinityData || {})[ing.trim().toLowerCase()]
+    if (!row) return `${ing}: no general affinity data available.`
+    return `${ing}: ${row.flavor_affinities}`
+  }).join('\n')
+
+  const forbiddenNote = sig?.forbiddenRoles?.length > 0
+    ? `This template forbids the following roles — never suggest a spirit or flavor category whose role would be one of these: ${sig.forbiddenRoles.join(', ')}.`
+    : ''
+  const modifierNote = (modifiers.lowABV || modifiers.na)
+    ? `A LOW ABV or NON-ALCOHOLIC modifier is active above. This is not optional flavor and it is not satisfied by prose alone: it must show up in spirit_categories for EVERY ingredient listed, with no exceptions. Concretely — do not list full-proof spirits (whiskey/bourbon/rye, dark rum, gin, tequila, etc.) as a spirit_category for any ingredient, even one that classically pairs with it. Replace each such instinct with its fortified-wine, aperitivo, NA-spirit, or session-strength counterpart instead (e.g. where you would reach for bourbon, suggest a sherry, madeira, or amaro; where you would reach for gin, suggest a fino sherry or blanc vermouth).`
+    : ''
+
+  const prompt = `You are an expert craft bartender. The user has already chosen a specific template for this exploration and wants to know how each ingredient behaves specifically in THIS context — not a generic flavor profile.
+
+INGREDIENTS: ${ingredients.join(' and ')}
+
+GENERAL CHARACTER (already known, for reference — do not just repeat this back):
+${baseContext}
+
+${buildTemplateContext(template, modifiers)}
+
+For EACH ingredient listed above, in the SAME ORDER, provide:
+- contextual_prose: 1-2 sentences on how this specific ingredient behaves in a ${t.name} — not a generic flavor profile, a template-specific one. If a modifier above (LOW ABV, NON-ALCOHOLIC, or FROZEN) is active, factor it into the direction too. Example of the right altitude: for Jägermeister in a Flip, how its herbal bitterness plays against egg and sugar in a dry-shaken build — not just "herbal, bittersweet, baking spice."
+- spirit_categories: 2-5 generic spirit/liqueur/fortified-wine CATEGORIES (never brand names) that would genuinely work in this exact template — e.g. "gin", "blanc vermouth", "dry curaçao". Each needs a "role" from this fixed enum: ${RECIPE_ROLES.join(' | ')}.
+- flavor_categories: 2-6 generic flavor/ingredient CATEGORIES (never brand names) that suit this template — e.g. "ginger", "stone fruit", "orgeat". Each needs a "role" from the same fixed enum.
+
+${forbiddenNote}
+${modifierNote}
+
+Return ONLY valid JSON, no markdown fences:
+{
+  "ingredients": [
+    { "contextual_prose": "string", "spirit_categories": [{ "category": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }], "flavor_categories": [{ "category": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }] }
+  ]
+}
+"ingredients" must have exactly ${ingredients.length} entries, in the same order as listed above.`
+
+  return await callClaude({
+    model: 'claude-sonnet-4-5',
+    max_tokens: 1200,
+    messages: [{ role: 'user', content: prompt }],
+  })
+}
+
 async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, tastingContext) {
   const body = {
     model: MODEL,
@@ -1350,6 +1406,43 @@ function IngredientDrawer({
         )}
         {invMatch?.notes && (
           <div style={{ fontSize: 13, color: C.textFaint, marginTop: 6 }}>{invMatch.notes}</div>
+        )}
+      </div>
+    </>
+  )
+}
+
+// Session 6: what tapping an owned category chip on the affinities screen
+// reveals. Same bottom-sheet affordance as IngredientDrawer/InventoryScreen
+// (Session 4) rather than a new pattern, but shaped around a category with
+// potentially several matching bottles instead of one matched item.
+function CategoryBottlesDrawer({ category, bottles, onAddGeneric, onAddBottle, onClose }) {
+  return (
+    <>
+      <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 99, transition: 'opacity 0.25s' }} />
+      <div style={{ position: 'fixed', bottom: 0, left: '50%', transform: 'translateX(-50%)', width: '100%', maxWidth: 700, background: '#1c1c1c', borderTop: `1px solid ${C.border}`, borderTopLeftRadius: 18, borderTopRightRadius: 18, padding: '20px 20px 36px', zIndex: 100, maxHeight: '72vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 16 }}>
+          <div style={{ fontSize: 20, fontWeight: 800, color: C.text, letterSpacing: '-0.02em' }}>{category}</div>
+          <button onClick={onClose} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textMuted, fontSize: 20, lineHeight: 1, padding: '2px 9px', cursor: 'pointer', flexShrink: 0 }}>×</button>
+        </div>
+        <div
+          onClick={onAddGeneric}
+          style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: C.gold + '15', border: `1px solid ${C.gold}44`, borderRadius: 8, padding: '10px 12px', marginBottom: 16, cursor: 'pointer' }}>
+          <span style={{ fontSize: 14, fontWeight: 600, color: C.gold }}>Add "{category}"</span>
+          <span style={{ fontSize: 12, color: C.gold }}>+</span>
+        </div>
+        {bottles.length > 0 && (
+          <>
+            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>You own</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {bottles.map(b => (
+                <div key={b.spirit} onClick={() => onAddBottle(b.spirit)} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', cursor: 'pointer' }}>
+                  <span style={{ fontSize: 14, color: C.text }}>{b.spirit}</span>
+                  {b.location && <span style={{ fontSize: 12, color: C.textMuted }}>📍 {b.location}</span>}
+                </div>
+              ))}
+            </div>
+          </>
         )}
       </div>
     </>
@@ -2757,7 +2850,7 @@ function TemplateInfoSheet({ template, onClose }) {
   )
 }
 
-function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pendingRestore, onRestoreConsumed, onBackToInProgress, onOpenWhiteboard }) {
+function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnDeck, user, pendingRestore, onRestoreConsumed, onBackToInProgress, onOpenWhiteboard }) {
   const [step, setStep] = useState('ingredients')
   const [navStack, setNavStack] = useState([])
   const [selected, setSelected] = useState([])
@@ -2788,6 +2881,12 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
   const [affinityData, setAffinityData] = useState({})
   const [affinityLoading, setAffinityLoading] = useState(false)
   const [affinityError, setAffinityError] = useState(null)
+  // Session 6: contextual layer — generated fresh per exploration, never
+  // persisted. Array in the same order as `selected`, one entry per ingredient.
+  const [contextualAffinityData, setContextualAffinityData] = useState([])
+  const [contextualAffinityLoading, setContextualAffinityLoading] = useState(false)
+  const [contextualAffinityError, setContextualAffinityError] = useState(null)
+  const [categoryDrawer, setCategoryDrawer] = useState(null) // { category, bottles } | null
   const [combinationData, setCombinationData] = useState(null)
   const [combinationLoading, setCombinationLoading] = useState(false)
   const [combinationError, setCombinationError] = useState(null)
@@ -3170,7 +3269,7 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     }
   }
 
-  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -3249,9 +3348,47 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     return map
   }
 
-  const handleNextFromIngredients = async () => {
-    await ensureAffinityData()
+  // Session 6: the base-layer fetch used to happen here, before the template
+  // was even chosen — which is exactly why affinities couldn't know about
+  // template or modifiers. It now fires from the template step instead (see
+  // handleContinueToAffinities). This transition is now just navigation.
+  const handleNextFromIngredients = () => {
     goToStep('template')
+  }
+
+  // Fires when the user leaves the template step for the affinities step —
+  // the first point in the flow where template and modifiers are both known.
+  // Blocks briefly on the base layer (a fast indexed read, so this stays
+  // close to instant) then navigates; the contextual layer is fired after
+  // navigating and streams in on its own, per Change 3.
+  const handleContinueToAffinities = async () => {
+    const baseMap = await ensureAffinityData()
+    setContextualAffinityData([])
+    setContextualAffinityError(null)
+    setContextualAffinityLoading(true)
+    goToStep('affinities')
+    fetchContextualAffinities(baseMap)
+  }
+
+  const fetchContextualAffinities = async (baseMap) => {
+    try {
+      const modifiers = { frozen, lowABV, na }
+      const data = await analyzeContextualAffinities(selected, template, modifiers, baseMap)
+      const forbidden = TEMPLATE_SIGNATURES[template]?.forbiddenRoles || []
+      const entries = (data?.ingredients || []).map(entry => ({
+        contextual_prose: entry?.contextual_prose || null,
+        spirit_categories: (entry?.spirit_categories || []).filter(c => c?.category && !forbidden.includes(c.role)),
+        flavor_categories: (entry?.flavor_categories || []).filter(c => c?.category && !forbidden.includes(c.role)),
+      }))
+      setContextualAffinityData(entries)
+    } catch (err) {
+      // Change 3: contextual failure degrades to the base layer, never an
+      // error state — the screen stays fully useful either way.
+      console.warn('[contextual affinities] failed:', err.message)
+      setContextualAffinityError(err.message)
+    } finally {
+      setContextualAffinityLoading(false)
+    }
   }
 
   // Quick Build and Surprise Me skip the deliberate template-picker flow entirely, so
@@ -3280,7 +3417,12 @@ function ExplorationsScreen({ inventory, inventoryText, onSaveOnDeck, user, pend
     setTemplatePickerLoading(true)
     setStep('loading') // covers the template-resolution round trip too, not just generation
     try {
-      const resolved = await resolveTemplate(selected, affinityData)
+      // Session 6: Surprise Me lives on the template step, which no longer
+      // pre-fetches affinity data on the way in (see handleNextFromIngredients)
+      // — resolveTemplate still needs it to pick a template, so fetch it here
+      // directly, same as Quick Build already does.
+      const affinityMap = await ensureAffinityData()
+      const resolved = await resolveTemplate(selected, affinityMap)
       setTemplate(resolved)
       const tier1 = await handleExplore({ template: resolved, fromStep, viaSurpriseMe: true })
       if (tier1 && !tier1.data.incompatible) {
@@ -3419,20 +3561,54 @@ Rules:
 
   if (step === 'affinities') {
     const selectedNorm = selected.map(s => s.trim().toLowerCase())
-    const getInventoryMatches = (spiritTags) => {
-      if (!spiritTags?.length || !inventory) return []
-      return inventory
-        .filter(item => !item.oos)
-        .filter(item => {
-          const normSpirit = item.spirit.trim().toLowerCase()
-          return spiritTags.some(tag => normSpirit.includes(tag) || tag.includes(normSpirit))
-        })
-        .filter(item => !selectedNorm.includes(item.spirit.trim().toLowerCase()))
-        .map(item => item.spirit)
-        .slice(0, 8)
+    const titleCase = s => s.replace(/(^|\s)(\p{L})/gu, (_, sep, c) => sep + c.toUpperCase())
+
+    // Session 4's inventory_tags, not string-matching on bottle names — a
+    // category is "owned" if some in-stock bottle's generic_type or an alias
+    // matches it exactly. Ownership never filters what's shown, only marks it.
+    const getOwnedBottlesForCategory = (category) => {
+      const normCat = category.trim().toLowerCase()
+      if (!inventory || !inventoryTags) return []
+      return inventory.filter(item => {
+        if (item.oos) return false
+        const tag = inventoryTags[item.spirit.trim().toLowerCase()]
+        if (!tag) return false
+        if ((tag.generic_type || '').trim().toLowerCase() === normCat) return true
+        return (tag.aliases || []).some(a => (a || '').trim().toLowerCase() === normCat)
+      })
     }
+
+    // Spirit chips always open the drawer, owned or not — the drawer itself
+    // always offers "Add <category>" as a generic option, with owned bottles
+    // (if any) listed below it as a refinement. The whole chip is one tap
+    // target regardless of ownership; the dot is a status indicator only.
+    const renderSpiritChip = (category) => {
+      const owned = getOwnedBottlesForCategory(category)
+      const isOwned = owned.length > 0
+      const label = titleCase(category)
+      return (
+        <span key={category}
+          onClick={() => setCategoryDrawer({ category: label, bottles: owned })}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: isOwned ? C.gold + '22' : C.surface, border: `1px solid ${isOwned ? C.gold + '44' : C.border}`, color: isOwned ? C.gold : C.textMuted, cursor: 'pointer' }}>
+          {label}
+          {isOwned && <span style={{ width: 6, height: 6, borderRadius: '50%', background: C.gold, flexShrink: 0 }} />}
+        </span>
+      )
+    }
+
+    // Flavor chips have no bottles behind them — nothing to drill into, so
+    // tapping adds the flavor directly as a second exploration ingredient.
+    const renderFlavorChip = (category) => (
+      <span key={category}
+        onClick={() => handleAddAndAnalyze(titleCase(category))}
+        style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.surface, border: `1px solid ${C.border}`, color: C.textMuted, cursor: 'pointer' }}>
+        {titleCase(category)}
+      </span>
+    )
+
     return (
       <div>
+        <style>{`@keyframes bcshimmer { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }`}</style>
         <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
         <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 24 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
         {affinityError && (
@@ -3441,37 +3617,39 @@ Rules:
         {selected.map((ingName, i) => {
           const normName = ingName.trim().toLowerCase()
           const row = affinityData[normName]
-          const spiritTags = row?.spirit_tags || []
-          const flavorTags = row?.flavor_tags || []
-          const matches = getInventoryMatches(spiritTags)
+          const contextual = contextualAffinityData[i]
+          // Streaming in: contextual replaces base wholesale per section once it
+          // arrives (Change 3) — a swap, not a merge, since contextual is what
+          // carries the role tags the forbidden-category filter depends on.
+          const resolving = contextualAffinityLoading && !contextual
+          const prose = contextual?.contextual_prose || row?.flavor_affinities || 'No affinity data available for this ingredient.'
+          const spiritCats = contextual ? (contextual.spirit_categories || []).map(c => c.category) : (row?.spirit_tags || [])
+          const flavorCats = contextual ? (contextual.flavor_categories || []).map(c => c.category) : (row?.flavor_tags || [])
+          const shimmerStyle = resolving ? { animation: 'bcshimmer 1.6s ease-in-out infinite' } : {}
           return (
             <div key={normName}>
               {i > 0 && <div style={{ borderTop: `1px solid ${C.border}`, margin: '20px 0' }} />}
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.gold, marginBottom: 12 }}>{ingName}</div>
-              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 16 }}>
-                <div style={{ fontSize: 14, color: row?.flavor_affinities ? C.textMuted : C.textFaint, lineHeight: 1.55 }}>
-                  {row?.flavor_affinities || 'No affinity data available for this ingredient.'}
+              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 16, minHeight: 52, boxSizing: 'border-box', ...shimmerStyle }}>
+                <div style={{ fontSize: 14, color: prose ? C.textMuted : C.textFaint, lineHeight: 1.55 }}>
+                  {prose}
                 </div>
               </div>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Pairs Well With — Spirits</div>
-              <div style={{ marginBottom: 16 }}>
-                {matches.length > 0 ? (
+              <div style={{ marginBottom: 16, ...shimmerStyle }}>
+                {spiritCats.length > 0 ? (
                   <div style={{ display: 'flex', flexWrap: 'wrap' }}>
-                    {matches.map(spirit => (
-                      <span key={spirit} onClick={() => handleAddAndAnalyze(spirit)} style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.gold + '22', border: `1px solid ${C.gold}44`, color: C.gold, cursor: 'pointer' }}>{spirit}</span>
-                    ))}
+                    {spiritCats.map(renderSpiritChip)}
                   </div>
                 ) : (
-                  <div style={{ fontSize: 13, color: C.textFaint }}>None in your current inventory</div>
+                  <div style={{ fontSize: 13, color: C.textFaint }}>No spirit affinities available</div>
                 )}
               </div>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Pairs Well With — Flavors</div>
-              <div style={{ marginBottom: 8 }}>
-                {flavorTags.length > 0 ? (
+              <div style={{ marginBottom: 8, ...shimmerStyle }}>
+                {flavorCats.length > 0 ? (
                   <div style={{ display: 'flex', flexWrap: 'wrap' }}>
-                    {flavorTags.map(tag => (
-                      <span key={tag} onClick={() => handleAddAndAnalyze(tag)} style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.surface, border: `1px solid ${C.border}`, color: C.textMuted, cursor: 'pointer' }}>{tag}</span>
-                    ))}
+                    {flavorCats.map(renderFlavorChip)}
                   </div>
                 ) : (
                   <div style={{ fontSize: 13, color: C.textFaint }}>No flavor tags available</div>
@@ -3480,6 +3658,15 @@ Rules:
             </div>
           )
         })}
+        {categoryDrawer && (
+          <CategoryBottlesDrawer
+            category={categoryDrawer.category}
+            bottles={categoryDrawer.bottles}
+            onAddGeneric={() => { setCategoryDrawer(null); handleAddAndAnalyze(categoryDrawer.category) }}
+            onAddBottle={(spirit) => { setCategoryDrawer(null); handleAddAndAnalyze(spirit) }}
+            onClose={() => setCategoryDrawer(null)}
+          />
+        )}
         {!showIngredientAdder ? (
           <button
             onClick={() => setShowIngredientAdder(true)}
@@ -3636,9 +3823,9 @@ Rules:
           🎲 Surprise Me
         </button>
 
-        <button onClick={() => goToStep('affinities')} disabled={!template}
-          style={{ width: '100%', background: template ? C.gold : C.surface, border: `1px solid ${template ? C.gold : C.border}`, borderRadius: 10, color: template ? '#0f0f0f' : C.textFaint, fontWeight: 700, fontSize: 15, padding: '13px', cursor: template ? 'pointer' : 'default', transition: 'background 0.15s, color 0.15s' }}>
-          Continue →
+        <button onClick={handleContinueToAffinities} disabled={!template || affinityLoading}
+          style={{ width: '100%', background: template ? C.gold : C.surface, border: `1px solid ${template ? C.gold : C.border}`, borderRadius: 10, color: template ? '#0f0f0f' : C.textFaint, fontWeight: 700, fontSize: 15, padding: '13px', cursor: (template && !affinityLoading) ? 'pointer' : 'default', opacity: affinityLoading ? 0.7 : 1, transition: 'background 0.15s, color 0.15s' }}>
+          {affinityLoading ? 'Loading…' : 'Continue →'}
         </button>
 
         {infoSheetTemplate && <TemplateInfoSheet template={infoSheetTemplate} onClose={() => setInfoSheetTemplate(null)} />}
@@ -4272,7 +4459,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
   )
 }
 
-function CreateScreen({ createSubTab, setCreateSubTab, inventory, inventoryText, onSaveOnDeck, user, pendingRestore, onRestoreConsumed, onBackToInProgress, onOpenWhiteboard }) {
+function CreateScreen({ createSubTab, setCreateSubTab, inventory, inventoryText, inventoryTags, onSaveOnDeck, user, pendingRestore, onRestoreConsumed, onBackToInProgress, onOpenWhiteboard }) {
   return (
     <div>
       <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 16 }}>Create</div>
@@ -4288,6 +4475,7 @@ function CreateScreen({ createSubTab, setCreateSubTab, inventory, inventoryText,
         <ExplorationsScreen
           inventory={inventory}
           inventoryText={inventoryText}
+          inventoryTags={inventoryTags}
           onSaveOnDeck={onSaveOnDeck}
           user={user}
           pendingRestore={pendingRestore}
@@ -5067,6 +5255,7 @@ export default function App() {
           setCreateSubTab={setCreateSubTab}
           inventory={inventory}
           inventoryText={inventoryText}
+          inventoryTags={inventoryTags}
           onSaveOnDeck={handleSaveOnDeckFromExploration}
           user={user}
           pendingRestore={pendingExplorationRestore}
