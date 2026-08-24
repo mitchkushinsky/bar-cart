@@ -1417,6 +1417,11 @@ function IngredientDrawer({
 // (Session 4) rather than a new pattern, but shaped around a category with
 // potentially several matching bottles instead of one matched item.
 function CategoryBottlesDrawer({ category, bottles, onAddGeneric, onAddBottle, onClose }) {
+  // Owned bottles and the generic "(unspecified)" option are peers, not a
+  // primary action and a fallback — both add to the exploration, so both
+  // get the same row treatment. Owned bottles list first; the generic
+  // option is always last, whether or not anything is owned.
+  const rowStyle = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', cursor: 'pointer' }
   return (
     <>
       <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 99, transition: 'opacity 0.25s' }} />
@@ -1425,25 +1430,20 @@ function CategoryBottlesDrawer({ category, bottles, onAddGeneric, onAddBottle, o
           <div style={{ fontSize: 20, fontWeight: 800, color: C.text, letterSpacing: '-0.02em' }}>{category}</div>
           <button onClick={onClose} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textMuted, fontSize: 20, lineHeight: 1, padding: '2px 9px', cursor: 'pointer', flexShrink: 0 }}>×</button>
         </div>
-        <div
-          onClick={onAddGeneric}
-          style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: C.gold + '15', border: `1px solid ${C.gold}44`, borderRadius: 8, padding: '10px 12px', marginBottom: 16, cursor: 'pointer' }}>
-          <span style={{ fontSize: 14, fontWeight: 600, color: C.gold }}>Add "{category}"</span>
-          <span style={{ fontSize: 12, color: C.gold }}>+</span>
-        </div>
         {bottles.length > 0 && (
-          <>
-            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>You own</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              {bottles.map(b => (
-                <div key={b.spirit} onClick={() => onAddBottle(b.spirit)} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', cursor: 'pointer' }}>
-                  <span style={{ fontSize: 14, color: C.text }}>{b.spirit}</span>
-                  {b.location && <span style={{ fontSize: 12, color: C.textMuted }}>📍 {b.location}</span>}
-                </div>
-              ))}
-            </div>
-          </>
+          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>You own</div>
         )}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {bottles.map(b => (
+            <div key={b.spirit} onClick={() => onAddBottle(b.spirit)} style={rowStyle}>
+              <span style={{ fontSize: 14, color: C.text }}>{b.spirit}</span>
+              {b.location && <span style={{ fontSize: 12, color: C.textMuted }}>📍 {b.location}</span>}
+            </div>
+          ))}
+          <div onClick={onAddGeneric} style={rowStyle}>
+            <span style={{ fontSize: 14, color: C.text }}>{category} (unspecified)</span>
+          </div>
+        </div>
       </div>
     </>
   )
@@ -3537,6 +3537,21 @@ Rules:
     await analyzeCombination(newSelected, mergedAffinityData)
   }
 
+  // Undoes an ingredient add from the affinities screen — the × on the
+  // "Exploring:" chips. Keeps contextualAffinityData aligned with `selected`
+  // by index, and clears combinationData/Error since it was computed for a
+  // set that included the ingredient being removed. Never removes the last
+  // ingredient — an exploration needs at least one.
+  const handleRemoveIngredient = (ingName) => {
+    if (selected.length <= 1) return
+    const idx = selected.findIndex(s => s === ingName)
+    if (idx === -1) return
+    setSelected(prev => prev.filter((_, i) => i !== idx))
+    setContextualAffinityData(prev => prev.filter((_, i) => i !== idx))
+    setCombinationData(null)
+    setCombinationError(null)
+  }
+
   if (step === 'ingredients') return (
     <div>
       <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 4 }}>Explorations</div>
@@ -3606,11 +3621,28 @@ Rules:
       </span>
     )
 
+    // The template and any active modifiers vanish from view after the
+    // template step otherwise, even though they're the biggest determinant
+    // of what gets generated on this very screen.
+    const activeModifierLabels = [lowABV && 'Low-ABV', na && 'NA', frozen && 'Frozen'].filter(Boolean)
+
     return (
       <div>
         <style>{`@keyframes bcshimmer { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }`}</style>
         <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
-        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 24 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginBottom: 24 }}>
+          <span style={{ fontSize: 13, color: C.textMuted }}>Exploring:</span>
+          {selected.map(ingName => (
+            <span key={ingName} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: C.gold + '22', border: `1px solid ${C.gold}55`, borderRadius: 20, color: C.gold, fontSize: 13, padding: '3px 8px 3px 12px', fontWeight: 500 }}>
+              {ingName}
+              {selected.length > 1 && (
+                <button onClick={() => handleRemoveIngredient(ingName)} style={{ background: 'none', border: 'none', color: C.gold, cursor: 'pointer', fontSize: 15, lineHeight: 1, padding: '0 0 0 2px' }}>×</button>
+              )}
+            </span>
+          ))}
+          {template && <span style={{ fontSize: 13, color: C.textMuted }}>· {TEMPLATE_MAP[template]?.name || template}</span>}
+          {activeModifierLabels.length > 0 && <span style={{ fontSize: 13, color: C.textMuted }}>· {activeModifierLabels.join(', ')}</span>}
+        </div>
         {affinityError && (
           <div style={{ background: C.amber + '15', border: `1px solid ${C.amber}44`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.amber, marginBottom: 20 }}>{affinityError}</div>
         )}
