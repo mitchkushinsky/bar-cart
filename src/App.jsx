@@ -650,9 +650,32 @@ A split base (two complementary spirits) is a valid output when the inventory an
   return block
 }
 
+// Tier-1 search bias fix: a user-typed ingredient like "muddled cucumber" names
+// a preparation, not a product — canonical published recipes list "cucumber"
+// as the ingredient and muddling as method, so carrying the prep word into the
+// search query and the ingredient-presence check biases the search toward
+// blog content titled after its own wording and away from named drinks. Strip
+// only this short, conservative list for SEARCH PURPOSES; the raw ingredient
+// name (with prep word intact) is preserved everywhere else in the app for
+// display, and is still handed to the model as a hint below — muddling is
+// real signal toward a Sour/Smash build, not noise to discard.
+const PREP_WORDS = new Set(['muddled', 'fresh', 'chilled', 'torched', 'smoked', 'grilled', 'crushed'])
+function stripPrepWordsForSearch(name) {
+  const kept = name.trim().split(/\s+/).filter(w => !PREP_WORDS.has(w.toLowerCase()))
+  const result = kept.join(' ').trim()
+  return result || name
+}
+
 async function analyzeExplorationsRecipes(ingredients, template, modifiers, inventoryText, excludeNames = []) {
   const t = TEMPLATE_MAP[template]
-  const ingredientPhrase = ingredients.join(' and ')
+  const searchIngredients = ingredients.map(stripPrepWordsForSearch)
+  const ingredientPhrase = searchIngredients.join(' and ')
+  const prepHints = ingredients
+    .map((original, i) => ({ original, stripped: searchIngredients[i] }))
+    .filter(p => p.stripped.toLowerCase() !== p.original.toLowerCase())
+  const prepNote = prepHints.length > 0
+    ? `\nPREPARATION NOTE: the user wrote ${prepHints.map(p => `"${p.original}"`).join(' and ')}. Search and match on the underlying ingredient — ${prepHints.map(p => `"${p.stripped}"`).join(', ')} — since published recipes list the ingredient by name, not by prep method. But don't discard the preparation itself: it's a real signal for which drink style to prioritize (e.g. "muddled" points toward a Sour or Smash build rather than an infusion), so let it inform your selection and how you present the result.`
+    : ''
   const body = {
     model: MODEL,
     max_tokens: 3000,
@@ -664,6 +687,7 @@ async function analyzeExplorationsRecipes(ingredients, template, modifiers, inve
 Today's date is ${TODAY}.
 
 FEATURED INGREDIENTS: ${ingredients.join(' and ')}
+${prepNote}
 
 ${buildTemplateContext(template, modifiers)}
 
@@ -675,12 +699,14 @@ SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated
 First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
 Otherwise, scope your web search itself to this template's family — search for terms like "published ${t.name} cocktail recipes with ${ingredientPhrase}" or "${ingredientPhrase} ${t.name} variation," not just "${ingredientPhrase} cocktail" — to find 2–3 published recipes that genuinely belong to this template.
+
+Prefer named, attributable cocktails over generic ingredient-titled recipes when deciding what to return AND what order to return it in. "Eastside," "Southside," "Last Word," "Bee's Knees" — drinks with a real history, a creator, or bar provenance — are the canon; "Cucumber Gin Sour," "Cucumber Gimlet with Rosemary" are recipe-blog content titled after their own ingredient list. Both are legitimate results, but a named drink outranks a generic one, so it goes first. This means searching for named cocktails that CONTAIN these ingredients, not just for recipes DESCRIBED BY these ingredients — a canonical drink's own title frequently does not contain the ingredient words at all (an Eastside's title says nothing about cucumber or gin), which is exactly why a title-keyword-only search misses it and surfaces the blog content instead. If you already know of a well-known drink in this template's family that features these ingredients, search to verify and source it specifically, don't wait for it to surface from a generic search. Where a drink has a known creator, bar, or era, that itself is strong evidence it belongs in the first batch, not a later one.
 ${excludeNames.length > 0 ? `\nALREADY SURFACED — the user has already seen these recipes, do not return them again, find genuinely different published recipes: ${excludeNames.join(', ')}.\n` : ''}
 If a published recipe you find doesn't genuinely belong to this template's family, leave it out of your results rather than including it anyway — never rewrite, restructure, or "correct" a real published recipe to make it fit. A published recipe is presented exactly as published, or not at all.
 
 Search both directions of category and brand for each featured ingredient. If it's a generic category (e.g. "coconut liqueur," "rye whiskey," "blanco tequila"), also search well-known specific products within that category (e.g. Malibu, Kalani, Coco Reàl for coconut liqueur) — published cocktail writing is overwhelmingly brand-specific, so a category-only search under-returns real matches. If it's a specific bottle (e.g. "Clement Mahina Coconut Rhum Liqueur"), also search the generic category term (e.g. "coconut liqueur") — a recipe published for the category is a genuine match for the specific bottle too, and category-level recipes are far more common than ones naming an exact product.
 
-CRITICAL: Every featured ingredient (${ingredients.join(', ')}) must appear as an actual ingredient in the recipe's ingredient list — under its own name, a brand name within its category, or the generic category name. A drink that merely shares a flavor or theme with a featured ingredient, without actually containing it, does not satisfy the requirement.
+CRITICAL: Every featured ingredient (${searchIngredients.join(', ')}) must appear as an actual ingredient in the recipe's ingredient list — under its own name, a brand name within its category, or the generic category name. A drink that merely shares a flavor or theme with a featured ingredient, without actually containing it, does not satisfy the requirement.
 
 ${SEED_INGREDIENT_EXEMPT}
 
@@ -696,7 +722,7 @@ ${CAN_MAKE_NOW_RULE}
 
 If you cannot find 2–3 published recipes that include ALL featured ingredients, return as many as you can find (even 0 or 1). If no qualifying published recipes exist, return an empty suggestions array and set "no_recipes_found": true. Do NOT invent original recipes in this call — that is handled separately.
 
-Separately from how many you return, report whether more genuinely exist: set "more_published_exist" to true only if you are aware of ADDITIONAL genuine published recipes for this ingredient/template combination beyond the ones you returned here — not ones you're merely guessing might exist. Set it false if these are all that genuinely exist, or if you found none at all. Do not set it true speculatively; false is a real and useful answer that tells the user something true about the canon. This field must be present on every response, including when no_recipes_found is true (where it should ordinarily be false).
+Separately from how many you return, report whether more genuinely exist: set "more_published_exist" to true only if you are aware of ADDITIONAL genuine published recipes for this ingredient/template combination beyond the ones you returned here — not ones you're merely guessing might exist. Setting it false is a specific claim — that no further NAMED, attributable cocktail exists for this combination beyond what you found — not that the batch you're returning merely feels sufficient. If everything in your results is a generic, ingredient-titled recipe rather than a named drink, treat that as evidence more canon likely exists rather than as a sign the search is complete, and lean toward true unless you're genuinely confident nothing else is out there. This doesn't license speculation the other way either: false is still the honest, correct answer whenever it's actually true — the fix is not defaulting to false, not avoiding it. This field must be present on every response, including when no_recipes_found is true (where it should ordinarily be false).
 
 Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
 
