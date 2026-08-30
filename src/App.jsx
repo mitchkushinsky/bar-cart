@@ -604,7 +604,7 @@ Use this exact JSON structure:
   "glass_type": "coupe | rocks | tiki | collins | null",
   "recipe": [{ "ingredient": "string", "amount": "string" }],
   "instructions": "string",
-  "summary": "1-2 sentence overall assessment of whether they can make this",
+  "summary": "1-2 sentence description of the drink itself — flavor profile and character (e.g. \"Bright and citrus-forward with a bitter backbone\"). Never inventory status or whether the user can make it — that's already conveyed separately by ingredient status, not summary.",
   "ingredients": [
     {
       "ingredient": "string",
@@ -641,15 +641,23 @@ async function analyzeRecipePhoto(imageFile, inventoryText) {
     }],
   })
   const body = buildBody(MAX_TOKENS)
+  // origin is set as a constant, not asked of the model: a screenshot handed
+  // to this path is, by construction, a screenshot of a recipe — the most
+  // directly "published" thing this app encounters, on the same footing as
+  // tier-1's web-sourced recipes. Some screenshots are themselves an
+  // LLM-generated adaptation rather than a canonical published recipe; the
+  // app has no way to tell, and a slightly loose 📖 beats no badge at all.
   try {
-    return { data: await callClaude(body, { detectTruncation: true }), body }
+    const data = await callClaude(body, { detectTruncation: true })
+    return { data: { ...data, origin: 'published' }, body }
   } catch (err) {
     if (err.code !== 'truncated' && err.code !== 'parse_failed') throw err
     // This path previously had no retry at all. A truncated or malformed
     // first attempt gets exactly one retry, with a meaningfully larger
     // budget than the call it's retrying — not a repeat of the same call.
     const retryBody = buildBody(Math.round(MAX_TOKENS * 1.5))
-    return { data: await callClaude(retryBody, { detectTruncation: true }), body: retryBody }
+    const data = await callClaude(retryBody, { detectTruncation: true })
+    return { data: { ...data, origin: 'published' }, body: retryBody }
   }
 }
 
@@ -663,7 +671,11 @@ async function analyzeCocktailName(name, inventoryText) {
       content: `Use web search to look up the canonical recipe for the cocktail "${name}". This is especially important for obscure or modern cocktails where training data may be inaccurate. Then check each ingredient against the bar inventory and provide a full analysis.\n\n${sharedPromptSuffix(inventoryText)}`,
     }],
   }
-  return { data: await callClaude(body), body }
+  // Same reasoning as analyzeRecipePhoto: this path exists to retrieve the
+  // canonical recipe for a named cocktail, never to invent one — origin is
+  // a constant, not a model report.
+  const data = await callClaude(body)
+  return { data: { ...data, origin: 'published' }, body }
 }
 
 async function analyzeCocktailNameTrainingOnly(name, inventoryText) {
@@ -677,6 +689,7 @@ async function analyzeCocktailNameTrainingOnly(name, inventoryText) {
   }
   const data = await callClaude(body)
   data._trainingDataFallback = true
+  data.origin = 'published'
   return { data, body }
 }
 
@@ -712,6 +725,11 @@ async function analyzeBarMenu(menuFile, cocktailName, inventoryText, cocktailPho
     text: `The first image shows a bar menu. Find the cocktail named "${cocktailName}" in the menu. Read its description carefully and infer the most likely ingredients from it. Set "inferred": true for any ingredient you are inferring from a vague description rather than one that is explicitly listed. Then check each ingredient against the bar inventory and provide a full analysis.\n\n${sharedPromptSuffix(inventoryText, { hasImage: true })}`,
   })
   const body = { model: MODEL, max_tokens: MAX_TOKENS, messages: [{ role: 'user', content }] }
+  // Deliberately no origin set here (Session 7a). Unlike the photo/name paths,
+  // this one infers ingredients from a menu description the model never saw
+  // spelled out — closer to a reconstruction than a transcription of a known
+  // recipe. Left unset (no badge, matching current behavior) rather than
+  // guessing at "published".
   return { data: await callClaude(body), body }
 }
 
@@ -2102,7 +2120,7 @@ function FavoriteCard({ fav, onRemove, onView, onUpdateNote }) {
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 16, color: C.gold, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 7 }}>{fav.recipeName}{fav.glassType && <GlassIcon type={fav.glassType} size={15} />}</div>
-          {fav.source === 'Exploration' && (
+          {(fav.origin || fav.originFlag || fav.difficulty) && (
             <div style={{ display: 'flex', gap: 6, marginBottom: 6, flexWrap: 'wrap' }}>
               <OriginBadge origin={fav.origin} originFlag={fav.originFlag} />
               <DifficultyBadge difficulty={fav.difficulty} />
@@ -2174,7 +2192,7 @@ function ToMakeCard({ item, onRemove, onView }) {
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 16, color: C.blue, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 7 }}>{item.recipeName}{item.glassType && <GlassIcon type={item.glassType} size={15} />}</div>
-          {item.source === 'Exploration' && (
+          {(item.origin || item.originFlag || item.difficulty) && (
             <div style={{ display: 'flex', gap: 6, marginBottom: 6, flexWrap: 'wrap' }}>
               <OriginBadge origin={item.origin} originFlag={item.originFlag} />
               <DifficultyBadge difficulty={item.difficulty} />
