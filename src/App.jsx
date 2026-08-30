@@ -43,6 +43,25 @@
 // alter table favorites add column if not exists origin text;
 // alter table to_make add column if not exists origin text;
 //
+// Session 7b: structured attribution (creator/bar/year/source), same shape and
+// same failure to avoid as 3d's origin threading — new rows only, no backfill.
+// Named attribution_source rather than source: this table already has a
+// `source` column meaning "which analyze mode produced this row" (Recipe
+// Screenshot / Bar Menu / Cocktail Name / Exploration) — reusing that name for
+// citation source would collide with it. attribution_user_supplied is a single
+// per-record flag (not per-field): true once the user has hand-edited any of
+// the four fields, so a later re-analysis never overwrites it.
+// alter table favorites add column if not exists creator text;
+// alter table favorites add column if not exists bar text;
+// alter table favorites add column if not exists year text;
+// alter table favorites add column if not exists attribution_source text;
+// alter table favorites add column if not exists attribution_user_supplied boolean default false;
+// alter table to_make add column if not exists creator text;
+// alter table to_make add column if not exists bar text;
+// alter table to_make add column if not exists year text;
+// alter table to_make add column if not exists attribution_source text;
+// alter table to_make add column if not exists attribution_user_supplied boolean default false;
+//
 // create table if not exists in_the_lab (
 //   id uuid default gen_random_uuid() primary key,
 //   user_id uuid references auth.users not null,
@@ -297,6 +316,22 @@ const RIFF_DISCIPLINE_BATCH = `${RIFF_DISCIPLINE_CORE}
 3. DISTINCTNESS WITHIN THE SET. Two returned riffs that differ only by an interchangeable bottle are one riff — return the better one, not both.
 Above all three: generate as many riffs as are genuinely good, not as many as are constructible. Four good riffs beat twelve mechanical ones. If only two are genuinely distinct, two is the honest answer — the same principle as tier-1 returning an empty state rather than stretching.
 4. HARD CAP: at most 4 suggestions total in this batch, and fewer whenever fewer are genuinely distinct. This is a ceiling, not a quota — "return 4" is wrong when only 2 are genuinely good. Two good riffs is a correct and complete answer.`
+
+// Session 7b: shared between sharedPromptSuffix (Analyze) and
+// analyzeExplorationsRecipes (tier-1) so the same citation discipline governs
+// attribution wherever it's asked for. Carries forward the 3c rule verbatim in
+// spirit — populate when genuinely known, leave null when not, never guess —
+// now applied to four structured fields instead of a sentence woven into
+// summary prose. Deliberately does not distinguish "read from the image" from
+// "recognized from training knowledge" — both are model-supplied, and the app
+// has no way to tell them apart after the fact, so there's nothing honest to
+// gain by pretending otherwise.
+const ATTRIBUTION_FIELDS_INSTRUCTION = `ATTRIBUTION — populate creator, bar, year, and attribution_source independently, each only when genuinely known:
+- creator: the person who created the drink.
+- bar: the bar or venue where it originated.
+- year: the year (or approximate era, e.g. "1930s") it was created.
+- attribution_source: the publication, book, or site it's documented in.
+Fill in whichever of these you're genuinely confident of, from the image itself or from your own knowledge of the drink — these two are not distinguished, both count as known. Leave any field you're not confident of as null; do not guess, and do not fill in a plausible-sounding value to avoid leaving a field empty. A hallucinated attribution is worse than a missing one. Most drinks will have some fields null — that's the expected, honest result, not a failure.`
 
 // Session 5: shared verbatim across every prompt that asks the model to set an
 // ingredient's "status" and a suggestion's can_make_now, so the two rules can't
@@ -598,13 +633,19 @@ Common fresh garnishes (orange peel, lemon twist, lime wheel, citrus peels, fres
 
 ${OWNERSHIP_STATUS_RULES}
 
+${ATTRIBUTION_FIELDS_INSTRUCTION}
+
 Use this exact JSON structure:
 {
   "recipe_name": "string",
   "glass_type": "coupe | rocks | tiki | collins | null",
   "recipe": [{ "ingredient": "string", "amount": "string" }],
   "instructions": "string",
-  "summary": "1-2 sentence description of the drink itself — flavor profile and character (e.g. \"Bright and citrus-forward with a bitter backbone\"). Never inventory status or whether the user can make it — that's already conveyed separately by ingredient status, not summary.",
+  "summary": "1-2 sentence description of the drink itself — flavor profile and character (e.g. \"Bright and citrus-forward with a bitter backbone\"). Never inventory status, whether the user can make it, or attribution — those are conveyed separately, not summary.",
+  "creator": "string or null",
+  "bar": "string or null",
+  "year": "string or null",
+  "attribution_source": "string or null",
   "ingredients": [
     {
       "ingredient": "string",
@@ -822,9 +863,9 @@ If you cannot find 2–3 published recipes that include ALL featured ingredients
 
 Separately from how many you return, report whether more genuinely exist: set "more_published_exist" to true only if you are aware of ADDITIONAL genuine published recipes for this ingredient/template combination beyond the ones you returned here — not ones you're merely guessing might exist. Setting it false is a specific claim — that no further NAMED, attributable cocktail exists for this combination beyond what you found — not that the batch you're returning merely feels sufficient. If everything in your results is a generic, ingredient-titled recipe rather than a named drink, treat that as evidence more canon likely exists rather than as a sign the search is complete, and lean toward true unless you're genuinely confident nothing else is out there. This doesn't license speculation the other way either: false is still the honest, correct answer whenever it's actually true — the fix is not defaulting to false, not avoiding it. This field must be present on every response, including when no_recipes_found is true (where it should ordinarily be false).
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Never inventory status, ownership, or attribution in summary — those are conveyed separately. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type, creator, bar, year, attribution_source).
 
-If — and only if — you are genuinely confident of the recipe's origin (who created it, and where/when), weave that attribution into the summary prose, e.g. "Created by Audrey Saunders at Pegu Club, 2005." Most published recipes don't have a confidently attributable origin — when you don't know, simply don't mention it. Never guess or imply an origin you're not sure of; staying silent is always better than a wrong or invented attribution.
+${ATTRIBUTION_FIELDS_INSTRUCTION}
 
 Every entry in each suggestion's "recipe" array must include a "role" field from this fixed enum, describing its functional role in the build: base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish. "citrus" means citrus juice used as a structural component — a citrus peel or twist used only as garnish is role "garnish", not "citrus". Every ingredient in the recipe gets exactly one role.
 
@@ -846,7 +887,11 @@ Return ONLY valid JSON with no markdown fences:
       "difficulty": "easy | medium | hard",
       "difficulty_note": "One sentence explaining difficulty",
       "can_make_now": true,
-      "summary": "1-2 sentence description including a flavor characterization",
+      "summary": "1-2 sentence description including a flavor characterization. Never creator, bar, year, or source here — those go in the dedicated fields below, not summary.",
+      "creator": "string or null",
+      "bar": "string or null",
+      "year": "string or null",
+      "attribution_source": "string or null",
       "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }],
       "instructions": "string",
       "glass_type": "coupe | rocks | tiki | collins | null",
@@ -1579,6 +1624,92 @@ function CategoryBottlesDrawer({ category, bottles, onAddGeneric, onAddBottle, o
   )
 }
 
+// Session 7b: structured attribution. Labeled fields, not assembled prose —
+// four optional values rendered as discrete rows rather than a sentence, so a
+// missing-field permutation never has to be handled in wording and each value
+// stays independently editable. Quiet styling throughout: this is metadata
+// subordinate to the recipe, not a headline.
+const ATTRIBUTION_FIELDS = [
+  { key: 'creator', label: 'Creator' },
+  { key: 'bar', label: 'Bar' },
+  { key: 'year', label: 'Year' },
+  { key: 'attributionSource', label: 'Source' },
+]
+
+function AttributionDisplay({ recipe, onEdit }) {
+  const hasAny = ATTRIBUTION_FIELDS.some(f => recipe?.[f.key])
+  if (!hasAny) {
+    // Nothing known — render only a quiet entry point to add it, when editing
+    // is available; genuinely nothing otherwise (no "unknown", no hedging).
+    if (!onEdit) return null
+    return (
+      <button onClick={onEdit} style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0, marginBottom: 10, display: 'block' }}>
+        + Add attribution
+      </button>
+    )
+  }
+  return (
+    <div onClick={onEdit} style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 10, marginBottom: 10, cursor: onEdit ? 'pointer' : 'default', width: 'fit-content' }}>
+      {ATTRIBUTION_FIELDS.map(f => recipe[f.key] && (
+        <div key={f.key} style={{ fontSize: 13, color: C.textMuted }}>
+          <span style={{ color: C.textFaint, fontSize: 11 }}>{f.label}: </span>{recipe[f.key]}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function AttributionDrawer({ recipe, onSave, onClose, saving, error }) {
+  const [creator, setCreator] = useState(recipe?.creator || '')
+  const [bar, setBar] = useState(recipe?.bar || '')
+  const [year, setYear] = useState(recipe?.year || '')
+  const [attributionSource, setAttributionSource] = useState(recipe?.attributionSource || '')
+
+  const inputStyle = { width: '100%', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: '8px 10px', fontSize: 14, boxSizing: 'border-box', outline: 'none' }
+  const labelStyle = { fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 6, display: 'block' }
+
+  const handleSave = () => onSave({
+    creator: creator.trim() || null,
+    bar: bar.trim() || null,
+    year: year.trim() || null,
+    attributionSource: attributionSource.trim() || null,
+  })
+
+  return (
+    <>
+      <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 99, transition: 'opacity 0.25s' }} />
+      <div style={{ position: 'fixed', bottom: 0, left: '50%', transform: 'translateX(-50%)', width: '100%', maxWidth: 700, background: '#1c1c1c', borderTop: `1px solid ${C.border}`, borderTopLeftRadius: 18, borderTopRightRadius: 18, padding: '20px 20px 36px', zIndex: 100, maxHeight: '80vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 16 }}>
+          <div style={{ fontSize: 20, fontWeight: 800, color: C.text, letterSpacing: '-0.02em' }}>Attribution</div>
+          <button onClick={onClose} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textMuted, fontSize: 20, lineHeight: 1, padding: '2px 9px', cursor: 'pointer', flexShrink: 0 }}>×</button>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 16 }}>
+          <div>
+            <label style={labelStyle}>Creator</label>
+            <input value={creator} onChange={e => setCreator(e.target.value)} placeholder="e.g. Audrey Saunders" style={inputStyle} />
+          </div>
+          <div>
+            <label style={labelStyle}>Bar</label>
+            <input value={bar} onChange={e => setBar(e.target.value)} placeholder="e.g. Pegu Club" style={inputStyle} />
+          </div>
+          <div>
+            <label style={labelStyle}>Year</label>
+            <input value={year} onChange={e => setYear(e.target.value)} placeholder="e.g. 2005" style={inputStyle} />
+          </div>
+          <div>
+            <label style={labelStyle}>Source</label>
+            <input value={attributionSource} onChange={e => setAttributionSource(e.target.value)} placeholder="e.g. The PDT Cocktail Book" style={inputStyle} />
+          </div>
+        </div>
+        {error && <div style={{ fontSize: 13, color: C.red, marginBottom: 12 }}>{error}</div>}
+        <button onClick={handleSave} disabled={saving} style={{ width: '100%', background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '12px', cursor: saving ? 'default' : 'pointer', opacity: saving ? 0.7 : 1 }}>
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+      </div>
+    </>
+  )
+}
+
 // ─── Ingredient Card ──────────────────────────────────────────────────────────
 
 function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer }) {
@@ -1698,13 +1829,14 @@ function DifficultyBadge({ difficulty }) {
 // ─── Results ──────────────────────────────────────────────────────────────────
 
 // TODO: unify with shared RecipeCard once the Analyze/Name/Menu flow is in scope (Session 1.5)
-function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, onFeedback, feedbackLoading, inventory, feedbackError }) {
+function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, onFeedback, feedbackLoading, inventory, feedbackError, onOpenAttributionEdit }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
   const adjustmentNoteRef = useRef(null)
   const [drawerItem, setDrawerItem] = useState(null)
   const [flavorCache, setFlavorCache] = useState({})
   const [drawerLoading, setDrawerLoading] = useState(false)
+  const [saveError, setSaveError] = useState(null)
 
   useEffect(() => {
     if (adjustmentNote) {
@@ -1743,6 +1875,15 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
     if (ok) setFeedbackText('')
   }
 
+  const handleToggleToMake = async () => {
+    setSaveError(null)
+    try { await onToggleToMake(result) } catch (err) { setSaveError(err.message || 'Could not save this recipe. Please try again.') }
+  }
+  const handleToggleFavorite = async () => {
+    setSaveError(null)
+    try { await onToggleFavorite(result) } catch (err) { setSaveError(err.message || 'Could not save this recipe. Please try again.') }
+  }
+
   return (
     <div style={{ marginTop: 36, opacity: feedbackLoading ? 0.5 : 1, transition: 'opacity 0.3s', pointerEvents: feedbackLoading ? 'none' : 'auto' }}>
       {/* Name */}
@@ -1753,26 +1894,30 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
         {result.glass_type && <GlassIcon type={result.glass_type} size={22} />}
       </div>
       {/* Action buttons */}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
         <button
-          onClick={() => onToggleToMake(result)}
+          onClick={handleToggleToMake}
           style={{ background: 'none', border: `1px solid ${isToMake ? C.blue : C.border}`, borderRadius: 20, color: isToMake ? C.blue : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
         >
           {isToMake ? '🍹 Saved to On Deck' : '🍹 On Deck'}
         </button>
         <button
-          onClick={() => onToggleFavorite(result)}
+          onClick={handleToggleFavorite}
           style={{ background: 'none', border: `1px solid ${isFav ? C.gold : C.border}`, borderRadius: 20, color: isFav ? C.gold : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
         >
           {isFav ? '♥ Saved' : '♡ Save to Favorites'}
         </button>
       </div>
+      {saveError && <div style={{ fontSize: 13, color: C.red, marginBottom: 12 }}>{saveError}</div>}
 
       {result.summary && (
-        <p style={{ color: C.textMuted, fontSize: 15, marginBottom: result._trainingDataFallback ? 10 : 24, lineHeight: 1.65, maxWidth: 600 }}>
+        <p style={{ color: C.textMuted, fontSize: 15, marginBottom: result._trainingDataFallback ? 10 : 0, lineHeight: 1.65, maxWidth: 600 }}>
           {result.summary}
         </p>
       )}
+
+      {onOpenAttributionEdit && <AttributionDisplay recipe={result} onEdit={onOpenAttributionEdit} />}
+
       {result._trainingDataFallback && (
         <p style={{ fontSize: 12, color: C.textFaint, marginBottom: 20 }}>Recipe sourced from training data — web search unavailable.</p>
       )}
@@ -2680,6 +2825,7 @@ function RecipeCard({
 }) {
   const [expanded, setExpanded] = useState(!!autoExpand)
   const [savedTo, setSavedTo] = useState(null)
+  const [saveError, setSaveError] = useState(null)
   const [tweakedSuggestion, setTweakedSuggestion] = useState(null)
   const [tweakDone, setTweakDone] = useState(false)
   const [tweakModalOpen, setTweakModalOpen] = useState(false)
@@ -2726,9 +2872,14 @@ function RecipeCard({
 
   const displayed = tweakedSuggestion || suggestion
 
-  const handleOnDeck = () => {
-    onSaveOnDeck(displayed, primaryIngredients)
-    setSavedTo('ondeck')
+  const handleOnDeck = async () => {
+    setSaveError(null)
+    try {
+      await onSaveOnDeck(displayed, primaryIngredients)
+      setSavedTo('ondeck')
+    } catch (err) {
+      setSaveError(err?.message || 'Could not save to On Deck.')
+    }
   }
 
   const handleToggleExpand = async () => {
@@ -2838,6 +2989,8 @@ function RecipeCard({
 
       {displayed.summary && <p style={{ fontSize: 14, color: C.textMuted, lineHeight: 1.55, marginBottom: 10 }}>{displayed.summary}</p>}
 
+      {showSaveButtons && <AttributionDisplay recipe={{ ...displayed, attributionSource: displayed.attribution_source }} />}
+
       {displayed.watch_outs && <p style={{ fontSize: 12, color: C.textFaint, fontStyle: 'italic', lineHeight: 1.5, marginTop: -4, marginBottom: 10 }}>{displayed.watch_outs}</p>}
 
       {lineage && (
@@ -2927,6 +3080,9 @@ function RecipeCard({
         ) : (
           <button onClick={handleOnDeck} style={{ background: 'none', border: `1px solid ${C.blue}`, borderRadius: 20, color: C.blue, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>🍹 On Deck</button>
         ))}
+        {showSaveButtons && saveError && (
+          <div style={{ fontSize: 12, color: C.red, width: '100%' }}>{saveError}</div>
+        )}
       </div>
 
       {showRefineCTA && (
@@ -4733,6 +4889,8 @@ export default function App() {
     glassType: row.glass_type || null, note: row.notes || '', mode: row.mode,
     source: row.source || 'manual', origin: row.origin || null, originFlag: row.origin_flag || null,
     difficulty: row.difficulty || null, primaryIngredients: row.primary_ingredients || [],
+    creator: row.creator || null, bar: row.bar || null, year: row.year || null,
+    attributionSource: row.attribution_source || null, attributionUserSupplied: row.attribution_user_supplied === true,
     savedAt: row.saved_at,
   })
 
@@ -4743,6 +4901,8 @@ export default function App() {
     glassType: row.glass_type || null, mode: row.mode,
     source: row.source || 'manual', origin: row.origin || null, originFlag: row.origin_flag || null,
     difficulty: row.difficulty || null, primaryIngredients: row.primary_ingredients || [],
+    creator: row.creator || null, bar: row.bar || null, year: row.year || null,
+    attributionSource: row.attribution_source || null, attributionUserSupplied: row.attribution_user_supplied === true,
     savedAt: row.saved_at,
   })
 
@@ -5071,7 +5231,10 @@ export default function App() {
 
   // Favorites helpers
   const toggleFavorite = async (res, extras = {}) => {
-    const { source = 'manual', origin = null, originFlag = null, difficulty = null, primaryIngredients = [] } = extras
+    const {
+      source = 'manual', origin = null, originFlag = null, difficulty = null, primaryIngredients = [],
+      creator = null, bar = null, year = null, attributionSource = null, attributionUserSupplied = false,
+    } = extras
     if (user) {
       const existing = favorites.find(f => f.recipeName === res.recipe_name)
       if (existing) {
@@ -5084,14 +5247,23 @@ export default function App() {
           ingredients: res.ingredients || [], variations: res.variations || [],
           glass_type: res.glass_type || null, source, origin, origin_flag: originFlag,
           difficulty, primary_ingredients: primaryIngredients, saved_at: new Date().toISOString(),
+          creator, bar, year, attribution_source: attributionSource, attribution_user_supplied: attributionUserSupplied,
         }).select().single()
-        if (!error && data) setFavorites(prev => [dbFavToLocal(data), ...prev])
+        // 3d's insert silently no-op'd against a missing column while the UI
+        // still claimed success. Throw instead — a write that didn't happen
+        // must never be reported as one that did.
+        if (error) {
+          const err = new Error(error.message || 'Could not save this recipe. Please try again.')
+          err.code = 'db_write_failed'
+          throw err
+        }
+        if (data) setFavorites(prev => [dbFavToLocal(data), ...prev])
       }
     } else {
       setFavorites(prev => {
         const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
         if (existing >= 0) return prev.filter((_, i) => i !== existing)
-        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, note: '', source, origin, originFlag, difficulty, primaryIngredients, savedAt: new Date().toISOString() }, ...prev]
+        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, note: '', source, origin, originFlag, difficulty, primaryIngredients, creator, bar, year, attributionSource, attributionUserSupplied, savedAt: new Date().toISOString() }, ...prev]
       })
     }
   }
@@ -5108,7 +5280,10 @@ export default function App() {
 
   // To Make helpers
   const toggleToMake = async (res, extras = {}) => {
-    const { source = 'manual', origin = null, originFlag = null, difficulty = null, primaryIngredients = [] } = extras
+    const {
+      source = 'manual', origin = null, originFlag = null, difficulty = null, primaryIngredients = [],
+      creator = null, bar = null, year = null, attributionSource = null, attributionUserSupplied = false,
+    } = extras
     if (user) {
       const existing = toMake.find(f => f.recipeName === res.recipe_name)
       if (existing) {
@@ -5121,14 +5296,22 @@ export default function App() {
           ingredients: res.ingredients || [], variations: res.variations || [],
           glass_type: res.glass_type || null, source, origin, origin_flag: originFlag,
           difficulty, primary_ingredients: primaryIngredients, saved_at: new Date().toISOString(),
+          creator, bar, year, attribution_source: attributionSource, attribution_user_supplied: attributionUserSupplied,
         }).select().single()
-        if (!error && data) setToMake(prev => [dbToMakeToLocal(data), ...prev])
+        // Same failure as 3d, avoided the same way: a write that didn't
+        // happen must never be reported as one that did.
+        if (error) {
+          const err = new Error(error.message || 'Could not save this recipe. Please try again.')
+          err.code = 'db_write_failed'
+          throw err
+        }
+        if (data) setToMake(prev => [dbToMakeToLocal(data), ...prev])
       }
     } else {
       setToMake(prev => {
         const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
         if (existing >= 0) return prev.filter((_, i) => i !== existing)
-        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, source, origin, originFlag, difficulty, primaryIngredients, savedAt: new Date().toISOString() }, ...prev]
+        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, source, origin, originFlag, difficulty, primaryIngredients, creator, bar, year, attributionSource, attributionUserSupplied, savedAt: new Date().toISOString() }, ...prev]
       })
     }
   }
@@ -5141,7 +5324,7 @@ export default function App() {
   const viewToMake = (item) => {
     sourceScrollRef.current = window.scrollY
     setError(null); setAdjustmentNote(null)
-    setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType, origin: item.origin, origin_flag: item.originFlag, difficulty: item.difficulty, source: item.source })
+    setResult({ id: item.id, recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType, origin: item.origin, origin_flag: item.originFlag, difficulty: item.difficulty, source: item.source, creator: item.creator, bar: item.bar, year: item.year, attributionSource: item.attributionSource, attributionUserSupplied: item.attributionUserSupplied })
     setResultSource('ondeck')
     setScreen('analyze')
   }
@@ -5149,7 +5332,7 @@ export default function App() {
   const viewFavorite = (fav) => {
     sourceScrollRef.current = window.scrollY
     setError(null); setAdjustmentNote(null)
-    setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType, origin: fav.origin, origin_flag: fav.originFlag, difficulty: fav.difficulty, source: fav.source })
+    setResult({ id: fav.id, recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType, origin: fav.origin, origin_flag: fav.originFlag, difficulty: fav.difficulty, source: fav.source, creator: fav.creator, bar: fav.bar, year: fav.year, attributionSource: fav.attributionSource, attributionUserSupplied: fav.attributionUserSupplied })
     setResultSource('favorites')
     setScreen('analyze')
   }
@@ -5168,6 +5351,13 @@ export default function App() {
 
   const processResult = useCallback((data) => {
     const filtered = applyGarnishFilter(data)
+    // Raw API JSON uses attribution_source (snake_case); every downstream
+    // consumer of `result` (AttributionDisplay, handleFeedback's protection,
+    // save-hop extras, the edit drawer) reads the camelCase alias, matching
+    // how saved items are normalized on load. Don't clobber an already-set
+    // attributionSource (e.g. handleFeedback's user-supplied protection runs
+    // before this and must survive it).
+    filtered.attributionSource = filtered.attributionSource ?? filtered.attribution_source ?? null
     // Auto-add ingredients whose shelf date has passed
     const now = new Date()
     now.setHours(0, 0, 0, 0)
@@ -5272,13 +5462,61 @@ export default function App() {
         setAdjustmentNote(null)
       }
       setError(null)
-      setResult(processResult(revised))
+      // A user-supplied attribution must survive a feedback revision — the
+      // model was handed the prior result (including these fields) and asked
+      // to "return the same JSON structure," which means it may well echo
+      // back its own guess rather than the user's correction. Protect at the
+      // merge point rather than trusting the model to leave them alone.
+      const protectedRevised = result?.attributionUserSupplied
+        ? { ...revised, creator: result.creator, bar: result.bar, year: result.year, attributionSource: result.attributionSource, attributionUserSupplied: true }
+        : revised
+      setResult(processResult(protectedRevised))
       return true
     } catch (err) {
       setError(err.message || 'Something went wrong. Please try again.')
       return false
     } finally {
       setFeedbackLoading(false)
+    }
+  }
+
+  const [attributionDrawerOpen, setAttributionDrawerOpen] = useState(false)
+  const [attributionSaving, setAttributionSaving] = useState(false)
+  const [attributionError, setAttributionError] = useState(null)
+
+  // Structured attribution edit — the Session 4 inventory drawer's affordance,
+  // applied here. Writes through to the saved row when one exists (viewing an
+  // on-deck/favorite item sets result.id + resultSource); otherwise just
+  // updates the in-progress, not-yet-saved result, which will carry the edit
+  // through whenever it's eventually saved (toggleToMake/toggleFavorite
+  // already read these fields off the result the same way they read origin).
+  const handleUpdateAttribution = async (fields) => {
+    setAttributionSaving(true)
+    setAttributionError(null)
+    try {
+      const withFlag = { ...fields, attributionUserSupplied: true }
+      if (result?.id && resultSource) {
+        const table = resultSource === 'ondeck' ? 'to_make' : 'favorites'
+        if (user) {
+          const { error } = await supabase.from(table).update({
+            creator: fields.creator, bar: fields.bar, year: fields.year,
+            attribution_source: fields.attributionSource, attribution_user_supplied: true,
+          }).eq('id', result.id)
+          if (error) {
+            const err = new Error(error.message || 'Could not save attribution. Please try again.')
+            err.code = 'db_write_failed'
+            throw err
+          }
+        }
+        const setter = resultSource === 'ondeck' ? setToMake : setFavorites
+        setter(prev => prev.map(f => f.id === result.id ? { ...f, ...withFlag } : f))
+      }
+      setResult(prev => ({ ...prev, ...withFlag }))
+      setAttributionDrawerOpen(false)
+    } catch (err) {
+      setAttributionError(err.message || 'Could not save attribution. Please try again.')
+    } finally {
+      setAttributionSaving(false)
     }
   }
 
@@ -5307,8 +5545,11 @@ export default function App() {
 
   const inventoryText = inventory ? inventoryToText(inventory, inventoryTags) : ''
 
-  const handleSaveOnDeckFromExploration = (suggestion, primaryIngredients) => {
-    toggleToMake({ recipe_name: suggestion.recipe_name, summary: suggestion.summary, recipe: suggestion.recipe, instructions: suggestion.instructions, ingredients: suggestion.ingredients, variations: suggestion.variations || [], glass_type: suggestion.glass_type }, { source: 'Exploration', origin: suggestion.origin, originFlag: suggestion.origin_flag, difficulty: suggestion.difficulty, primaryIngredients })
+  // Async and re-throws on failure (rather than swallowing) so RecipeCard's
+  // save button can tell a real success from a failed write and stop
+  // reporting "Saved" when nothing persisted.
+  const handleSaveOnDeckFromExploration = async (suggestion, primaryIngredients) => {
+    await toggleToMake({ recipe_name: suggestion.recipe_name, summary: suggestion.summary, recipe: suggestion.recipe, instructions: suggestion.instructions, ingredients: suggestion.ingredients, variations: suggestion.variations || [], glass_type: suggestion.glass_type }, { source: 'Exploration', origin: suggestion.origin, originFlag: suggestion.origin_flag, difficulty: suggestion.difficulty, primaryIngredients, creator: suggestion.creator, bar: suggestion.bar, year: suggestion.year, attributionSource: suggestion.attribution_source })
   }
 
   return (
@@ -5523,17 +5764,28 @@ export default function App() {
                 shoppingList={shoppingList}
                 onAddToList={addToShopping}
                 favorites={favorites}
-                onToggleFavorite={res => toggleFavorite(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty })}
+                onToggleFavorite={res => toggleFavorite(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty, creator: res.creator, bar: res.bar, year: res.year, attributionSource: res.attributionSource, attributionUserSupplied: res.attributionUserSupplied })}
                 toMake={toMake}
-                onToggleToMake={res => toggleToMake(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty })}
+                onToggleToMake={res => toggleToMake(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty, creator: res.creator, bar: res.bar, year: res.year, attributionSource: res.attributionSource, attributionUserSupplied: res.attributionUserSupplied })}
                 onFeedback={handleFeedback}
                 feedbackLoading={feedbackLoading}
                 inventory={inventory}
                 feedbackError={error}
+                onOpenAttributionEdit={() => setAttributionDrawerOpen(true)}
               />
             </>
           )}
         </>
+      )}
+
+      {attributionDrawerOpen && (
+        <AttributionDrawer
+          recipe={result}
+          onSave={handleUpdateAttribution}
+          onClose={() => { setAttributionDrawerOpen(false); setAttributionError(null) }}
+          saving={attributionSaving}
+          error={attributionError}
+        />
       )}
 
       <BottomTabBar screen={screen} onTab={setScreen} />
