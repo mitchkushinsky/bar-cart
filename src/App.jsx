@@ -348,6 +348,14 @@ The found/substitute boundary is PRODUCT CATEGORY, not flavor similarity. Differ
 
 const CAN_MAKE_NOW_RULE = `Set can_make_now: true when every required ingredient OTHER than the featured ingredient(s) is "found" or "substitute" — the user can make a recognizable version of this drink tonight without buying anything. Set it false only when at least one non-featured ingredient is "missing." Judge this honestly for each suggestion on its own; do not aim for a particular mix of true/false results across a batch — if everything is genuinely makeable, every suggestion should say so.`
 
+// Session 8 (skeleton-first): appended wherever a first-pass listing still
+// needs can_make_now without paying for the per-ingredient breakdown that
+// normally justifies it. Without this, the reasoning tends to come back
+// anyway (as substitute/location prose bleeding into summary, or the model
+// second-guessing and including the array despite the schema omitting it) —
+// stating the suppression explicitly is what actually saves the tokens.
+const CAN_MAKE_NOW_SILENT = `For THIS response, apply the OWNERSHIP STATUS rule above internally, ingredient by ingredient, purely to determine can_make_now — do not include a per-ingredient breakdown, substitute suggestions, locations, or flavor-impact notes anywhere in this response, and do not let that reasoning leak into summary. Think it through, emit only the resulting boolean. The full breakdown is requested separately, later, only for the one recipe the user opens.`
+
 // Placed adjacent to each prompt's "every featured ingredient must appear"
 // requirement, since that is where this carve-out and that requirement would
 // otherwise sit with no boundary between them.
@@ -558,6 +566,142 @@ async function callClaude(body, opts = {}) {
   }
   return extractJSON(textBlock.text)
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// TEMP DIAGNOSTIC INSTRUMENTATION — "Where the Seconds Go" timing diagnostic.
+// Opt-in and additive, same pattern as opts.detectTruncation: only call sites
+// that pass a diagLabel take this path. Every other caller is byte-for-byte
+// unaffected. Globally gated by DIAG_ON (a localStorage flag) so it never
+// fires for normal usage even though the labeled call sites stay in place —
+// enable with `localStorage.setItem('bc_diag','1')` in devtools, then reload.
+//
+// Why streaming: a non-streaming response is one JSON blob with no per-block
+// timestamps, so search (server_tool_use / web_search_tool_result blocks)
+// and generation (the final text block) can't be separated after the fact —
+// only during. This requests `stream: true` from /api/claude (which passes
+// it straight through to Anthropic, see the matching temp block there) and
+// timestamps each content_block_start/stop as it arrives.
+//
+// Removable: delete this block, the DIAG_ON constant, the stream-passthrough
+// branch in api/claude.js, the timing block in api/backfill-affinities.js,
+// and the diagLabel plumbing (default-null params + call-site labels) in
+// analyzeExplorationsRecipes, analyzeExplorationsOriginals,
+// analyzeContextualAffinities, handleExplore, handleSeeMore,
+// handleSeeMorePublished, and ensureAffinityData.
+const DIAG_ON = typeof window !== 'undefined' && window.localStorage?.getItem('bc_diag') === '1'
+
+async function callClaudeStreamDiag(body, label) {
+  const t0 = performance.now()
+  const elapsed = () => Math.round(performance.now() - t0)
+  let res
+  try {
+    res = await fetch('/api/claude', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...body, stream: true }),
+    })
+  } catch (err) {
+    console.error(`[DIAG:${label}] network error`, err.message)
+    throw err
+  }
+  if (!res.ok || !res.body) {
+    const errText = await res.text().catch(() => '')
+    console.error(`[DIAG:${label}] http error`, res.status, errText)
+    throw new Error(`DIAG stream HTTP ${res.status}`)
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  const blocks = {} // index -> { type, name, tStart, tStop }
+  let text = ''
+  let inputTokens = null
+  let outputTokens = null
+  let stopReason = null
+  let tMessageStart = null
+
+  const handleEvent = (raw) => {
+    const dataLine = raw.split('\n').find(l => l.startsWith('data:'))
+    if (!dataLine) return
+    let evt
+    try { evt = JSON.parse(dataLine.slice(5).trim()) } catch { return }
+    switch (evt.type) {
+      case 'message_start':
+        tMessageStart = elapsed()
+        inputTokens = evt.message?.usage?.input_tokens ?? inputTokens
+        console.log(`[DIAG:${label}] message_start ${JSON.stringify({ atMs: tMessageStart, input_tokens: inputTokens })}`)
+        break
+      case 'content_block_start': {
+        const cb = evt.content_block || {}
+        blocks[evt.index] = { type: cb.type, name: cb.name, tStart: elapsed(), tStop: null }
+        console.log(`[DIAG:${label}] content_block_start ${JSON.stringify({ index: evt.index, type: cb.type, name: cb.name, atMs: blocks[evt.index].tStart })}`)
+        break
+      }
+      case 'content_block_delta':
+        if (evt.delta?.type === 'text_delta') text += evt.delta.text
+        break
+      case 'content_block_stop':
+        if (blocks[evt.index]) {
+          blocks[evt.index].tStop = elapsed()
+          console.log(`[DIAG:${label}] content_block_stop ${JSON.stringify({ index: evt.index, type: blocks[evt.index].type, atMs: blocks[evt.index].tStop })}`)
+        }
+        break
+      case 'message_delta':
+        if (evt.usage?.output_tokens != null) outputTokens = evt.usage.output_tokens
+        if (evt.delta?.stop_reason) stopReason = evt.delta.stop_reason
+        break
+      case 'message_stop':
+        console.log(`[DIAG:${label}] message_stop ${JSON.stringify({ atMs: elapsed() })}`)
+        break
+      case 'error':
+        console.error(`[DIAG:${label}] stream error event`, evt)
+        break
+      default:
+        break
+    }
+  }
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let sep
+    while ((sep = buffer.indexOf('\n\n')) !== -1) {
+      const raw = buffer.slice(0, sep)
+      buffer = buffer.slice(sep + 2)
+      if (raw.trim()) handleEvent(raw)
+    }
+  }
+
+  const totalMs = elapsed()
+  const blockList = Object.entries(blocks).map(([index, b]) => ({ index: Number(index), ...b }))
+  const searchBlocks = blockList.filter(b => b.type === 'server_tool_use' || b.type === 'web_search_tool_result')
+  const searchCallCount = blockList.filter(b => b.type === 'server_tool_use').length
+  const textBlocks = blockList.filter(b => b.type === 'text')
+  // "How much elapsed time falls before the final text generation begins" —
+  // literally the start timestamp of the last text block. If there are no
+  // text blocks (shouldn't happen) fall back to total time.
+  const genStartMs = textBlocks.length > 0 ? Math.max(...textBlocks.map(b => b.tStart)) : totalMs
+  const searchMs = genStartMs
+  const generationMs = totalMs - genStartMs
+
+  console.log(`[DIAG:${label}] SUMMARY ${JSON.stringify({
+    totalMs,
+    messageStartMs: tMessageStart,
+    searchCallCount,
+    searchBlocks: searchBlocks.map(b => ({ index: b.index, type: b.type, name: b.name, tStart: b.tStart, tStop: b.tStop })),
+    textBlocks: textBlocks.map(b => ({ index: b.index, tStart: b.tStart, tStop: b.tStop })),
+    genStartMs_searchPhaseMs: searchMs,
+    generationMs,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    stop_reason: stopReason,
+    totalBlockCount: blockList.length,
+  })}`)
+
+  return { text, inputTokens, outputTokens, stopReason, totalMs, searchMs, generationMs, searchCallCount }
+}
+// ══════════════════════════════════════════════════════════════ END TEMP ═══
 
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
@@ -822,7 +966,7 @@ function stripPrepWordsForSearch(name) {
   return result || name
 }
 
-async function analyzeExplorationsRecipes(ingredients, template, modifiers, inventoryText, excludeNames = []) {
+async function analyzeExplorationsRecipes(ingredients, template, modifiers, inventoryText, excludeNames = [], diagLabel = null) {
   const t = TEMPLATE_MAP[template]
   const searchIngredients = ingredients.map(stripPrepWordsForSearch)
   const ingredientPhrase = searchIngredients.join(' and ')
@@ -876,15 +1020,15 @@ ${OWNERSHIP_STATUS_RULES}
 
 ${CAN_MAKE_NOW_RULE}
 
+${CAN_MAKE_NOW_SILENT}
+
 If you cannot find 2–3 published recipes that include ALL featured ingredients, return as many as you can find (even 0 or 1). If no qualifying published recipes exist, return an empty suggestions array and set "no_recipes_found": true. Do NOT invent original recipes in this call — that is handled separately.
 
 Separately from how many you return, report whether more genuinely exist: set "more_published_exist" to true only if you are aware of ADDITIONAL genuine published recipes for this ingredient/template combination beyond the ones you returned here — not ones you're merely guessing might exist. Setting it false is a specific claim — that no further NAMED, attributable cocktail exists for this combination beyond what you found — not that the batch you're returning merely feels sufficient. If everything in your results is a generic, ingredient-titled recipe rather than a named drink, treat that as evidence more canon likely exists rather than as a sign the search is complete, and lean toward true unless you're genuinely confident nothing else is out there. This doesn't license speculation the other way either: false is still the honest, correct answer whenever it's actually true — the fix is not defaulting to false, not avoiding it. This field must be present on every response, including when no_recipes_found is true (where it should ordinarily be false).
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Never inventory status, ownership, or attribution in summary — those are conveyed separately. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type, creator, bar, year, attribution_source).
+This is a first-pass listing, not the full analysis — the user picks one to open before seeing build detail. Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, can_make_now, summary, recipe (array of {ingredient, amount}). The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), in one line — save elaboration for later. Never inventory status, ownership, or attribution in summary — those are conveyed separately. Do not omit or leave any of these fields empty except where the schema explicitly allows null (creator, bar, year, attribution_source). Do NOT include instructions, glass_type, technique_notes, difficulty, difficulty_note, watch_outs, or a per-ingredient ownership breakdown in this response — none of that is being asked for here.
 
 ${ATTRIBUTION_FIELDS_INSTRUCTION}
-
-Every entry in each suggestion's "recipe" array must include a "role" field from this fixed enum, describing its functional role in the build: base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish. "citrus" means citrus juice used as a structural component — a citrus peel or twist used only as garnish is role "garnish", not "citrus". Every ingredient in the recipe gets exactly one role.
 
 Separately, check whether these exact featured ingredients are also the basis of a different well-known published drink that belongs to a DIFFERENT template than the one chosen above. Only populate cross_template_suggestion if there's a genuine, well-known match — otherwise leave it null. Do not force one.
 
@@ -901,40 +1045,30 @@ Return ONLY valid JSON with no markdown fences:
     {
       "recipe_name": "string",
       "origin": "published",
-      "difficulty": "easy | medium | hard",
-      "difficulty_note": "One sentence explaining difficulty",
       "can_make_now": true,
-      "summary": "1-2 sentence description including a flavor characterization. Never creator, bar, year, or source here — those go in the dedicated fields below, not summary.",
+      "summary": "one line — flavor and character only. Never creator, bar, year, or source here — those go in the dedicated fields below, not summary.",
       "creator": "string or null",
       "bar": "string or null",
       "year": "string or null",
       "attribution_source": "string or null",
-      "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }],
-      "instructions": "string",
-      "glass_type": "coupe | rocks | tiki | collins | null",
-      "ingredients": [
-        {
-          "ingredient": "string",
-          "status": "found | substitute | missing",
-          "location": "string or null",
-          "substitute": "string or null",
-          "substitute_location": "string or null",
-          "flavor_impact": "string or null"
-        }
-      ],
-      "technique_notes": "string or null"
+      "recipe": [{ "ingredient": "string", "amount": "string" }]
     }
   ]
 }
 cross_template_suggestion must be null (not omitted) when there is no genuine match. more_published_exist must be present (not omitted) on every response.`,
     }],
   }
-  const firstText = await callClaudeText(body)
+  // TEMP DIAGNOSTIC: diagLabel opts into the streaming/instrumented path;
+  // default (null) behavior below is byte-for-byte what it was before.
+  const __diagT0 = diagLabel ? performance.now() : null
+  const firstText = diagLabel
+    ? (await callClaudeStreamDiag(body, diagLabel)).text
+    : await callClaudeText(body)
   let data
   try {
     data = extractJSON(firstText)
   } catch (_) {
-    const retryText = await callClaudeText({
+    const retryBody = {
       model: MODEL,
       max_tokens: 3000,
       messages: [
@@ -942,9 +1076,13 @@ cross_template_suggestion must be null (not omitted) when there is no genuine ma
         { role: 'assistant', content: firstText },
         { role: 'user', content: 'Your previous response was cut off or invalid JSON. Please return ONLY the complete valid JSON object, no other text.' },
       ],
-    })
+    }
+    const retryText = diagLabel
+      ? (await callClaudeStreamDiag(retryBody, `${diagLabel}-retry`)).text
+      : await callClaudeText(retryBody)
     data = extractJSON(retryText)
   }
+  if (diagLabel) console.log(`[DIAG:${diagLabel}] analyzeExplorationsRecipes total fn time ms`, Math.round(performance.now() - __diagT0))
   // origin_flag is derived here rather than asked of the model — it's a legacy
   // compatibility field consumed by Favorites/On Deck saves (a real DB column),
   // and every suggestion from this call is always "from_recipe" regardless of
@@ -960,11 +1098,15 @@ cross_template_suggestion must be null (not omitted) when there is no genuine ma
 // Single-suggestion regeneration after a template-structure validation failure (Change
 // 5). Asks for exactly one corrected suggestion, naming the specific violation, and
 // allows the model to honestly decline (return null) rather than force a bad fit.
-async function regenerateOriginalSuggestion(ingredients, template, modifiers, inventoryText, failedSuggestion, violations) {
+// Session 8: regenerates a SKELETON now, not the full suggestion — this call
+// only exists to fix a structural violation before the user ever sees the
+// suggestion, so it never needed instructions/ownership/etc, and dropping
+// them cuts a ~1,050-token regeneration to roughly ~160 (measure and report).
+async function regenerateOriginalSuggestion(ingredients, template, modifiers, inventoryText, failedSuggestion, violations, diagLabel = null) {
   const t = TEMPLATE_MAP[template]
   const body = {
     model: MODEL,
-    max_tokens: 1200,
+    max_tokens: 400,
     messages: [{
       role: 'user',
       content: `You are an expert craft bartender. Your previous suggestion "${failedSuggestion?.recipe_name || 'suggestion'}" violated the ${t?.name || template} template's structure: ${violations.join('; ')}.
@@ -988,33 +1130,26 @@ ${OWNERSHIP_STATUS_RULES}
 
 ${CAN_MAKE_NOW_RULE}
 
+${CAN_MAKE_NOW_SILENT}
+
 Set "origin" honestly ("riff" if it's a substitution into the template's usual formula, "original" only as a rare last resort). Every entry in the "recipe" array must include a "role" field from this fixed enum: ${RECIPE_ROLES.join(' | ')}. "citrus" means citrus juice used structurally; a peel/twist garnish is role "garnish".
 
 ${RIFF_DISCIPLINE_CORE}
 
-${WATCH_OUTS_INSTRUCTION}
-
-Return ONLY valid JSON, no markdown fences:
+This is a first-pass listing, not the full analysis — the user picks it before seeing build detail. Return ONLY valid JSON, no markdown fences:
 {
   "suggestion": {
     "recipe_name": "string",
     "origin": "riff | original",
-    "difficulty": "easy | medium | hard",
-    "difficulty_note": "string",
     "can_make_now": true,
-    "summary": "string",
-    "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }],
-    "instructions": "string",
-    "glass_type": "coupe | rocks | tiki | collins | null",
-    "ingredients": [{ "ingredient": "string", "status": "found | substitute | missing", "location": "string or null", "substitute": "string or null", "substitute_location": "string or null", "flavor_impact": "string or null" }],
-    "technique_notes": "string or null",
-    "watch_outs": "string or null"
+    "summary": "one line — flavor and character only",
+    "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }]
   }
 }
-"suggestion" must be null (not omitted) if no honest fit exists. watch_outs must be null (not omitted) when there's nothing worth flagging.`,
+"suggestion" must be null (not omitted) if no honest fit exists. Do NOT include instructions, glass_type, technique_notes, difficulty, difficulty_note, watch_outs, or a per-ingredient ownership breakdown — none of that is being asked for here.`,
     }],
   }
-  const text = await callClaudeText(body)
+  const text = diagLabel ? (await callClaudeStreamDiag(body, diagLabel)).text : await callClaudeText(body)
   try {
     const parsed = extractJSON(text)
     return parsed?.suggestion || null
@@ -1029,7 +1164,7 @@ Return ONLY valid JSON, no markdown fences:
 // first failure was truncation.
 const EXPLORATIONS_ORIGINALS_MAX_TOKENS = 4000
 
-async function analyzeExplorationsOriginals(ingredients, template, modifiers, inventoryText, excludeNames = []) {
+async function analyzeExplorationsOriginals(ingredients, template, modifiers, inventoryText, excludeNames = [], diagLabel = null) {
   const buildBody = (maxTokens) => ({
     model: MODEL,
     max_tokens: maxTokens,
@@ -1067,13 +1202,13 @@ ${OWNERSHIP_STATUS_RULES}
 
 ${CAN_MAKE_NOW_RULE}
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount, role}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), since there is no separate flavor-preference input from the user anymore. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+${CAN_MAKE_NOW_SILENT}
 
-Every entry in each suggestion's "recipe" array must include a "role" field from this fixed enum, describing its functional role in the build: ${RECIPE_ROLES.join(' | ')}. "citrus" means citrus juice used as a structural component — a citrus peel or twist used only as garnish is role "garnish", not "citrus". Every ingredient in the recipe gets exactly one role.
+This is a first-pass listing, not the full analysis — the user picks one to open before seeing build detail. Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, can_make_now, summary, recipe (array of {ingredient, amount, role}). The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), in one line — save elaboration for later. Do not omit or leave any of these fields empty. Do NOT include instructions, glass_type, technique_notes, difficulty, difficulty_note, watch_outs, or a per-ingredient ownership breakdown in this response — none of that is being asked for here.
+
+Every entry in each suggestion's "recipe" array must include a "role" field from this fixed enum, describing its functional role in the build: ${RECIPE_ROLES.join(' | ')}. "citrus" means citrus juice used as a structural component — a citrus peel or twist used only as garnish is role "garnish", not "citrus". Every ingredient in the recipe gets exactly one role. This is kept even at this first-pass stage because the app checks it structurally before showing you the suggestion at all — a Sour with no citrus role gets caught and corrected here, not after the user has opened it.
 
 ${RIFF_DISCIPLINE_BATCH}
-
-${WATCH_OUTS_INSTRUCTION}
 
 Separately from how many you return, report whether more genuinely distinct riffs or originals remain: set "more_ideas_exist" to true only if you are aware of additional swaps or inventions that would pass the riff-discipline bar above beyond what you returned here. Set it false once you've shown everything worth showing — at some point it is the bartender's call: the job is to surface the swaps worth knowing about and then stop, not to enumerate the space and leave the user to filter it. An honest "that's what's here" is a better answer than a longer list of progressively weaker variations. This field must be present on every response.
 
@@ -1089,35 +1224,29 @@ Return ONLY valid JSON with no markdown fences:
     {
       "recipe_name": "string",
       "origin": "riff | original",
-      "difficulty": "easy | medium | hard",
-      "difficulty_note": "One sentence explaining difficulty",
       "can_make_now": true,
-      "summary": "1-2 sentence description including a flavor characterization",
-      "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }],
-      "instructions": "string",
-      "glass_type": "coupe | rocks | tiki | collins | null",
-      "ingredients": [
-        {
-          "ingredient": "string",
-          "status": "found | substitute | missing",
-          "location": "string or null",
-          "substitute": "string or null",
-          "substitute_location": "string or null",
-          "flavor_impact": "string or null"
-        }
-      ],
-      "technique_notes": "string or null",
-      "watch_outs": "string or null"
+      "summary": "one line — flavor and character only",
+      "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }]
     }
   ]
 }
-cross_template_suggestion is always null from this call — leave it exactly as shown. watch_outs must be null (not omitted) when there's nothing worth flagging. more_ideas_exist must be present (not omitted) on every response.`,
+cross_template_suggestion is always null from this call — leave it exactly as shown. more_ideas_exist must be present (not omitted) on every response.`,
     }],
   })
   const body = buildBody(EXPLORATIONS_ORIGINALS_MAX_TOKENS)
+  // TEMP DIAGNOSTIC: diagLabel opts into the streaming/instrumented path;
+  // default (null) behavior below is byte-for-byte what it was before.
+  const __diagT0 = diagLabel ? performance.now() : null
   let data
   try {
-    const firstText = await callClaudeText(body, { detectTruncation: true })
+    let firstText
+    if (diagLabel) {
+      const r = await callClaudeStreamDiag(body, diagLabel)
+      if (r.stopReason === 'max_tokens') { const e = new Error('truncated'); e.code = 'truncated'; throw e }
+      firstText = r.text
+    } else {
+      firstText = await callClaudeText(body, { detectTruncation: true })
+    }
     data = extractJSON(firstText)
   } catch (firstErr) {
     if (firstErr.code !== 'truncated' && firstErr.code !== 'parse_failed') throw firstErr
@@ -1127,7 +1256,12 @@ cross_template_suggestion is always null from this call — leave it exactly as 
     // especially when truncation lands mid-string; a fresh, better-funded
     // attempt is the simpler, more robust fix).
     const retryBody = buildBody(Math.round(EXPLORATIONS_ORIGINALS_MAX_TOKENS * 1.5))
-    const retryText = await callClaudeText(retryBody, { detectTruncation: true })
+    let retryText
+    if (diagLabel) {
+      retryText = (await callClaudeStreamDiag(retryBody, `${diagLabel}-retry`)).text
+    } else {
+      retryText = await callClaudeText(retryBody, { detectTruncation: true })
+    }
     data = extractJSON(retryText)
   }
 
@@ -1142,7 +1276,7 @@ cross_template_suggestion is always null from this call — leave it exactly as 
       const check = validateSuggestionStructure(s, template)
       if (check.valid) { validated.push(s); continue }
       console.warn('[template validation] failed, regenerating once:', { template, recipe_name: s.recipe_name, violations: check.violations, ingredients })
-      const regenerated = await regenerateOriginalSuggestion(ingredients, template, modifiers, inventoryText, s, check.violations)
+      const regenerated = await regenerateOriginalSuggestion(ingredients, template, modifiers, inventoryText, s, check.violations, diagLabel ? `${diagLabel}-regen` : null)
       if (!regenerated) {
         console.warn('[template validation] regeneration declined, dropping suggestion:', { template, ingredients })
         continue
@@ -1156,6 +1290,11 @@ cross_template_suggestion is always null from this call — leave it exactly as 
     }
     data.suggestions = validated
   }
+  // Moved here (past the validation/regeneration loop above) so this reflects
+  // true end-to-end time — logging it right after the main call, as before,
+  // undercounted whenever a regeneration fired (a prior diagnostic run found
+  // this exact gap: an instrumented "43s" call that actually took ~68s).
+  if (diagLabel) console.log(`[DIAG:${diagLabel}] analyzeExplorationsOriginals total fn time ms`, Math.round(performance.now() - __diagT0))
 
   // Both riff and original map to the same legacy origin_flag value — that field
   // only ever distinguished "from the web-search call" vs "from this call," and
@@ -1165,6 +1304,171 @@ cross_template_suggestion is always null from this call — leave it exactly as 
   // Same normalization rationale as more_published_exist: never trust the literal value,
   // coerce to strict boolean so a malformed/omitted field can't leave a CTA stuck visible.
   if (data) data.more_ideas_exist = data.more_ideas_exist === true
+  return data
+}
+
+// Session 8 (skeleton-first) — detail on demand. Re-sends the skeleton's
+// recipe_name, template, and fixed ingredient list so the model has full
+// context, then asks only for what a skeleton suggestion is missing:
+// difficulty, instructions, glass, technique notes, watch_outs (riffs only,
+// matching tier-1's original schema which never had it), and a per-ingredient
+// ownership check. The ingredient list itself is never re-derived — see
+// mergeSuggestionDetail, which enforces that even if the model drifts.
+//
+// published vs riff/original get different treatment for the same reason
+// they did at generation time: a published drink is reconstructed from canon
+// (web_search, scoped to confirming THIS drink's technique, never its
+// ingredients), while a riff/original is the model's own prior invention —
+// no search, just elaboration consistent with what it already decided.
+async function analyzeSuggestionDetail(suggestion, primaryIngredients, template, modifiers, inventoryText, diagLabel = null) {
+  const isPublished = suggestion.origin === 'published'
+  const ingredientList = (suggestion.recipe || []).map(r => `- ${r.amount} ${r.ingredient}`).join('\n')
+  const body = {
+    model: MODEL,
+    max_tokens: 1200,
+    ...(isPublished ? { tools: [{ type: 'web_search_20250305', name: 'web_search' }] } : {}),
+    messages: [{
+      role: 'user',
+      content: `You are an expert craft bartender providing full build detail for one already-chosen cocktail suggestion.
+
+FIXED RECIPE — already decided, given to you exactly as-is. Do not add, remove, substitute, re-derive, or resize any ingredient, even if you believe you know a different build for this drink${isPublished ? ' from search or training knowledge' : ''}. Your job below is elaboration only — instructions, technique, glassware, difficulty, and an ownership check against the bar inventory — never the ingredient list itself.
+
+"${suggestion.recipe_name}"
+${ingredientList}
+
+${buildTemplateContext(template, modifiers)}
+
+BAR INVENTORY:
+${inventoryText}
+
+SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated. Simple syrup — 2–4 weeks room temp. Amaro — 6–12 months. Commercial liqueurs — 6+ months.
+
+${isPublished
+  ? 'Use web search to confirm the correct technique and instructions for this specific published recipe as given above — the ingredient list is already settled, search only informs HOW it is made, never what is in it.'
+  : 'This was your own invention from an earlier step — reconstruct instructions and technique consistent with the fixed ingredient list above. No search needed.'}
+
+FEATURED INGREDIENT(S) FOR THIS EXPLORATION: ${primaryIngredients.join(' and ')}
+${SEED_INGREDIENT_EXEMPT}
+
+${OWNERSHIP_STATUS_RULES}
+
+Check every non-garnish, non-pantry-staple ingredient in the fixed list above against the bar inventory (note the generic type and aliases listed alongside each bottle — a bottle's generic type or an alias matching an ingredient means the user owns it). Report ownership for EVERY ingredient in the fixed list, in the same order, under its exact name as given above — do not rename, merge, split, or omit any of them, and do not introduce ingredients that aren't in that list.
+
+${isPublished ? '' : WATCH_OUTS_INSTRUCTION}
+
+Return ONLY valid JSON with no markdown fences:
+{
+  "difficulty": "easy | medium | hard",
+  "difficulty_note": "One sentence explaining difficulty",
+  "instructions": "string",
+  "glass_type": "coupe | rocks | tiki | collins | null",
+  "technique_notes": "string or null",${isPublished ? '' : `
+  "watch_outs": "string or null",`}
+  "ingredients": [
+    { "ingredient": "string", "status": "found | substitute | missing", "location": "string or null", "substitute": "string or null", "substitute_location": "string or null", "flavor_impact": "string or null" }
+  ]
+}
+${isPublished ? '' : 'watch_outs must be null (not omitted) when there is nothing worth flagging.'}`,
+    }],
+  }
+  const text = diagLabel ? (await callClaudeStreamDiag(body, diagLabel)).text : await callClaudeText(body)
+  return stripCiteTags(extractJSON(text))
+}
+
+// Folds a detail response's ownership analysis onto a skeleton's fixed
+// ingredient list, matched by name — the skeleton's list is authoritative,
+// never the detail response's. If the model drifted (renamed, dropped, or
+// invented an ingredient despite being told the list was fixed — the riff
+// path is the higher-risk one here, since a riff is the model's own thin
+// memory of its own invention, not a canon it can re-derive), the mismatched
+// entries are logged and simply carry no ownership data rather than showing
+// something that isn't actually in the build.
+function mergeSuggestionDetail(skeleton, detail) {
+  const norm = s => (s || '').trim().toLowerCase()
+  const byName = {}
+  for (const d of (detail?.ingredients || [])) {
+    if (d?.ingredient) byName[norm(d.ingredient)] = d
+  }
+  const skeletonNames = new Set((skeleton.recipe || []).map(r => norm(r.ingredient)))
+  const drifted = (detail?.ingredients || []).some(d => d?.ingredient && !skeletonNames.has(norm(d.ingredient)))
+  if (drifted) {
+    console.warn('[detail drift] model returned ingredients outside the fixed skeleton list — those entries are dropped, skeleton list wins', {
+      recipe_name: skeleton.recipe_name,
+      origin: skeleton.origin,
+      skeleton: [...skeletonNames],
+      detail: (detail?.ingredients || []).map(d => d.ingredient),
+    })
+  }
+  const ingredients = (skeleton.recipe || []).map(r => {
+    const d = byName[norm(r.ingredient)]
+    return {
+      ingredient: r.ingredient,
+      status: d?.status ?? null,
+      location: d?.location ?? null,
+      substitute: d?.substitute ?? null,
+      substitute_location: d?.substitute_location ?? null,
+      flavor_impact: d?.flavor_impact ?? null,
+    }
+  })
+  return {
+    difficulty: detail?.difficulty ?? null,
+    difficulty_note: detail?.difficulty_note ?? null,
+    instructions: detail?.instructions ?? null,
+    glass_type: detail?.glass_type ?? null,
+    technique_notes: detail?.technique_notes ?? null,
+    watch_outs: detail?.watch_outs ?? null,
+    ingredients,
+  }
+}
+
+// Session 8, Change 4 — the cross-template CTA already names a specific
+// drink; this looks that one drink up (one targeted search, not open
+// discovery) instead of discarding the name and re-running full tier-1
+// discovery under the new template. Returns a single tier-1-shaped skeleton
+// suggestion, same contract as analyzeExplorationsRecipes's suggestions[0].
+async function analyzeNamedDrinkSkeleton(drinkName, template, modifiers, inventoryText, diagLabel = null) {
+  const t = TEMPLATE_MAP[template]
+  const body = {
+    model: MODEL,
+    max_tokens: 800,
+    tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+    messages: [{
+      role: 'user',
+      content: `You are an expert craft bartender. Use web search to look up the canonical published recipe for the specific cocktail "${drinkName}" — a single, targeted lookup for a drink you already know the name of, not open discovery. This drink is already established to belong to the ${t?.name || template} family (usual formula: ${t?.formula || 'n/a'}).
+
+BAR INVENTORY:
+${inventoryText}
+
+${OWNERSHIP_STATUS_RULES}
+
+${CAN_MAKE_NOW_RULE}
+
+${CAN_MAKE_NOW_SILENT}
+
+${ATTRIBUTION_FIELDS_INSTRUCTION}
+
+This is a first-pass listing, not the full analysis — the user opens it to see build detail. Return ONLY valid JSON with no markdown fences:
+{
+  "more_published_exist": true,
+  "suggestion": {
+    "recipe_name": "string",
+    "origin": "published",
+    "can_make_now": true,
+    "summary": "one line — flavor and character only",
+    "creator": "string or null",
+    "bar": "string or null",
+    "year": "string or null",
+    "attribution_source": "string or null",
+    "recipe": [{ "ingredient": "string", "amount": "string" }]
+  }
+}
+"more_published_exist": report your genuine knowledge of whether other published recipes exist in this template beyond this one — same honesty bar as elsewhere, true unless you're genuinely confident there's nothing else. Do NOT include instructions, glass_type, technique_notes, difficulty, difficulty_note, watch_outs, or a per-ingredient ownership breakdown here — none of that is being asked for.`,
+    }],
+  }
+  const text = diagLabel ? (await callClaudeStreamDiag(body, diagLabel)).text : await callClaudeText(body)
+  const data = stripCiteTags(extractJSON(text))
+  if (data?.suggestion) data.suggestion.origin_flag = 'from_recipe'
+  data.more_published_exist = data?.more_published_exist === true
   return data
 }
 
@@ -1295,7 +1599,7 @@ Pick exactly one template id that best fits these ingredients. Return ONLY valid
 // stale the moment this prompt changes. Ownership is deliberately absent
 // from this prompt — resolved client-side from inventory_tags and applied
 // as presentation only, never as a filter on what gets generated here.
-async function analyzeContextualAffinities(ingredients, template, modifiers, baseAffinityData) {
+async function analyzeContextualAffinities(ingredients, template, modifiers, baseAffinityData, diagLabel = null) {
   const t = TEMPLATE_MAP[template]
   const sig = TEMPLATE_SIGNATURES[template]
   const baseContext = ingredients.map(ing => {
@@ -1336,11 +1640,18 @@ Return ONLY valid JSON, no markdown fences:
 }
 "ingredients" must have exactly ${ingredients.length} entries, in the same order as listed above.`
 
-  return await callClaude({
+  const body = {
     model: 'claude-sonnet-4-5',
     max_tokens: 1200,
     messages: [{ role: 'user', content: prompt }],
-  })
+  }
+  // TEMP DIAGNOSTIC: diagLabel opts into the streaming/instrumented path;
+  // default (null) behavior below is byte-for-byte what it was before.
+  if (diagLabel) {
+    const r = await callClaudeStreamDiag(body, diagLabel)
+    return extractJSON(r.text)
+  }
+  return await callClaude(body)
 }
 
 async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, tastingContext) {
@@ -2924,10 +3235,15 @@ function RecipeCard({
   onTriedToggle = null,
   onNotesSave = null,
   inventoryText = '',
+  template = null,
+  modifiers = null,
+  onDetailFetched = null,
 }) {
   const [expanded, setExpanded] = useState(!!autoExpand)
   const [savedTo, setSavedTo] = useState(null)
   const [saveError, setSaveError] = useState(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [detailError, setDetailError] = useState(false)
   const [tweakedSuggestion, setTweakedSuggestion] = useState(null)
   const [tweakDone, setTweakDone] = useState(false)
   const [tweakModalOpen, setTweakModalOpen] = useState(false)
@@ -2950,8 +3266,17 @@ function RecipeCard({
   useEffect(() => {
     if (autoExpand && cardRef.current) {
       setTimeout(() => cardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+      // Session 8: autoExpand starts the card open (e.g. "Continue Exploration"
+      // from a whiteboard node) without going through handleToggleExpand, so
+      // it needs its own detail-fetch trigger — otherwise a card that opens
+      // pre-expanded would sit on skeleton-only with no loading state ever
+      // firing. ensureDetail/hasDetail are declared later in this component
+      // but safe to reference here: this callback only runs after the full
+      // render, well after both are assigned.
+      if (showSaveButtons && !hasDetail) ensureDetail()
     }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Sync ref when eager recipe-node writes complete after cards have already rendered.
   // Flush any tried/notes mutations that arrived before the ID was known.
@@ -2972,21 +3297,77 @@ function RecipeCard({
     }
   }, [recipeNodeIds]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const displayed = tweakedSuggestion || suggestion
+  // mergedDetail holds the detail patch locally so `displayed` is correct
+  // within THIS same render pass — waiting for the parent's onDetailFetched
+  // to round-trip back down as a fresh `suggestion` prop would leave a stale
+  // skeleton visible (or handed to TweakModal) for one extra render.
+  const [mergedDetail, setMergedDetail] = useState(null)
+  const displayed = tweakedSuggestion || mergedDetail || suggestion
+  // Session 8 (skeleton-first): a suggestion is "detailed" once it carries an
+  // ownership breakdown — that field only ever arrives from the detail call,
+  // never from the skeleton, so its presence is the cache check: same card
+  // collapsed and reopened, or the save button hit a second time, costs
+  // nothing further. Legacy full suggestions (a "refine" result, or a
+  // pre-Session-8 whiteboard node) already carry it too, so they're treated
+  // as already-detailed and never re-fetched.
+  const hasDetail = !!(displayed.ingredients && displayed.ingredients.length > 0)
 
+  // Fetches and merges detail exactly once per card. Concurrent callers (e.g.
+  // expanding and hitting Save in quick succession) share the same in-flight
+  // request rather than firing twice.
+  const detailPromiseRef = useRef(null)
+  const ensureDetail = async () => {
+    if (hasDetail) return displayed
+    if (detailPromiseRef.current) return detailPromiseRef.current
+    setDetailLoading(true)
+    setDetailError(false)
+    const p = (async () => {
+      try {
+        const detail = await analyzeSuggestionDetail(displayed, primaryIngredients, template, modifiers || {}, inventoryText, DIAG_ON ? `detail-fetch-${displayed.origin || 'unknown'}` : null)
+        const patch = mergeSuggestionDetail(displayed, detail)
+        const merged = { ...displayed, ...patch }
+        setMergedDetail(merged)
+        onDetailFetched?.(displayed.recipe_name, patch)
+        return merged
+      } catch (err) {
+        console.warn('[detail] fetch failed, keeping skeleton visible:', err.message)
+        setDetailError(true)
+        return displayed
+      } finally {
+        setDetailLoading(false)
+        detailPromiseRef.current = null
+      }
+    })()
+    detailPromiseRef.current = p
+    return p
+  }
+
+  // Session 8, Change 5: saving a skeleton would mean a saved recipe with no
+  // instructions, so this always ensures detail first — a no-op if the card
+  // was already opened (ensureDetail's cache check), a real fetch if the user
+  // is saving straight off the results list without opening it. onDeckSaving
+  // covers exactly that second case with its own label, since detailLoading
+  // (rendered only inside the expanded section) wouldn't be visible on a
+  // still-collapsed card.
+  const [onDeckSaving, setOnDeckSaving] = useState(false)
   const handleOnDeck = async () => {
     setSaveError(null)
+    setOnDeckSaving(true)
     try {
-      await onSaveOnDeck(displayed, primaryIngredients)
+      const full = await ensureDetail()
+      await onSaveOnDeck(full, primaryIngredients)
       setSavedTo('ondeck')
     } catch (err) {
       setSaveError(err?.message || 'Could not save to On Deck.')
+    } finally {
+      setOnDeckSaving(false)
     }
   }
 
   const handleToggleExpand = async () => {
     const next = !expanded
     setExpanded(next)
+    if (next && showSaveButtons && !hasDetail) ensureDetail()
     if (next && !recipeNodeIdRef.current && user && whiteboardId && recipeListNodeId) {
       try {
         const { data } = await supabase
@@ -3112,27 +3493,48 @@ function RecipeCard({
         </div>
       )}
 
+      {/* Session 8: the ingredient list is the skeleton's most decisive field —
+          "is this worth opening?" — so it's always visible, never behind the
+          expand toggle below. Only instructions/technique/ownership, which
+          require the separate on-demand detail call, are gated on expand. */}
+      {displayed.recipe && displayed.recipe.length > 0 && (
+        <div style={{ background: C.bg, borderRadius: 8, padding: '12px 14px', marginBottom: 10 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>Recipe</div>
+          <ul style={{ listStyle: 'none' }}>
+            {displayed.recipe.map((r, i) => (
+              <li key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', borderBottom: i < displayed.recipe.length - 1 ? `1px solid ${C.border}` : 'none', gap: 12 }}>
+                <span style={{ fontSize: 14 }}>{r.ingredient}</span>
+                <span style={{ fontSize: 13, color: C.gold, fontWeight: 500, whiteSpace: 'nowrap' }}>{r.amount}</span>
+              </li>
+            ))}
+          </ul>
+          {displayed.instructions && (
+            <p style={{ fontSize: 13, color: C.textMuted, marginTop: 10, lineHeight: 1.6, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>{displayed.instructions}</p>
+          )}
+        </div>
+      )}
+
       <button onClick={handleToggleExpand}
         style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0, marginBottom: expanded ? 12 : 0 }}>
-        {expanded ? '▲ Hide recipe' : '▼ Show recipe & ingredients'}
+        {expanded ? '▲ Hide details' : hasDetail ? '▼ Show instructions & ownership' : '▼ Open — instructions & ownership'}
       </button>
 
       {expanded && (
         <div>
-          {displayed.recipe && displayed.recipe.length > 0 && (
-            <div style={{ background: C.bg, borderRadius: 8, padding: '12px 14px', marginBottom: 10 }}>
-              <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>Recipe</div>
-              <ul style={{ listStyle: 'none' }}>
-                {displayed.recipe.map((r, i) => (
-                  <li key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', borderBottom: i < displayed.recipe.length - 1 ? `1px solid ${C.border}` : 'none', gap: 12 }}>
-                    <span style={{ fontSize: 14 }}>{r.ingredient}</span>
-                    <span style={{ fontSize: 13, color: C.gold, fontWeight: 500, whiteSpace: 'nowrap' }}>{r.amount}</span>
-                  </li>
-                ))}
-              </ul>
-              {displayed.instructions && (
-                <p style={{ fontSize: 13, color: C.textMuted, marginTop: 10, lineHeight: 1.6, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>{displayed.instructions}</p>
-              )}
+          {/* Session 8: skeleton loads instantly above; instructions/technique/ownership
+              arrive from the separate on-demand detail call and are absent until it
+              resolves — show a lightweight loading state rather than an empty gap, and
+              keep the skeleton fully visible (never an error page) if it fails. */}
+          {detailLoading && (
+            <div style={{ fontSize: 12, color: C.textFaint, marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span style={{ display: 'inline-block', width: 10, height: 10, border: `2px solid ${C.border}`, borderTopColor: C.gold, borderRadius: '50%', animation: 'bcspini 0.6s linear infinite' }} />
+              Loading full recipe…
+            </div>
+          )}
+          {detailError && !detailLoading && (
+            <div style={{ fontSize: 12, color: C.textFaint, marginBottom: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+              Couldn't load the full recipe.
+              <button onClick={ensureDetail} style={{ background: 'none', border: 'none', color: C.gold, fontSize: 12, cursor: 'pointer', padding: 0, textDecoration: 'underline' }}>Retry</button>
             </div>
           )}
           {displayed.technique_notes && (
@@ -3144,9 +3546,10 @@ function RecipeCard({
             <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
               {displayed.ingredients.filter(ing => ing.ingredient).map((ing, i) => {
                 const ingMissing = ing.status === 'missing'
+                const dotColor = ing.status === 'found' ? C.green : ing.status === 'substitute' ? C.amber : ing.status === 'missing' ? C.missing : C.textFaint
                 return (
                   <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13 }}>
-                    <span style={{ display: 'inline-block', width: ingMissing ? 8 : 7, height: ingMissing ? 8 : 7, borderRadius: '50%', background: ing.status === 'found' ? C.green : ing.status === 'substitute' ? C.amber : C.missing, boxShadow: ingMissing ? `0 0 0 3px ${C.missing}33` : 'none', flexShrink: 0, marginTop: 4 }} />
+                    <span style={{ display: 'inline-block', width: ingMissing ? 8 : 7, height: ingMissing ? 8 : 7, borderRadius: '50%', background: dotColor, boxShadow: ingMissing ? `0 0 0 3px ${C.missing}33` : 'none', flexShrink: 0, marginTop: 4 }} />
                     <div>
                       <span style={{ color: C.text }}>{ing.ingredient}</span>
                       {ing.location && <span style={{ color: C.textMuted }}> · 📍 {ing.location}</span>}
@@ -3180,7 +3583,11 @@ function RecipeCard({
         {showSaveButtons && (savedTo ? (
           <div style={{ fontSize: 13, color: C.textFaint }}>✓ Saved to On Deck</div>
         ) : (
-          <button onClick={handleOnDeck} style={{ background: 'none', border: `1px solid ${C.blue}`, borderRadius: 20, color: C.blue, fontSize: 12, padding: '5px 12px', cursor: 'pointer' }}>🍹 On Deck</button>
+          <button onClick={handleOnDeck} disabled={onDeckSaving}
+            style={{ background: 'none', border: `1px solid ${C.blue}`, borderRadius: 20, color: C.blue, fontSize: 12, padding: '5px 12px', cursor: onDeckSaving ? 'default' : 'pointer', opacity: onDeckSaving ? 0.6 : 1, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            {onDeckSaving && <span style={{ display: 'inline-block', width: 10, height: 10, border: '2px solid currentColor', borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite' }} />}
+            {onDeckSaving ? 'Saving…' : '🍹 On Deck'}
+          </button>
         ))}
         {showSaveButtons && saveError && (
           <div style={{ fontSize: 12, color: C.red, width: '100%' }}>{saveError}</div>
@@ -3190,7 +3597,7 @@ function RecipeCard({
       {showRefineCTA && (
         <div style={{ marginTop: 10, borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
           {tweakDone && <div style={{ fontSize: 12, color: C.green, marginBottom: 6 }}>✓ Refined</div>}
-          <button onClick={() => setTweakModalOpen(true)}
+          <button onClick={async () => { await ensureDetail(); setTweakModalOpen(true) }}
             style={{ background: 'none', border: `1px solid ${C.gold}66`, borderRadius: 20, color: C.gold, fontSize: 12, fontWeight: 500, padding: '5px 12px', cursor: 'pointer' }}>
             ✦ Refine this
           </button>
@@ -3264,6 +3671,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const [morePublishedExist, setMorePublishedExist] = useState(false)
   const [seeMorePublishedLoading, setSeeMorePublishedLoading] = useState(false)
   const [seeMorePublishedError, setSeeMorePublishedError] = useState(null)
+  // TEMP DIAGNOSTIC — removable with the rest of the DIAG_ON instrumentation.
+  // Starts at 2: the initial Build (handleExplore) is conceptually "tap 1",
+  // so the first handleSeeMorePublished call is the 2nd tap.
+  const diagSeeMorePublishedTapRef = useRef(2)
   const [viaSurpriseMe, setViaSurpriseMe] = useState(false)
   const [loadingMsgIdx, setLoadingMsgIdx] = useState(0)
   const [affinityData, setAffinityData] = useState({})
@@ -3430,6 +3841,12 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // call. Returns { data, wbId, recipeListNodeId, ingredientsNodeId } (or null on full
   // failure) so callers that need to chain a tier-2/3 fetch (Quick Build, Surprise Me —
   // Decision B) can do so without depending on state that hasn't re-rendered yet.
+  // opts.redirectDrinkName (Change 4): the cross-template CTA already names a
+  // specific drink, so a redirect fetches THAT drink (one targeted lookup, no
+  // discovery search) instead of running a full fresh tier-1 search under the
+  // new template. Reshaped into the same `data` contract analyzeExplorationsRecipes
+  // returns so the rest of this function — whiteboard persistence included —
+  // doesn't need to know which path produced it.
   const handleExplore = async (opts = {}) => {
     const activeTemplate = opts.template ?? template
     const activeContinueFromNodeId = opts.continueFromNodeId !== undefined ? opts.continueFromNodeId : continueFromNodeId
@@ -3446,7 +3863,18 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     setAutoExpandNodeData(null)
     try {
       const modifiers = { frozen, lowABV, na }
-      const data = stripCiteTags(await analyzeExplorationsRecipes(selected, activeTemplate, modifiers, inventoryText))
+      let data
+      if (opts.redirectDrinkName) {
+        const named = stripCiteTags(await analyzeNamedDrinkSkeleton(opts.redirectDrinkName, activeTemplate, modifiers, inventoryText, DIAG_ON ? 'tier1-redirect' : null))
+        data = {
+          incompatible: false, incompatibility_reason: null, no_recipes_found: !named?.suggestion,
+          more_published_exist: named?.more_published_exist === true,
+          flavor_profile_note: null, pairs_well_with: null, cross_template_suggestion: null,
+          suggestions: named?.suggestion ? [named.suggestion] : [],
+        }
+      } else {
+        data = stripCiteTags(await analyzeExplorationsRecipes(selected, activeTemplate, modifiers, inventoryText, [], DIAG_ON ? 'tier1-build' : null))
+      }
       setResult(data)
       setMorePublishedExist(data?.more_published_exist === true)
       setStep('results')
@@ -3547,7 +3975,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       const excludeNames = baseSuggestions
         .filter(s => s.origin === 'riff' || s.origin === 'original')
         .map(s => `${s.recipe_name} (${(s.recipe || []).map(r => r.ingredient).join(', ')})`)
-      const freshData = stripCiteTags(await analyzeExplorationsOriginals(selected, activeTemplate, modifiers, inventoryText, excludeNames))
+      const freshData = stripCiteTags(await analyzeExplorationsOriginals(selected, activeTemplate, modifiers, inventoryText, excludeNames, DIAG_ON ? 'tier2-3-see-more-ideas' : null))
       const newSuggestions = freshData?.suggestions || []
       const mergedSuggestions = sortByOriginRank([...baseSuggestions, ...newSuggestions])
 
@@ -3610,7 +4038,13 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     try {
       const modifiers = { frozen, lowABV, na }
       const excludeNames = baseSuggestions.filter(s => s.origin === 'published').map(s => s.recipe_name)
-      const freshData = stripCiteTags(await analyzeExplorationsRecipes(selected, template, modifiers, inventoryText, excludeNames))
+      const tapN = diagSeeMorePublishedTapRef.current
+      diagSeeMorePublishedTapRef.current += 1
+      if (DIAG_ON) {
+        const joined = excludeNames.join(', ')
+        console.log(`[DIAG:tier1-see-more-published-tap${tapN}] exclusion list ${JSON.stringify({ count: excludeNames.length, chars: joined.length, approxWords: joined.split(/\s+/).filter(Boolean).length })}`)
+      }
+      const freshData = stripCiteTags(await analyzeExplorationsRecipes(selected, template, modifiers, inventoryText, excludeNames, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null))
       const newSuggestions = freshData?.suggestions || []
       const mergedSuggestions = sortByOriginRank([...baseSuggestions, ...newSuggestions])
 
@@ -3690,26 +4124,35 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       const normalizedSelected = selected.map(s => s.trim().toLowerCase())
 
       // Step 1: Check what's already in the affinities table
+      const __diagBaseT0 = DIAG_ON ? performance.now() : null
       const { data, error } = await supabase
         .from('ingredient_affinities')
         .select('ingredient_name, flavor_affinities, spirit_tags, flavor_tags')
         .in('ingredient_name', normalizedSelected)
       if (error) throw error
+      if (DIAG_ON) console.log('[DIAG:affinities-base-lookup] supabase select ms', Math.round(performance.now() - __diagBaseT0))
 
       ;(data || []).forEach(row => { map[row.ingredient_name] = row })
 
       // Step 2: Find selected ingredients with no affinity data
       const missing = selected.filter(s => !map[s.trim().toLowerCase()])
+      if (DIAG_ON) console.log(`[DIAG:affinities] cache status ${JSON.stringify({ selected, missing, cached: selected.filter(s => !missing.includes(s)) })}`)
 
       // Step 3: Generate on-demand for any not in the table
       if (missing.length > 0) {
         try {
           const ingredients = missing.map(name => ({ name, category: '', notes: '', own_flavors: map[name.trim().toLowerCase()]?.flavor_tags || [] }))
+          // TEMP DIAGNOSTIC: this endpoint calls Anthropic directly (not
+          // through callClaude), so it's timed here client-side (round trip)
+          // and again server-side in api/backfill-affinities.js (pure model
+          // call time, no client/server hop). Both removable together.
+          const __diagBackfillT0 = DIAG_ON ? performance.now() : null
           const response = await fetch('/api/backfill-affinities', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ ingredients }),
           })
+          if (DIAG_ON) console.log(`[DIAG:affinities-backfill] client round-trip ms ${Math.round(performance.now() - __diagBackfillT0)} ${JSON.stringify({ missing })}`)
           if (response.ok) {
             const { data: freshData } = await supabase
               .from('ingredient_affinities')
@@ -3761,7 +4204,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const fetchContextualAffinities = async (baseMap) => {
     try {
       const modifiers = { frozen, lowABV, na }
-      const data = await analyzeContextualAffinities(selected, template, modifiers, baseMap)
+      const data = await analyzeContextualAffinities(selected, template, modifiers, baseMap, DIAG_ON ? 'affinities-contextual' : null)
       const forbidden = TEMPLATE_SIGNATURES[template]?.forbiddenRoles || []
       const entries = (data?.ingredients || []).map(entry => ({
         contextual_prose: entry?.contextual_prose || null,
@@ -3821,12 +4264,29 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     }
   }
 
-  const handleCrossTemplateSuggestion = async (suggestedTemplate) => {
+  // Session 8, Change 4: fetches the drink the CTA already named, rather than
+  // discarding that name and running a full fresh tier-1 search — see
+  // handleExplore's redirectDrinkName branch. The user keeps the ability to
+  // explore the new template further (See More Published/Ideas both still
+  // work normally from here); the change is that the named drink appears
+  // immediately instead of after a full rebuild.
+  const handleCrossTemplateSuggestion = async (suggestedTemplate, drinkName) => {
     setTemplate(suggestedTemplate)
     // Attach the new recipe_list as a sibling under the same ingredients node
     // (not nested under the current recipe_list) so the whiteboard shows two
     // parallel builds from the same seed ingredients rather than a chain.
-    await handleExplore({ template: suggestedTemplate, continueFromNodeId: currentIngredientsNodeId })
+    await handleExplore({ template: suggestedTemplate, continueFromNodeId: currentIngredientsNodeId, redirectDrinkName: drinkName })
+  }
+
+  // Session 8: RecipeCard fetches its own detail on demand, then reports the
+  // merged patch back up here so it lands in `result.suggestions` — the
+  // session-level cache. Matched by recipe_name, consistent with every other
+  // place in this file that keys a suggestion that way (recipeNodeIds, etc.).
+  const handleSuggestionDetailFetched = (recipeName, patch) => {
+    setResult(prev => prev ? {
+      ...prev,
+      suggestions: (prev.suggestions || []).map(s => s.recipe_name === recipeName ? { ...s, ...patch } : s),
+    } : prev)
   }
 
   const analyzeCombination = async (ingredients, currentAffinityData) => {
@@ -4315,7 +4775,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} /> })}
+                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} /> })}
               </div>
             </div>
           )}
@@ -4323,7 +4783,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Shopping Required ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} /> })}
+                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} /> })}
               </div>
             </div>
           )}
@@ -4331,7 +4791,7 @@ Rules:
         {/* Suppressed after Surprise Me (Change 5) — the model already picked the template
             there, so a redirect a moment later reads as second-guessing its own choice. */}
         {!viaSurpriseMe && result.cross_template_suggestion && TEMPLATE_MAP[result.cross_template_suggestion.template] && (
-          <div onClick={() => handleCrossTemplateSuggestion(result.cross_template_suggestion.template)}
+          <div onClick={() => handleCrossTemplateSuggestion(result.cross_template_suggestion.template, result.cross_template_suggestion.drink_name)}
             style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 20, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
             <div>
               <div style={{ fontSize: 14, fontWeight: 600, color: C.text, marginBottom: 6 }}>

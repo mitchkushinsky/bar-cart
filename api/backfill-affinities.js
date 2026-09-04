@@ -63,6 +63,10 @@ Ingredients:
 ${ingredientList}`
 
   try {
+    // TEMP DIAGNOSTIC (Session: timing diagnostic) — pure model-call time,
+    // no client/server hop. Removable: delete __diagT0 and the console.log
+    // below, leave everything else as-is.
+    const __diagT0 = Date.now()
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -83,6 +87,13 @@ ${ingredientList}`
     }
 
     const claudeData = await claudeRes.json()
+    console.log('[DIAG:affinities-backfill-server] model call ms', Date.now() - __diagT0, {
+      ingredientCount: ingredients.length,
+      names: ingredients.map(i => i.name),
+      input_tokens: claudeData.usage?.input_tokens,
+      output_tokens: claudeData.usage?.output_tokens,
+      stop_reason: claudeData.stop_reason,
+    })
     const textBlock = (claudeData.content || []).filter(b => b.type === 'text').pop()
     if (!textBlock) throw new Error('No text content in Claude response')
 
