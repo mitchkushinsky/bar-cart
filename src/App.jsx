@@ -613,12 +613,33 @@ async function callClaudeStreamDiag(body, label) {
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
-  const blocks = {} // index -> { type, name, tStart, tStop }
+  const blocks = {} // index -> { type, name, tStart, tStop, query?, results? }
+  // TEMP DIAGNOSTIC EXTENSION ("What the Searches Are Doing" investigation):
+  // accumulates a server_tool_use block's streamed JSON input (Anthropic
+  // sends a tool call's input as incremental input_json_delta/partial_json
+  // chunks, never as one piece — confirmed by a raw curl against the
+  // Messages API) so the actual query string can be recovered at
+  // content_block_stop. web_search_tool_result blocks are NOT streamed this
+  // way — their full result array (title/url per hit) arrives already
+  // populated on content_block_start, so no accumulation is needed there.
+  // Additive and gated exactly like the rest of this file's diagnostics;
+  // remove this comment and the two blocks marked below together with the
+  // rest of callClaudeStreamDiag when the instrumentation is retired.
+  const toolInputAccum = {} // index -> accumulated partial_json string
   let text = ''
   let inputTokens = null
   let outputTokens = null
   let stopReason = null
   let tMessageStart = null
+  let serverWebSearchRequests = null // message_delta.usage.server_tool_use.web_search_requests — Anthropic's own count, cross-checked against searchCallCount below
+  // TEMP DIAGNOSTIC EXTENSION ("Search Overlap and the Single-Query
+  // Alternative" investigation): citations_delta events arrive interleaved
+  // with text_delta inside the final text block and name which web search
+  // result (by URL) grounded the text at that point. Accumulated by the
+  // content_block index they arrive in so they can be attributed back to a
+  // specific answer block. Additive/gated exactly like the rest of this
+  // diagnostic; remove together with it.
+  const citationsByBlock = {} // index -> [{url, title, citedText}]
 
   const handleEvent = (raw) => {
     const dataLine = raw.split('\n').find(l => l.startsWith('data:'))
@@ -633,22 +654,55 @@ async function callClaudeStreamDiag(body, label) {
         break
       case 'content_block_start': {
         const cb = evt.content_block || {}
-        blocks[evt.index] = { type: cb.type, name: cb.name, tStart: elapsed(), tStop: null }
-        console.log(`[DIAG:${label}] content_block_start ${JSON.stringify({ index: evt.index, type: cb.type, name: cb.name, atMs: blocks[evt.index].tStart })}`)
+        const entry = { type: cb.type, name: cb.name, tStart: elapsed(), tStop: null }
+        // TEMP: web_search_tool_result's content array arrives whole here.
+        // Matched back to its issuing search by tool_use_id === the
+        // server_tool_use block's own id — NOT by index/timing adjacency,
+        // since multiple searches are sometimes issued back-to-back before
+        // any of their results arrive (confirmed in live captures), which
+        // breaks any "next result block after this one" heuristic.
+        if (cb.type === 'web_search_tool_result' && Array.isArray(cb.content)) {
+          entry.toolUseId = cb.tool_use_id ?? null
+          entry.resultCount = cb.content.length
+          entry.results = cb.content.map(r => ({ title: r.title ?? null, url: r.url ?? null }))
+        }
+        if (cb.type === 'server_tool_use') {
+          entry.id = cb.id ?? null
+          toolInputAccum[evt.index] = ''
+        }
+        blocks[evt.index] = entry
+        console.log(`[DIAG:${label}] content_block_start ${JSON.stringify({ index: evt.index, type: cb.type, name: cb.name, atMs: entry.tStart, resultCount: entry.resultCount })}`)
         break
       }
       case 'content_block_delta':
         if (evt.delta?.type === 'text_delta') text += evt.delta.text
+        // TEMP: accumulate a tool-use block's streamed JSON input.
+        if (evt.delta?.type === 'input_json_delta' && toolInputAccum[evt.index] !== undefined) {
+          toolInputAccum[evt.index] += evt.delta.partial_json || ''
+        }
+        // TEMP: capture citation deltas — each names the web search result
+        // (url/title) the model just grounded its preceding text in.
+        if (evt.delta?.type === 'citations_delta' && evt.delta.citation) {
+          const c = evt.delta.citation
+          if (!citationsByBlock[evt.index]) citationsByBlock[evt.index] = []
+          citationsByBlock[evt.index].push({ url: c.url ?? null, title: c.title ?? null, citedText: c.cited_text ?? null })
+        }
         break
       case 'content_block_stop':
         if (blocks[evt.index]) {
           blocks[evt.index].tStop = elapsed()
-          console.log(`[DIAG:${label}] content_block_stop ${JSON.stringify({ index: evt.index, type: blocks[evt.index].type, atMs: blocks[evt.index].tStop })}`)
+          // TEMP: parse the completed tool input now that all deltas are in.
+          if (blocks[evt.index].type === 'server_tool_use' && toolInputAccum[evt.index] !== undefined) {
+            try { blocks[evt.index].query = JSON.parse(toolInputAccum[evt.index] || '{}')?.query ?? null } catch { blocks[evt.index].query = `<unparsed: ${toolInputAccum[evt.index]}>` }
+          }
+          console.log(`[DIAG:${label}] content_block_stop ${JSON.stringify({ index: evt.index, type: blocks[evt.index].type, atMs: blocks[evt.index].tStop, query: blocks[evt.index].query })}`)
         }
         break
       case 'message_delta':
         if (evt.usage?.output_tokens != null) outputTokens = evt.usage.output_tokens
         if (evt.delta?.stop_reason) stopReason = evt.delta.stop_reason
+        // TEMP: Anthropic's own server-side search-request count, for cross-check.
+        if (evt.usage?.server_tool_use?.web_search_requests != null) serverWebSearchRequests = evt.usage.server_tool_use.web_search_requests
         break
       case 'message_stop':
         console.log(`[DIAG:${label}] message_stop ${JSON.stringify({ atMs: elapsed() })}`)
@@ -685,11 +739,41 @@ async function callClaudeStreamDiag(body, label) {
   const searchMs = genStartMs
   const generationMs = totalMs - genStartMs
 
+  // TEMP: per-query summary in call order — query text, elapsed at issue,
+  // duration until its matching result block stopped, and how many results
+  // that search returned. This is the primary artifact the search
+  // investigation reads back out of the console.
+  // EXTENSION ("Search Overlap" investigation): resultUrls kept as-is for
+  // continuity with the prior investigation's format; results now also
+  // carries {url, title} pairs so novelty/overlap analysis can report titles
+  // alongside URLs without a second lookup.
+  const queries = blockList
+    .filter(b => b.type === 'server_tool_use')
+    .map(b => {
+      const resultBlock = blockList.find(r => r.type === 'web_search_tool_result' && r.toolUseId === b.id)
+      return {
+        index: b.index,
+        query: b.query ?? null,
+        issuedAtMs: b.tStart,
+        resultAtMs: resultBlock?.tStart ?? null,
+        roundTripMs: resultBlock ? resultBlock.tStart - b.tStart : null,
+        resultCount: resultBlock?.resultCount ?? null,
+        resultUrls: resultBlock?.results?.map(r => r.url) ?? null,
+        results: resultBlock?.results ?? null,
+      }
+    })
+  // TEMP: citation deltas grouped by the text block they annotated —
+  // reports which search-result URLs the final answer actually cited.
+  const citations = Object.entries(citationsByBlock).map(([index, cites]) => ({ textBlockIndex: Number(index), citations: cites }))
+
   console.log(`[DIAG:${label}] SUMMARY ${JSON.stringify({
     totalMs,
     messageStartMs: tMessageStart,
     searchCallCount,
-    searchBlocks: searchBlocks.map(b => ({ index: b.index, type: b.type, name: b.name, tStart: b.tStart, tStop: b.tStop })),
+    serverWebSearchRequests,
+    queries,
+    citations,
+    searchBlocks: searchBlocks.map(b => ({ index: b.index, type: b.type, name: b.name, tStart: b.tStart, tStop: b.tStop, query: b.query, resultCount: b.resultCount })),
     textBlocks: textBlocks.map(b => ({ index: b.index, tStart: b.tStart, tStop: b.tStop })),
     genStartMs_searchPhaseMs: searchMs,
     generationMs,
@@ -699,7 +783,7 @@ async function callClaudeStreamDiag(body, label) {
     totalBlockCount: blockList.length,
   })}`)
 
-  return { text, inputTokens, outputTokens, stopReason, totalMs, searchMs, generationMs, searchCallCount }
+  return { text, inputTokens, outputTokens, stopReason, totalMs, searchMs, generationMs, searchCallCount, queries }
 }
 // ══════════════════════════════════════════════════════════════ END TEMP ═══
 
@@ -1922,6 +2006,19 @@ function IngredientDrawer({
     inv.spirit.toLowerCase().includes(item.ingredient.toLowerCase())
   )
   const tag = tags && invMatch ? tags[invMatch.spirit.trim().toLowerCase()] : null
+  const [genericTypeSaving, setGenericTypeSaving] = useState(false)
+  const [genericTypeError, setGenericTypeError] = useState(null)
+  const handleSetGenericType = async (spiritName, newType) => {
+    setGenericTypeSaving(true)
+    setGenericTypeError(null)
+    try {
+      await onSetGenericType(spiritName, newType)
+    } catch (err) {
+      setGenericTypeError(err?.message || 'Could not save.')
+    } finally {
+      setGenericTypeSaving(false)
+    }
+  }
 
   return (
     <>
@@ -1964,14 +2061,23 @@ function IngredientDrawer({
                 </button>
               )}
             </div>
-            <select
-              value={tag?.generic_type || ''}
-              onChange={e => e.target.value && onSetGenericType(invMatch.spirit, e.target.value)}
-              style={{ width: '100%', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: '8px 10px', fontSize: 14 }}
-            >
-              <option value="" disabled>{tag ? tag.generic_type : '— untagged —'}</option>
-              {distinctGenericTypes?.map(t => <option key={t} value={t}>{t}</option>)}
-            </select>
+            <div style={{ position: 'relative' }}>
+              <select
+                value={tag?.generic_type || ''}
+                onChange={e => e.target.value && handleSetGenericType(invMatch.spirit, e.target.value)}
+                disabled={genericTypeSaving}
+                style={{ width: '100%', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: '8px 10px', fontSize: 14, opacity: genericTypeSaving ? 0.6 : 1 }}
+              >
+                <option value="" disabled>{tag ? tag.generic_type : '— untagged —'}</option>
+                {distinctGenericTypes?.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+              {genericTypeSaving && (
+                <span style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', display: 'inline-block', width: 12, height: 12, border: `2px solid ${C.border}`, borderTopColor: C.gold, borderRadius: '50%', animation: 'bcspini 0.6s linear infinite' }} />
+              )}
+            </div>
+            {genericTypeError && (
+              <div style={{ fontSize: 12, color: C.red, marginTop: 6 }}>{genericTypeError}</div>
+            )}
             {tag?.aliases?.length > 0 && (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
                 {tag.aliases.map(a => (
@@ -2667,10 +2773,24 @@ function ShoppingListScreen({ shoppingList, onRemove, onClear }) {
 function FavoriteCard({ fav, onRemove, onView, onUpdateNote }) {
   const [editingNote, setEditingNote] = useState(false)
   const [noteText, setNoteText] = useState(fav.note || '')
+  const [noteSaving, setNoteSaving] = useState(false)
+  const [noteError, setNoteError] = useState(null)
 
-  const saveNote = () => {
-    onUpdateNote(fav.id, noteText.trim())
-    setEditingNote(false)
+  // Session 9, Change 2: this closed the editor immediately on click,
+  // before the write even started — a failed save looked identical to a
+  // successful one. Now awaits and keeps the editor open with the typed
+  // text intact if it fails, instead of silently discarding it.
+  const saveNote = async () => {
+    setNoteSaving(true)
+    setNoteError(null)
+    try {
+      await onUpdateNote(fav.id, noteText.trim())
+      setEditingNote(false)
+    } catch (err) {
+      setNoteError(err?.message || 'Could not save note.')
+    } finally {
+      setNoteSaving(false)
+    }
   }
 
   return (
@@ -2710,9 +2830,13 @@ function FavoriteCard({ fav, onRemove, onView, onUpdateNote }) {
               autoFocus
               style={{ width: '100%', background: '#111', border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: '8px 10px', fontSize: 13, resize: 'vertical', outline: 'none', fontFamily: 'inherit' }}
             />
-            <div style={{ display: 'flex', gap: 6 }}>
-              <button onClick={saveNote} style={{ background: C.gold, border: 'none', borderRadius: 6, color: '#0f0f0f', fontSize: 12, fontWeight: 700, padding: '5px 12px', cursor: 'pointer' }}>Save</button>
-              <button onClick={() => { setNoteText(fav.note || ''); setEditingNote(false) }} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 6, color: C.textMuted, fontSize: 12, padding: '5px 10px', cursor: 'pointer' }}>Cancel</button>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <button onClick={saveNote} disabled={noteSaving} style={{ background: C.gold, border: 'none', borderRadius: 6, color: '#0f0f0f', fontSize: 12, fontWeight: 700, padding: '5px 12px', cursor: noteSaving ? 'default' : 'pointer', opacity: noteSaving ? 0.7 : 1, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                {noteSaving && <span style={{ display: 'inline-block', width: 10, height: 10, border: '2px solid currentColor', borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite' }} />}
+                {noteSaving ? 'Saving…' : 'Save'}
+              </button>
+              <button onClick={() => { setNoteText(fav.note || ''); setNoteError(null); setEditingNote(false) }} disabled={noteSaving} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 6, color: C.textMuted, fontSize: 12, padding: '5px 10px', cursor: noteSaving ? 'default' : 'pointer' }}>Cancel</button>
+              {noteError && <span style={{ fontSize: 12, color: C.red }}>{noteError}</span>}
             </div>
           </div>
         ) : fav.note ? (
@@ -3249,6 +3373,8 @@ function RecipeCard({
   const [tweakModalOpen, setTweakModalOpen] = useState(false)
   const [tried, setTried] = useState(initialTried)
   const [notes, setNotes] = useState(initialNotes)
+  const [triedError, setTriedError] = useState(null)
+  const [notesError, setNotesError] = useState(null)
   const [lineage, setLineage] = useState(null) // { parentName } once a tweak has been applied this session
   const [showOriginal, setShowOriginal] = useState(false)
   const recipeNodeIdRef = useRef(restoreRecipeNodeId || recipeNodeIds?.[suggestion.recipe_name] || null)
@@ -3384,25 +3510,45 @@ function RecipeCard({
     }
   }
 
-  const handleToggleTried = () => {
+  // Session 9, Change 2: this used to fire the write and forget it — tried
+  // flipped visually the instant it was tapped regardless of whether the
+  // write actually landed. Now awaited, with the optimistic flip rolled back
+  // and a real error shown if it didn't.
+  const handleToggleTried = async () => {
     const next = !tried
     const triedAt = next ? new Date().toISOString() : null
     setTried(next)
+    setTriedError(null)
     if (onTriedToggle) {
-      onTriedToggle(next, triedAt)
+      try {
+        await onTriedToggle(next, triedAt)
+      } catch (err) {
+        setTried(!next)
+        setTriedError(err?.message || 'Could not save.')
+      }
     } else if (recipeNodeIdRef.current && user) {
-      supabase.from('exploration_nodes').update({ tried: next, tried_at: triedAt }).eq('id', recipeNodeIdRef.current).then()
+      const { error } = await supabase.from('exploration_nodes').update({ tried: next, tried_at: triedAt }).eq('id', recipeNodeIdRef.current)
+      if (error) { setTried(!next); setTriedError(error.message || 'Could not save.') }
     } else {
       pendingTriedRef.current = { tried: next, tried_at: triedAt }
     }
   }
 
-  const handleNotesSave = (value) => {
+  // Notes have no checkmark to roll back — clearing what someone just typed
+  // because the save failed would be worse than the bug this is fixing — so
+  // a failure here surfaces an error instead of reverting `notes`.
+  const handleNotesSave = async (value) => {
     savedNotesRef.current = value
+    setNotesError(null)
     if (onNotesSave) {
-      onNotesSave(value)
+      try {
+        await onNotesSave(value)
+      } catch (err) {
+        setNotesError(err?.message || 'Could not save note.')
+      }
     } else if (recipeNodeIdRef.current && user) {
-      supabase.from('exploration_nodes').update({ notes: value }).eq('id', recipeNodeIdRef.current).then()
+      const { error } = await supabase.from('exploration_nodes').update({ notes: value }).eq('id', recipeNodeIdRef.current)
+      if (error) setNotesError(error.message || 'Could not save note.')
     } else {
       pendingNotesRef.current = value
     }
@@ -3573,6 +3719,12 @@ function RecipeCard({
           rows={2}
           style={{ width: '100%', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, padding: '8px 10px', resize: 'vertical', outline: 'none', boxSizing: 'border-box' }}
         />
+        {notesError && (
+          <div style={{ fontSize: 12, color: C.red, marginTop: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
+            {notesError}
+            <button onClick={() => handleNotesSave(notes)} style={{ background: 'none', border: 'none', color: C.gold, fontSize: 12, cursor: 'pointer', padding: 0, textDecoration: 'underline' }}>Retry</button>
+          </div>
+        )}
       </div>
 
       <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -3589,6 +3741,9 @@ function RecipeCard({
             {onDeckSaving ? 'Saving…' : '🍹 On Deck'}
           </button>
         ))}
+        {triedError && (
+          <div style={{ fontSize: 12, color: C.red, width: '100%' }}>{triedError}</div>
+        )}
         {showSaveButtons && saveError && (
           <div style={{ fontSize: 12, color: C.red, width: '100%' }}>{saveError}</div>
         )}
@@ -3623,6 +3778,23 @@ function RecipeCard({
 const EXPLORE_LOADING_MSGS = [
   'Searching published cocktail recipes…',
   'Crafting original ideas for your ingredients…',
+  'Matching against your inventory…',
+  'Almost there…',
+]
+
+// Session 9, Change 4: See More Published/Ideas ran 20-45s showing only a
+// static button-label swap — no spinner, no sense of ongoing progress, which
+// reads as a hang well before it actually finishes. Same rotating-message
+// treatment as EXPLORE_LOADING_MSGS above, scaled to an inline row instead
+// of a full-screen takeover since the existing results stay visible and
+// usable underneath while these run.
+const SEE_MORE_PUBLISHED_MSGS = [
+  'Searching for more published recipes…',
+  'Checking named, attributable cocktails first…',
+  'Almost there…',
+]
+const SEE_MORE_IDEAS_MSGS = [
+  'Crafting more original ideas…',
   'Matching against your inventory…',
   'Almost there…',
 ]
@@ -3677,6 +3849,8 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const diagSeeMorePublishedTapRef = useRef(2)
   const [viaSurpriseMe, setViaSurpriseMe] = useState(false)
   const [loadingMsgIdx, setLoadingMsgIdx] = useState(0)
+  const [seeMorePublishedMsgIdx, setSeeMorePublishedMsgIdx] = useState(0)
+  const [seeMoreIdeasMsgIdx, setSeeMoreIdeasMsgIdx] = useState(0)
   const [affinityData, setAffinityData] = useState({})
   const [affinityLoading, setAffinityLoading] = useState(false)
   const [affinityError, setAffinityError] = useState(null)
@@ -3699,6 +3873,109 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const [autoExpandRecipeNodeId, setAutoExpandRecipeNodeId] = useState(null)
   const [restoreNodeData, setRestoreNodeData] = useState({}) // recipe_name → { nodeId, tried, notes } — siblings only, see buildContinueRestore
   const [autoExpandNodeData, setAutoExpandNodeData] = useState(null) // { tried, notes } for the auto-expanded card, keyed by node id not name
+
+  // Session 9, Change 1: notes/tried typed or tapped on a recipe card in the
+  // moment before that recipe's exploration_nodes row exists have nowhere
+  // durable to land. The eager per-recipe insert in handleExplore/
+  // handleSeeMore/handleSeeMorePublished is fire-and-forget and can take a
+  // second or two after results first render; a RecipeCard's own fallback
+  // (pendingNotesRef/pendingTriedRef, see RecipeCard) only survives if that
+  // SAME card instance is still mounted when the id arrives. Buffering here
+  // instead — keyed by recipe_name — survives the card unmounting (e.g. the
+  // user hits Back to 'ingredients' and the results list disappears) because
+  // this component itself stays mounted across step changes within one
+  // Create > New session; only the branch of JSX it returns changes.
+  const [pendingRecipeNotes, setPendingRecipeNotes] = useState({})
+  const [pendingRecipeTried, setPendingRecipeTried] = useState({})
+  const pendingRecipeNotesRef = useRef(pendingRecipeNotes)
+  useEffect(() => { pendingRecipeNotesRef.current = pendingRecipeNotes }, [pendingRecipeNotes])
+  const pendingRecipeTriedRef = useRef(pendingRecipeTried)
+  useEffect(() => { pendingRecipeTriedRef.current = pendingRecipeTried }, [pendingRecipeTried])
+  const currentRecipeNodeIdsRef = useRef(currentRecipeNodeIds)
+  useEffect(() => { currentRecipeNodeIdsRef.current = currentRecipeNodeIds }, [currentRecipeNodeIds])
+
+  // Writes straight through once a node id is known; otherwise buffers above.
+  // Throws on a real write failure so RecipeCard's own await/catch can roll
+  // back its optimistic UI and show the user something actually failed,
+  // rather than the previous fire-and-forget `.then()` that swallowed it.
+  const handleRecipeNotesSave = async (recipeName, value) => {
+    const nodeId = currentRecipeNodeIds[recipeName]
+    if (nodeId && user) {
+      const { error } = await supabase.from('exploration_nodes').update({ notes: value }).eq('id', nodeId)
+      if (error) throw new Error(error.message || 'Could not save note.')
+      setPendingRecipeNotes(prev => {
+        if (!(recipeName in prev)) return prev
+        const next = { ...prev }; delete next[recipeName]; return next
+      })
+    } else {
+      setPendingRecipeNotes(prev => ({ ...prev, [recipeName]: value }))
+    }
+  }
+
+  const handleRecipeTriedToggle = async (recipeName, next, triedAt) => {
+    const nodeId = currentRecipeNodeIds[recipeName]
+    if (nodeId && user) {
+      const { error } = await supabase.from('exploration_nodes').update({ tried: next, tried_at: triedAt }).eq('id', nodeId)
+      if (error) throw new Error(error.message || 'Could not save.')
+      setPendingRecipeTried(prev => {
+        if (!(recipeName in prev)) return prev
+        const nextMap = { ...prev }; delete nextMap[recipeName]; return nextMap
+      })
+    } else {
+      setPendingRecipeTried(prev => ({ ...prev, [recipeName]: { tried: next, tried_at: triedAt } }))
+    }
+  }
+
+  // Drains anything buffered above the moment its node id becomes known —
+  // covers the case where the user has already navigated to a different
+  // step (or the card that took the note has unmounted) by the time the
+  // eager insert resolves.
+  useEffect(() => {
+    const notes = pendingRecipeNotesRef.current
+    const tried = pendingRecipeTriedRef.current
+    const noteNames = Object.keys(notes).filter(name => currentRecipeNodeIds[name])
+    const triedNames = Object.keys(tried).filter(name => currentRecipeNodeIds[name])
+    if (noteNames.length === 0 && triedNames.length === 0) return
+    noteNames.forEach(name => {
+      supabase.from('exploration_nodes').update({ notes: notes[name] }).eq('id', currentRecipeNodeIds[name])
+        .then(({ error }) => { if (error) console.warn('[notes] deferred save failed:', error.message) })
+    })
+    triedNames.forEach(name => {
+      const t = tried[name]
+      supabase.from('exploration_nodes').update({ tried: t.tried, tried_at: t.tried_at }).eq('id', currentRecipeNodeIds[name])
+        .then(({ error }) => { if (error) console.warn('[tried] deferred save failed:', error.message) })
+    })
+    if (noteNames.length > 0) setPendingRecipeNotes(prev => { const n = { ...prev }; noteNames.forEach(k => delete n[k]); return n })
+    if (triedNames.length > 0) setPendingRecipeTried(prev => { const n = { ...prev }; triedNames.forEach(k => delete n[k]); return n })
+  }, [currentRecipeNodeIds])
+
+  // Last-resort flush for the two exits nothing else above can catch: the
+  // user closes/reloads the tab (beforeunload — best effort, fire-and-forget,
+  // since the page won't wait for a promise here) or leaves Create > New
+  // entirely (unmount) while a node id has still never arrived at all. If a
+  // node id never arrived, there is nothing durable to attach the value to
+  // without risking a duplicate node — the same accepted tradeoff the
+  // pre-existing pendingNotesRef/pendingTriedRef design already makes.
+  useEffect(() => {
+    const flush = () => {
+      const notes = pendingRecipeNotesRef.current
+      const tried = pendingRecipeTriedRef.current
+      const ids = currentRecipeNodeIdsRef.current
+      Object.entries(notes).forEach(([name, value]) => {
+        const nodeId = ids[name]
+        if (nodeId) supabase.from('exploration_nodes').update({ notes: value }).eq('id', nodeId).then()
+      })
+      Object.entries(tried).forEach(([name, t]) => {
+        const nodeId = ids[name]
+        if (nodeId) supabase.from('exploration_nodes').update({ tried: t.tried, tried_at: t.tried_at }).eq('id', nodeId).then()
+      })
+    }
+    window.addEventListener('beforeunload', flush)
+    return () => {
+      window.removeEventListener('beforeunload', flush)
+      flush()
+    }
+  }, [])
 
   useEffect(() => {
     const load = async () => {
@@ -3759,6 +4036,20 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     const id = setInterval(() => setLoadingMsgIdx(prev => (prev + 1) % EXPLORE_LOADING_MSGS.length), 8000)
     return () => clearInterval(id)
   }, [step])
+
+  useEffect(() => {
+    if (!seeMorePublishedLoading) return
+    setSeeMorePublishedMsgIdx(0)
+    const id = setInterval(() => setSeeMorePublishedMsgIdx(prev => (prev + 1) % SEE_MORE_PUBLISHED_MSGS.length), 8000)
+    return () => clearInterval(id)
+  }, [seeMorePublishedLoading])
+
+  useEffect(() => {
+    if (!seeMoreLoading) return
+    setSeeMoreIdeasMsgIdx(0)
+    const id = setInterval(() => setSeeMoreIdeasMsgIdx(prev => (prev + 1) % SEE_MORE_IDEAS_MSGS.length), 8000)
+    return () => clearInterval(id)
+  }, [seeMoreLoading])
 
   const upsertHistory = (ingredients, searchTemplate, searchFrozen, searchLowABV, searchNa, searchResult) => {
     const entry = {
@@ -4775,7 +5066,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} /> })}
+                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} /> })}
               </div>
             </div>
           )}
@@ -4783,7 +5074,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Shopping Required ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} /> })}
+                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} /> })}
               </div>
             </div>
           )}
@@ -4818,8 +5109,9 @@ Rules:
         {morePublishedExist && (
           <div style={{ marginBottom: 12 }}>
             <button onClick={() => handleSeeMorePublished()} disabled={seeMorePublishedLoading}
-              style={{ width: '100%', background: 'none', border: `1px dashed ${C.border}`, borderRadius: 10, color: C.gold, fontSize: 13, fontWeight: 600, padding: '12px 16px', cursor: seeMorePublishedLoading ? 'default' : 'pointer', opacity: seeMorePublishedLoading ? 0.6 : 1 }}>
-              {seeMorePublishedLoading ? 'Searching for more…' : 'See more published recipes →'}
+              style={{ width: '100%', background: 'none', border: `1px dashed ${C.border}`, borderRadius: 10, color: C.gold, fontSize: 13, fontWeight: 600, padding: '12px 16px', cursor: seeMorePublishedLoading ? 'default' : 'pointer', opacity: seeMorePublishedLoading ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+              {seeMorePublishedLoading && <span style={{ display: 'inline-block', width: 12, height: 12, border: '2px solid currentColor', borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite', flexShrink: 0 }} />}
+              {seeMorePublishedLoading ? SEE_MORE_PUBLISHED_MSGS[seeMorePublishedMsgIdx] : 'See more published recipes →'}
             </button>
             {seeMorePublishedError && <div style={{ fontSize: 13, color: C.red, marginTop: 8 }}>{seeMorePublishedError}</div>}
           </div>
@@ -4830,8 +5122,9 @@ Rules:
         {(!originalsFetched || moreIdeasExist) && (
           <div style={{ marginBottom: 24 }}>
             <button onClick={() => handleSeeMore()} disabled={seeMoreLoading}
-              style={{ width: '100%', background: 'none', border: `1px dashed ${C.border}`, borderRadius: 10, color: C.gold, fontSize: 13, fontWeight: 600, padding: '12px 16px', cursor: seeMoreLoading ? 'default' : 'pointer', opacity: seeMoreLoading ? 0.6 : 1 }}>
-              {seeMoreLoading ? 'Finding more ideas…' : 'See more ideas →'}
+              style={{ width: '100%', background: 'none', border: `1px dashed ${C.border}`, borderRadius: 10, color: C.gold, fontSize: 13, fontWeight: 600, padding: '12px 16px', cursor: seeMoreLoading ? 'default' : 'pointer', opacity: seeMoreLoading ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+              {seeMoreLoading && <span style={{ display: 'inline-block', width: 12, height: 12, border: '2px solid currentColor', borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite', flexShrink: 0 }} />}
+              {seeMoreLoading ? SEE_MORE_IDEAS_MSGS[seeMoreIdeasMsgIdx] : 'See more ideas →'}
             </button>
             {seeMoreError && <div style={{ fontSize: 13, color: C.red, marginTop: 8 }}>{seeMoreError}</div>}
           </div>
@@ -4952,6 +5245,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
   const nodeNotesRef = useRef(nodeNotes)
   useEffect(() => { nodeNotesRef.current = nodeNotes }, [nodeNotes])
   const dirtyNoteIdsRef = useRef(new Set())
+  const [tweakNoteErrors, setTweakNoteErrors] = useState({}) // node id → error message, for the inline tweak-node notes field
 
   useEffect(() => {
     const load = async () => {
@@ -4989,14 +5283,19 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
     })
   }
 
+  // Session 9, Change 2: previously deleted from the dirty set and swallowed
+  // any error via try/catch — but a Supabase query rejects that promise only
+  // on a network-level failure; a real write failure (RLS, bad column, etc.)
+  // comes back as { error } on a resolved promise, which the old try/catch
+  // never inspected. That meant most real failures were invisible AND the
+  // note was marked clean (dropped from dirtyNoteIdsRef) regardless, so the
+  // unmount-flush safety net below wouldn't even retry it. Now throws on a
+  // real error and only clears the dirty flag on confirmed success.
   const handleSaveNotes = async (nodeId, notes) => {
+    const { error } = await supabase.from('exploration_nodes').update({ notes }).eq('id', nodeId)
+    if (error) throw new Error(error.message || 'Could not save note.')
     dirtyNoteIdsRef.current.delete(nodeId)
-    try {
-      await supabase.from('exploration_nodes').update({ notes }).eq('id', nodeId)
-      await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId)
-    } catch (err) {
-      console.warn('[whiteboard] note save failed:', err.message)
-    }
+    supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId).then()
   }
 
   // Notes only save on textarea blur — if the user navigates away (Back, tab switch, etc.)
@@ -5190,14 +5489,21 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
           initialNotes={nodeNotes[node.id] ?? node.notes ?? ''}
           showSaveButtons={false}
           showRefineCTA={false}
-          onTriedToggle={(next, triedAt) => {
+          onTriedToggle={async (next, triedAt) => {
+            // Session 9, Change 2: was fire-and-forget with no rollback —
+            // inconsistent with the (correct) tried-toggle for tweak nodes
+            // just below, which already awaits and rolls back on failure.
             setTriedMap(prev => ({ ...prev, [node.id]: next }))
-            supabase.from('exploration_nodes').update({ tried: next, tried_at: triedAt }).eq('id', node.id).then()
+            const { error } = await supabase.from('exploration_nodes').update({ tried: next, tried_at: triedAt }).eq('id', node.id)
+            if (error) {
+              setTriedMap(prev => ({ ...prev, [node.id]: !next }))
+              throw new Error(error.message || 'Could not save.')
+            }
             supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId).then()
           }}
-          onNotesSave={(value) => {
+          onNotesSave={async (value) => {
             setNodeNotes(prev => ({ ...prev, [node.id]: value }))
-            handleSaveNotes(node.id, value)
+            await handleSaveNotes(node.id, value)
           }}
         />
       )
@@ -5229,11 +5535,21 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
         <textarea
           value={nodeNotes[node.id] ?? node.notes ?? ''}
           onChange={e => { setNodeNotes(prev => ({ ...prev, [node.id]: e.target.value })); dirtyNoteIdsRef.current.add(node.id) }}
-          onBlur={e => handleSaveNotes(node.id, e.target.value)}
+          onBlur={async e => {
+            setTweakNoteErrors(prev => { if (!(node.id in prev)) return prev; const n = { ...prev }; delete n[node.id]; return n })
+            try {
+              await handleSaveNotes(node.id, e.target.value)
+            } catch (err) {
+              setTweakNoteErrors(prev => ({ ...prev, [node.id]: err?.message || 'Could not save note.' }))
+            }
+          }}
           placeholder="Add your tasting notes…"
           rows={3}
           style={{ width: '100%', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, padding: '8px 10px', resize: 'vertical', outline: 'none', boxSizing: 'border-box' }}
         />
+        {tweakNoteErrors[node.id] && (
+          <div style={{ fontSize: 12, color: C.red, marginTop: 4 }}>{tweakNoteErrors[node.id]}</div>
+        )}
       </div>
     )
     }
@@ -5758,6 +6074,11 @@ export default function App() {
 
   // Manual dropdown edit — anon-key direct write, no service role. Restricted
   // to values already in use is enforced by the dropdown UI, not here.
+  // Session 9, Change 2/4: used to route a failure into tagSweepError, which
+  // renders only in the main Inventory screen banner — invisible while this
+  // runs from inside IngredientDrawer's bottom sheet, which overlays that
+  // banner entirely. Throws instead so the drawer can show it right where
+  // the edit happened, and give the dropdown a saving state while it's async.
   const setGenericTypeManually = useCallback(async (spiritName, newType) => {
     const key = spiritName.trim().toLowerCase()
     const { data, error } = await supabase
@@ -5766,7 +6087,7 @@ export default function App() {
       .eq('item_name', key)
       .select()
       .single()
-    if (error) { setTagSweepError(error.message); return }
+    if (error) throw new Error(error.message || 'Could not save.')
     setInventoryTags(prev => ({ ...prev, [key]: data }))
   }, [])
 
@@ -5784,13 +6105,23 @@ export default function App() {
     }
   }, [user])
 
+  // Session 9, Change 2: these awaited the delete but never checked its
+  // result, so the item vanished from the list even on a failed write —
+  // it would reappear on next reload with no explanation of why it came
+  // back. Now only updates local state once the delete is confirmed.
   const removeFromShopping = async (id) => {
-    if (user) await supabase.from('shopping_list').delete().eq('id', id)
+    if (user) {
+      const { error } = await supabase.from('shopping_list').delete().eq('id', id)
+      if (error) { console.error('[shopping list] remove failed:', error.message); return }
+    }
     setShoppingList(prev => prev.filter(i => i.id !== id))
   }
 
   const clearShopping = async () => {
-    if (user) await supabase.from('shopping_list').delete().eq('user_id', user.id)
+    if (user) {
+      const { error } = await supabase.from('shopping_list').delete().eq('user_id', user.id)
+      if (error) { console.error('[shopping list] clear failed:', error.message); return }
+    }
     setShoppingList([])
   }
 
@@ -5833,13 +6164,26 @@ export default function App() {
     }
   }
 
+  // Session 9, Change 2: same swallowed-error pattern as the shopping list
+  // helpers above — awaited but never checked, so local state moved on
+  // regardless of whether the write actually happened.
   const removeFavorite = async (id) => {
-    if (user) await supabase.from('favorites').delete().eq('id', id)
+    if (user) {
+      const { error } = await supabase.from('favorites').delete().eq('id', id)
+      if (error) { console.error('[favorites] remove failed:', error.message); return }
+    }
     setFavorites(prev => prev.filter(f => f.id !== id))
   }
 
+  // Throws on failure (rather than swallowing) so FavoriteCard's explicit
+  // Save button can tell a real success from a failed write and keep the
+  // note field open with the user's typed text intact instead of closing it
+  // as if the note had saved.
   const updateFavoriteNote = async (id, note) => {
-    if (user) await supabase.from('favorites').update({ notes: note }).eq('id', id)
+    if (user) {
+      const { error } = await supabase.from('favorites').update({ notes: note }).eq('id', id)
+      if (error) throw new Error(error.message || 'Could not save note.')
+    }
     setFavorites(prev => prev.map(f => f.id === id ? { ...f, note } : f))
   }
 
@@ -5882,7 +6226,10 @@ export default function App() {
   }
 
   const removeFromToMake = async (id) => {
-    if (user) await supabase.from('to_make').delete().eq('id', id)
+    if (user) {
+      const { error } = await supabase.from('to_make').delete().eq('id', id)
+      if (error) { console.error('[on deck] remove failed:', error.message); return }
+    }
     setToMake(prev => prev.filter(f => f.id !== id))
   }
 
@@ -5900,6 +6247,23 @@ export default function App() {
     setResult({ id: fav.id, recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType, origin: fav.origin, origin_flag: fav.originFlag, difficulty: fav.difficulty, source: fav.source, creator: fav.creator, bar: fav.bar, year: fav.year, attributionSource: fav.attributionSource, attributionUserSupplied: fav.attributionUserSupplied })
     setResultSource('favorites')
     setScreen('detail')
+  }
+
+  // Session 9, Change 3: the bottom-nav Create icon is a "go to this tab"
+  // action, distinct from in-app Back navigation (WhiteboardScreen's own
+  // back arrow, or ExplorationsScreen's goBack) which deliberately lands on
+  // In Progress to return the user where they came from. createSubTab is
+  // otherwise sticky across screen changes — once anything sets it to
+  // 'in_progress' it stays there, so tapping Create later reopens the
+  // in-progress list with no obvious way back to a blank start. Tapping the
+  // tab icon always resets to New, matching the common mobile convention
+  // that the active tab's icon returns to that tab's root. Harmless when
+  // already on Create with New active (setCreateSubTab/setScreen both
+  // receive their current value, so React bails out of re-rendering and an
+  // in-progress New exploration is left completely undisturbed).
+  const handleBottomTab = (id) => {
+    if (id === 'create') setCreateSubTab('new')
+    setScreen(id)
   }
 
   const signIn = () => supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: window.location.origin } })
@@ -6370,7 +6734,7 @@ export default function App() {
         />
       )}
 
-      <BottomTabBar screen={screen} onTab={setScreen} resultSource={resultSource} />
+      <BottomTabBar screen={screen} onTab={handleBottomTab} resultSource={resultSource} />
     </div>
   )
 }
