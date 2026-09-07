@@ -365,9 +365,21 @@ const SEED_INGREDIENT_EXEMPT = `The featured ingredient(s) are OUT OF SCOPE for 
 // section (Can Make Now / Shopping Required) — published items are already tier-1-first
 // by construction, so ranking them 0 just preserves that; this exists to fix riff-vs-
 // original ordering, which the model doesn't reliably emit in generation order.
-const ORIGIN_RANK = { published: 0, riff: 1, original: 2 }
+// Session 10, Change 3: published_variation slots in between published and riff —
+// a sourced variation still outranks a riff (it's a real published recipe, not a
+// substitution into the template), but sits behind canon.
+const ORIGIN_RANK = { published: 0, published_variation: 1, riff: 2, original: 3 }
+// Session 10, Change 1/3: within "published" itself, canon leads and low-tier
+// trails — tier is a transient, session-only classification (not always present
+// on legacy/saved items), so an unknown tier sorts to the middle rather than
+// pushing a legacy item to either extreme.
+const TIER_RANK = { canon: 0, variation: 1, low: 2 }
 function sortByOriginRank(suggestions) {
-  return [...suggestions].sort((a, b) => (ORIGIN_RANK[a?.origin] ?? 3) - (ORIGIN_RANK[b?.origin] ?? 3))
+  return [...suggestions].sort((a, b) => {
+    const originDiff = (ORIGIN_RANK[a?.origin] ?? 4) - (ORIGIN_RANK[b?.origin] ?? 4)
+    if (originDiff !== 0) return originDiff
+    return (TIER_RANK[a?.tier] ?? 1) - (TIER_RANK[b?.tier] ?? 1)
+  })
 }
 
 const NA_KEYWORDS = ['cucumber', 'mint', 'grapefruit', 'ginger', 'lemongrass', 'lime', 'lemon', 'juice', 'soda', 'tonic', 'syrup', 'tea']
@@ -1066,7 +1078,7 @@ async function analyzeExplorationsRecipes(ingredients, template, modifiers, inve
     tools: [{ type: 'web_search_20250305', name: 'web_search' }],
     messages: [{
       role: 'user',
-      content: `You are an expert craft bartender. Search the web for PUBLISHED cocktail recipes featuring the featured ingredients, within the family of the chosen template below. Return ONLY real recipes found from published sources — do NOT invent original cocktails. Set origin: "published" for ALL suggestions — every suggestion from this call is an exact published recipe.
+      content: `You are an expert craft bartender. Search the web for PUBLISHED cocktail recipes featuring the featured ingredients, within the family of the chosen template below. Return ONLY real recipes found from published sources — do NOT invent original cocktails. Every suggestion from this call is an exact published recipe — never a substitution or invention — but they are not all the same tier of published; see TIERS below for how to classify and set "origin" honestly per suggestion.
 
 Today's date is ${TODAY}.
 
@@ -1085,7 +1097,19 @@ First check if the featured ingredients fundamentally clash in cocktail contexts
 Otherwise, scope your web search itself to this template's family — search for terms like "published ${t.name} cocktail recipes with ${ingredientPhrase}" or "${ingredientPhrase} ${t.name} variation," not just "${ingredientPhrase} cocktail" — to find 2–3 published recipes that genuinely belong to this template.
 
 Prefer named, attributable cocktails over generic ingredient-titled recipes when deciding what to return AND what order to return it in. "Eastside," "Southside," "Last Word," "Bee's Knees" — drinks with a real history, a creator, or bar provenance — are the canon; "Cucumber Gin Sour," "Cucumber Gimlet with Rosemary" are recipe-blog content titled after their own ingredient list. Both are legitimate results, but a named drink outranks a generic one, so it goes first. This means searching for named cocktails that CONTAIN these ingredients, not just for recipes DESCRIBED BY these ingredients — a canonical drink's own title frequently does not contain the ingredient words at all (an Eastside's title says nothing about cucumber or gin), which is exactly why a title-keyword-only search misses it and surfaces the blog content instead. If you already know of a well-known drink in this template's family that features these ingredients, search to verify and source it specifically, don't wait for it to surface from a generic search. Where a drink has a known creator, bar, or era, that itself is strong evidence it belongs in the first batch, not a later one.
-${excludeNames.length > 0 ? `\nALREADY SURFACED — the user has already seen these recipes, do not return them again, find genuinely different published recipes: ${excludeNames.join(', ')}.\n` : ''}
+
+TIERS — sort every result you find into exactly one, and set each suggestion's "tier" field honestly:
+- CANON: a named drink with independent, documented history — a real creator, a bar, or an era distinct from whatever site happens to publish it today. The Old Fashioned is canon despite having no single named inventor, because the drink itself is the historical record, not a gloss on someone else's.
+- VARIATION: a real, properly sourced recipe that is nonetheless explicitly a specific source's own take on something else, not an independently famous drink in its own right — commonly self-declaring by name ("Sazerac, Difford's split-base version") or framing ("our twist on the Paper Plane"). The source is credited (attribution_source), but there is no independent creator, bar, or era beyond that source having published its own version.
+- LOW: a real published recipe with no distinguishing history at all — generic, ingredient-titled blog or SEO content ("Cucumber Gin Sour"). Still genuine and still usable, just without canon standing.
+The signal is the DRINK's provenance, not the site's reputation — a single reputable source (Difford's Guide, for instance) publishes real canon and its own labeled variations side by side, and tier follows which one a given result actually is. Do not default every result to the same tier, and do not inflate a variation into canon just because the source is a good one.
+
+DISPLAY: return up to 4 canon suggestions — a ceiling, not a quota; return fewer when fewer genuinely exist. Alongside them, return 1-2 low-tier suggestions as a baseline — real recipes, not padding to hit a number. If canon is thin (0-1 found), low-tier suggestions may carry more of the result set instead, since there is nothing else to show. The count you return should read as an honest reflection of what is actually out there, not a filled quota — two results should mean the canon is genuinely thin, not that the batch was capped.
+
+BUFFER: separately from what you display, report up to 10 further candidate drinks you found and judged genuine but did not write up, as a plain list of {name, source_url, tier}. No summary, no ingredients, no attribution beyond the URL — this is a name and a pointer, not a suggestion, so it costs you nothing extra to include. A candidate glimpsed once in a snippet without confidence it satisfies every featured ingredient does not belong here — the buffer is held to the same quality bar as what you displayed, just not yet written up. Order the buffer canon first.
+
+PREFERRED SOURCES: when multiple sources would serve equally well for the same drink, prefer citing Difford's Guide, Kindred Cocktails, Imbibe, Punch, Wikipedia, or the featured ingredient's own producer site — these have been the most reliable in practice. This is a preference, not a filter: a canonical drink documented only elsewhere must still surface.
+${excludeNames.length > 0 ? `\nALREADY SURFACED — the user has already seen these recipes, do not return them again (as a suggestion OR in the buffer), find genuinely different published recipes: ${excludeNames.join(', ')}.\n` : ''}
 If a published recipe you find doesn't genuinely belong to this template's family, leave it out of your results rather than including it anyway — never rewrite, restructure, or "correct" a real published recipe to make it fit. A published recipe is presented exactly as published, or not at all.
 
 Search both directions of category and brand for each featured ingredient. If it's a generic category (e.g. "coconut liqueur," "rye whiskey," "blanco tequila"), also search well-known specific products within that category (e.g. Malibu, Kalani, Coco Reàl for coconut liqueur) — published cocktail writing is overwhelmingly brand-specific, so a category-only search under-returns real matches. If it's a specific bottle (e.g. "Clement Mahina Coconut Rhum Liqueur"), also search the generic category term (e.g. "coconut liqueur") — a recipe published for the category is a genuine match for the specific bottle too, and category-level recipes are far more common than ones naming an exact product.
@@ -1106,11 +1130,11 @@ ${CAN_MAKE_NOW_RULE}
 
 ${CAN_MAKE_NOW_SILENT}
 
-If you cannot find 2–3 published recipes that include ALL featured ingredients, return as many as you can find (even 0 or 1). If no qualifying published recipes exist, return an empty suggestions array and set "no_recipes_found": true. Do NOT invent original recipes in this call — that is handled separately.
+If you cannot find published recipes that include ALL featured ingredients under the DISPLAY guidance above, return as many as you can find (even 0 or 1) plus whatever the BUFFER holds. If no qualifying published recipes exist anywhere — displayed or buffered — return an empty suggestions array, an empty buffer, and set "no_recipes_found": true. Do NOT invent original recipes in this call — that is handled separately.
 
-Separately from how many you return, report whether more genuinely exist: set "more_published_exist" to true only if you are aware of ADDITIONAL genuine published recipes for this ingredient/template combination beyond the ones you returned here — not ones you're merely guessing might exist. Setting it false is a specific claim — that no further NAMED, attributable cocktail exists for this combination beyond what you found — not that the batch you're returning merely feels sufficient. If everything in your results is a generic, ingredient-titled recipe rather than a named drink, treat that as evidence more canon likely exists rather than as a sign the search is complete, and lean toward true unless you're genuinely confident nothing else is out there. This doesn't license speculation the other way either: false is still the honest, correct answer whenever it's actually true — the fix is not defaulting to false, not avoiding it. This field must be present on every response, including when no_recipes_found is true (where it should ordinarily be false).
+Separately from how many you display, report whether more genuinely exist beyond what you displayed AND buffered above: set "more_published_exist" to true only if you are aware of ADDITIONAL genuine published recipes for this ingredient/template combination beyond both — not ones you're merely guessing might exist. Setting it false is a specific claim — that no further NAMED, attributable cocktail exists for this combination beyond what you found or buffered — not that the batch you're returning merely feels sufficient. If everything in your results is a generic, ingredient-titled recipe rather than a named drink, treat that as evidence more canon likely exists rather than as a sign the search is complete, and lean toward true unless you're genuinely confident nothing else is out there. This doesn't license speculation the other way either: false is still the honest, correct answer whenever it's actually true — the fix is not defaulting to false, not avoiding it. This field must be present on every response, including when no_recipes_found is true (where it should ordinarily be false).
 
-This is a first-pass listing, not the full analysis — the user picks one to open before seeing build detail. Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, can_make_now, summary, recipe (array of {ingredient, amount}). The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), in one line — save elaboration for later. Never inventory status, ownership, or attribution in summary — those are conveyed separately. Do not omit or leave any of these fields empty except where the schema explicitly allows null (creator, bar, year, attribution_source). Do NOT include instructions, glass_type, technique_notes, difficulty, difficulty_note, watch_outs, or a per-ingredient ownership breakdown in this response — none of that is being asked for here.
+This is a first-pass listing, not the full analysis — the user picks one to open before seeing build detail. Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, tier, can_make_now, summary, recipe (array of {ingredient, amount}). The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), in one line — save elaboration for later. Never inventory status, ownership, or attribution in summary — those are conveyed separately. Do not omit or leave any of these fields empty except where the schema explicitly allows null (creator, bar, year, attribution_source). Do NOT include instructions, glass_type, technique_notes, difficulty, difficulty_note, watch_outs, or a per-ingredient ownership breakdown in this response — none of that is being asked for here.
 
 ${ATTRIBUTION_FIELDS_INSTRUCTION}
 
@@ -1129,6 +1153,7 @@ Return ONLY valid JSON with no markdown fences:
     {
       "recipe_name": "string",
       "origin": "published",
+      "tier": "canon | variation | low",
       "can_make_now": true,
       "summary": "one line — flavor and character only. Never creator, bar, year, or source here — those go in the dedicated fields below, not summary.",
       "creator": "string or null",
@@ -1137,9 +1162,12 @@ Return ONLY valid JSON with no markdown fences:
       "attribution_source": "string or null",
       "recipe": [{ "ingredient": "string", "amount": "string" }]
     }
+  ],
+  "buffer": [
+    { "name": "string", "source_url": "string or null", "tier": "canon | variation | low" }
   ]
 }
-cross_template_suggestion must be null (not omitted) when there is no genuine match. more_published_exist must be present (not omitted) on every response.`,
+cross_template_suggestion must be null (not omitted) when there is no genuine match. more_published_exist must be present (not omitted) on every response. Set "origin" to "published" for every suggestion here regardless of tier — the app derives the user-facing published/published_variation split from "tier" itself, so origin only needs to say "this came from a real published source," which is true of canon, variation, and low alike. buffer must be present (an empty array, not omitted) even when there is nothing left to buffer.`,
     }],
   }
   // TEMP DIAGNOSTIC: diagLabel opts into the streaming/instrumented path;
@@ -1171,11 +1199,46 @@ cross_template_suggestion must be null (not omitted) when there is no genuine ma
   // compatibility field consumed by Favorites/On Deck saves (a real DB column),
   // and every suggestion from this call is always "from_recipe" regardless of
   // the new self-reported origin value, so deriving it guarantees consistency.
-  if (data?.suggestions) data.suggestions = data.suggestions.map(s => ({ ...s, origin_flag: 'from_recipe' }))
+  // Session 10, Change 3: the model always sets origin: "published" (see the
+  // prompt) — the published/published_variation split the user actually sees
+  // is derived here from "tier" instead, the same way origin_flag already is.
+  // An unrecognized or missing tier falls back to "published" (not variation)
+  // so a model slip never demotes a real canon result, matching this app's
+  // general bias toward the more generous reading when a self-report is absent.
+  if (data?.suggestions) {
+    data.suggestions = data.suggestions.map(s => {
+      const tier = ['canon', 'variation', 'low'].includes(s?.tier) ? s.tier : null
+      return { ...s, tier, origin: tier === 'variation' ? 'published_variation' : 'published', origin_flag: 'from_recipe' }
+    })
+  }
   // Normalize to a strict boolean rather than trusting the model's JSON literally —
   // anything short of an explicit true is treated as false, so a malformed or omitted
   // field never accidentally shows a CTA the canon can't back up.
   if (data) data.more_published_exist = data.more_published_exist === true
+  // Session 10, Change 1: the buffer is a plain candidate list, not a suggestion —
+  // capped defensively at 10 (the prompt already asks for this, but a data-shape
+  // safety net costs nothing) and deduped against what's actually displayed, in
+  // case the model buffers a name it also wrote up. A candidate with no name is
+  // useless (nothing to drain it into later) and dropped.
+  if (data) {
+    const displayedNames = new Set((data.suggestions || []).map(s => (s?.recipe_name || '').trim().toLowerCase()))
+    const seenBufferNames = new Set()
+    data.buffer = (Array.isArray(data.buffer) ? data.buffer : [])
+      .filter(b => b?.name && typeof b.name === 'string')
+      .map(b => ({
+        name: b.name.trim(),
+        source_url: typeof b.source_url === 'string' ? b.source_url : null,
+        tier: ['canon', 'variation', 'low'].includes(b?.tier) ? b.tier : null,
+      }))
+      .filter(b => {
+        const key = b.name.toLowerCase()
+        if (displayedNames.has(key) || seenBufferNames.has(key)) return false
+        seenBufferNames.add(key)
+        return true
+      })
+      .sort((a, b) => (TIER_RANK[a.tier] ?? 1) - (TIER_RANK[b.tier] ?? 1))
+      .slice(0, 10)
+  }
   return data
 }
 
@@ -1405,7 +1468,12 @@ cross_template_suggestion is always null from this call — leave it exactly as 
 // ingredients), while a riff/original is the model's own prior invention —
 // no search, just elaboration consistent with what it already decided.
 async function analyzeSuggestionDetail(suggestion, primaryIngredients, template, modifiers, inventoryText, diagLabel = null) {
-  const isPublished = suggestion.origin === 'published'
+  // Session 10: a published_variation is still a real, sourced recipe with a
+  // fixed ingredient list and genuine documented technique to verify — it
+  // behaves exactly like "published" here, never like a riff/original (which
+  // has no independent technique to look up, only the model's own prior
+  // reasoning to restate).
+  const isPublished = suggestion.origin === 'published' || suggestion.origin === 'published_variation'
   const ingredientList = (suggestion.recipe || []).map(r => `- ${r.amount} ${r.ingredient}`).join('\n')
   const body = {
     model: MODEL,
@@ -1554,6 +1622,104 @@ This is a first-pass listing, not the full analysis — the user opens it to see
   if (data?.suggestion) data.suggestion.origin_flag = 'from_recipe'
   data.more_published_exist = data?.more_published_exist === true
   return data
+}
+
+// Session 10, Change 2: writes up skeletons for candidates already found and
+// buffered by an earlier analyzeExplorationsRecipes call (its BUFFER section)
+// — no discovery search, since the name, source, and tier are already known.
+// analyzeNamedDrinkSkeleton (Session 8) is the nearest precedent — it already
+// writes a skeleton for one known drink by name — but declares web_search as
+// mandatory since a redirect has no prior context to recall from. Here the
+// tool is present but the prompt asks the model to prefer recall and reach
+// for at most one targeted verification search per uncertain candidate;
+// bc_diag on the caller reports what it actually does, since this is the
+// thing the whole change is betting on.
+async function analyzeBufferedDrinkSkeletons(candidates, ingredients, template, modifiers, inventoryText, diagLabel = null) {
+  const t = TEMPLATE_MAP[template]
+  const candidateList = candidates.map((c, i) => `${i + 1}. "${c.name}"${c.source_url ? ` — ${c.source_url}` : ''}`).join('\n')
+  const body = {
+    model: MODEL,
+    max_tokens: 1800,
+    tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+    messages: [{
+      role: 'user',
+      content: `You are an expert craft bartender. While researching cocktails featuring ${ingredients.join(' and ')} in the ${t?.name || template} family, you already identified these specific drinks as genuine, real published recipes but did not yet write them up:
+${candidateList}
+
+Write up each one now as a first-pass suggestion. You already know these are real — this is recall and elaboration, not discovery. For each, use your own knowledge of the drink (and the source noted alongside it, where given) to produce its published ingredient list. Do NOT search by default. Only if you are genuinely not confident of a specific candidate's exact ingredient list should you run ONE targeted web search for that candidate to verify it — do not search for anything not already named above, and do not treat this as a new discovery pass.
+
+If, on reflection, a candidate turns out not to be real or not to genuinely contain every featured ingredient, drop it rather than forcing it — return fewer suggestions than candidates given rather than inventing one to fill a slot.
+
+${buildTemplateContext(template, modifiers)}
+
+BAR INVENTORY:
+${inventoryText}
+
+SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated. Simple syrup — 2–4 weeks room temp. Amaro — 6–12 months. Commercial liqueurs — 6+ months.
+
+CRITICAL: Every featured ingredient (${ingredients.join(', ')}) must appear as an actual ingredient in the recipe's ingredient list.
+
+${SEED_INGREDIENT_EXEMPT}
+
+Check every non-garnish, non-pantry-staple ingredient against the bar inventory above (note the generic type and aliases listed alongside each bottle — a bottle's generic type or an alias matching an ingredient the recipe calls for means the user owns it).
+
+${OWNERSHIP_STATUS_RULES}
+
+${CAN_MAKE_NOW_RULE}
+
+${CAN_MAKE_NOW_SILENT}
+
+${ATTRIBUTION_FIELDS_INSTRUCTION}
+
+This is a first-pass listing, not the full analysis — the user picks one to open before seeing build detail. For each suggestion, "matched_candidate" must be the EXACT name as given in the numbered list above, so the app can match it back to its known tier and source. Return ONLY valid JSON with no markdown fences:
+{
+  "suggestions": [
+    {
+      "matched_candidate": "string — exact name from the numbered list above",
+      "recipe_name": "string",
+      "origin": "published",
+      "can_make_now": true,
+      "summary": "one line — flavor and character only. Never creator, bar, year, or source here — those go in the dedicated fields below, not summary.",
+      "creator": "string or null",
+      "bar": "string or null",
+      "year": "string or null",
+      "attribution_source": "string or null",
+      "recipe": [{ "ingredient": "string", "amount": "string" }]
+    }
+  ]
+}`,
+    }],
+  }
+  const text = diagLabel ? (await callClaudeStreamDiag(body, diagLabel)).text : await callClaudeText(body)
+  const data = stripCiteTags(extractJSON(text))
+  const byNormName = {}
+  candidates.forEach(c => { byNormName[c.name.trim().toLowerCase()] = c })
+  // Matched by name back to the candidate that named it, rather than trusted
+  // positionally — the model may drop a candidate it couldn't confirm, so
+  // response order and count aren't guaranteed to mirror the request.
+  const suggestions = (data?.suggestions || [])
+    .map(s => {
+      const candidate = byNormName[(s?.matched_candidate || '').trim().toLowerCase()]
+      if (!candidate) {
+        console.warn('[buffer drain] suggestion did not match any given candidate, dropped:', s?.matched_candidate)
+        return null
+      }
+      return {
+        recipe_name: s.recipe_name,
+        tier: candidate.tier,
+        origin: candidate.tier === 'variation' ? 'published_variation' : 'published',
+        origin_flag: 'from_recipe',
+        can_make_now: s.can_make_now,
+        summary: s.summary,
+        creator: s.creator ?? null,
+        bar: s.bar ?? null,
+        year: s.year ?? null,
+        attribution_source: s.attribution_source ?? null,
+        recipe: s.recipe,
+      }
+    })
+    .filter(Boolean)
+  return { suggestions }
 }
 
 async function refineExplorations(ingredients, template, modifiers, inventoryText, previousNames, feedbackText) {
@@ -2312,18 +2478,23 @@ function VariationCard({ variation }) {
 
 const ORIGIN_BADGE_LABELS = {
   published: '📖 From a recipe',
+  published_variation: '📝 Published Variation',
   riff: '🔁 Riff',
   original: '✨ Original',
 }
 
 function OriginBadge({ origin, originFlag }) {
-  // Resolution order: real self-reported `origin` (3-way) first; then the legacy
-  // `origin_flag` (2-way, from suggestions generated before this field existed,
-  // or from Refine/Tweak which still only emit origin_flag) mapped losslessly
-  // where possible (from_recipe → published) and conservatively where not
-  // (anything else → original, since we can't recover whether an old
-  // "original"-flagged item was secretly a riff); no signal at all → no badge,
-  // matching prior behavior for Favorites/On Deck items with nothing set.
+  // Resolution order: real self-reported `origin` (now 4-way, Session 10 added
+  // published_variation) first; then the legacy `origin_flag` (2-way, from
+  // suggestions generated before this field existed, or from Refine/Tweak
+  // which still only emit origin_flag) mapped losslessly where possible
+  // (from_recipe → published) and conservatively where not (anything else →
+  // original, since we can't recover whether an old "original"-flagged item
+  // was secretly a riff); no signal at all → no badge, matching prior
+  // behavior for Favorites/On Deck items with nothing set. A legacy item can
+  // only ever resolve to published/riff/original — published_variation is
+  // exclusively a first-class `origin` value, never derived from origin_flag,
+  // so old saved recipes render exactly as they did before this session.
   const resolved = origin || (originFlag ? (originFlag === 'from_recipe' ? 'published' : 'original') : null)
   if (!resolved) return null
   return (
@@ -3793,11 +3964,26 @@ const SEE_MORE_PUBLISHED_MSGS = [
   'Checking named, attributable cocktails first…',
   'Almost there…',
 ]
+// Session 10, Change 2: the CTA keeps one label regardless of which path runs
+// underneath — switching text between "Load more" / "Find more" would be a
+// mechanism the user has no reason to model, and would read as a downgrade
+// when the fast path is used. The rotating message is where the two paths
+// actually differ: draining the buffer is recall/write-up, not a new search.
+const SEE_MORE_PUBLISHED_FROM_BUFFER_MSGS = [
+  'Writing up recipes already found…',
+  'Almost there…',
+]
 const SEE_MORE_IDEAS_MSGS = [
   'Crafting more original ideas…',
   'Matching against your inventory…',
   'Almost there…',
 ]
+// Session 10, Change 2: how many buffered candidates one "See More Published"
+// tap writes up at a time. A fixed batch rather than draining everything in
+// one shot, so a well-populated buffer empties over a few taps rather than
+// one — matching the cadence a real search-based round used to have, and
+// giving Test 3 (tap until empty) something to actually observe.
+const PUBLISHED_BUFFER_DRAIN_BATCH = 3
 
 function TemplateInfoSheet({ template, onClose }) {
   const t = TEMPLATE_MAP[template]
@@ -3843,6 +4029,18 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const [morePublishedExist, setMorePublishedExist] = useState(false)
   const [seeMorePublishedLoading, setSeeMorePublishedLoading] = useState(false)
   const [seeMorePublishedError, setSeeMorePublishedError] = useState(null)
+  // Session 10, Change 1/2: candidate drinks tier-1 (or a later real search)
+  // found and judged genuine but did not write up — {name, source_url, tier}.
+  // Component state only, by design: it does not persist to the DB or the
+  // whiteboard, so a refresh loses it — the fallback is a fresh search, which
+  // is exactly today's (pre-Session-10) behavior, so nothing regresses.
+  const [publishedBuffer, setPublishedBuffer] = useState([])
+  // Which message set the current See More Published run is showing —
+  // decided once, when the tap starts, from whether the buffer had entries
+  // at that moment. Kept separate from publishedBuffer itself since the
+  // buffer empties DURING the drain (state updates as results land), and the
+  // messages for an in-flight run shouldn't flip mid-flight because of that.
+  const [seeMorePublishedFromBuffer, setSeeMorePublishedFromBuffer] = useState(false)
   // TEMP DIAGNOSTIC — removable with the rest of the DIAG_ON instrumentation.
   // Starts at 2: the initial Build (handleExplore) is conceptually "tap 1",
   // so the first handleSeeMorePublished call is the 2nd tap.
@@ -4040,9 +4238,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   useEffect(() => {
     if (!seeMorePublishedLoading) return
     setSeeMorePublishedMsgIdx(0)
-    const id = setInterval(() => setSeeMorePublishedMsgIdx(prev => (prev + 1) % SEE_MORE_PUBLISHED_MSGS.length), 8000)
+    const msgs = seeMorePublishedFromBuffer ? SEE_MORE_PUBLISHED_FROM_BUFFER_MSGS : SEE_MORE_PUBLISHED_MSGS
+    const id = setInterval(() => setSeeMorePublishedMsgIdx(prev => (prev + 1) % msgs.length), 8000)
     return () => clearInterval(id)
-  }, [seeMorePublishedLoading])
+  }, [seeMorePublishedLoading, seeMorePublishedFromBuffer])
 
   useEffect(() => {
     if (!seeMoreLoading) return
@@ -4152,6 +4351,11 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     setViaSurpriseMe(!!opts.viaSurpriseMe)
     setRestoreNodeData({})
     setAutoExpandNodeData(null)
+    // Session 10, Change 1: a fresh exploration starts with an empty buffer
+    // regardless of whatever the previous one left behind — the buffer is
+    // scoped to one exploration's search, not carried across a Start Over or
+    // a new Build with different ingredients.
+    setPublishedBuffer([])
     try {
       const modifiers = { frozen, lowABV, na }
       let data
@@ -4162,12 +4366,17 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           more_published_exist: named?.more_published_exist === true,
           flavor_profile_note: null, pairs_well_with: null, cross_template_suggestion: null,
           suggestions: named?.suggestion ? [named.suggestion] : [],
+          // A redirect is one targeted lookup for a drink already named by the
+          // cross-template CTA, not a discovery search — there's nothing to buffer.
+          buffer: [],
         }
       } else {
         data = stripCiteTags(await analyzeExplorationsRecipes(selected, activeTemplate, modifiers, inventoryText, [], DIAG_ON ? 'tier1-build' : null))
       }
       setResult(data)
       setMorePublishedExist(data?.more_published_exist === true)
+      setPublishedBuffer(data?.buffer || [])
+      if (DIAG_ON) console.log('[DIAG:tier1-build] tiers+buffer', JSON.stringify({ displayed: (data?.suggestions || []).map(s => ({ name: s.recipe_name, tier: s.tier, origin: s.origin })), buffer: data?.buffer || [] }))
       setStep('results')
       let wbId = null
       let recipeListNodeId = null
@@ -4315,28 +4524,63 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   }
 
   // On-demand tier-1 (published) re-search, triggered by the "See More Published
-  // Recipes →" CTA (only rendered when more_published_exist is true). Passes the
-  // already-surfaced published names so the model finds genuinely different recipes
-  // instead of re-finding the same ones. Mirrors handleSeeMore's merge-and-persist
-  // pattern, but appends into the sorted list and re-derives more_published_exist from
-  // this call's own response, so the CTA can persist across several rounds and
-  // disappear once the canon is exhausted.
+  // Recipes →" CTA. Session 10, Change 2: now checks the buffer first — if it has
+  // entries, this writes up a batch of them (recall/generation, no search) instead
+  // of running a fresh search. Only once the buffer is empty does it fall back to
+  // the pre-Session-10 behavior below: a real search with the exclusion list,
+  // which is also where more_published_exist and the buffer itself get refreshed
+  // from the model's own judgment again.
   const handleSeeMorePublished = async () => {
     if (seeMorePublishedLoading) return
     const baseSuggestions = result?.suggestions ?? []
+    const drainBatch = publishedBuffer.slice(0, PUBLISHED_BUFFER_DRAIN_BATCH)
+    const usingBuffer = drainBatch.length > 0
+    setSeeMorePublishedFromBuffer(usingBuffer)
     setSeeMorePublishedLoading(true)
     setSeeMorePublishedError(null)
     try {
       const modifiers = { frozen, lowABV, na }
-      const excludeNames = baseSuggestions.filter(s => s.origin === 'published').map(s => s.recipe_name)
       const tapN = diagSeeMorePublishedTapRef.current
       diagSeeMorePublishedTapRef.current += 1
-      if (DIAG_ON) {
-        const joined = excludeNames.join(', ')
-        console.log(`[DIAG:tier1-see-more-published-tap${tapN}] exclusion list ${JSON.stringify({ count: excludeNames.length, chars: joined.length, approxWords: joined.split(/\s+/).filter(Boolean).length })}`)
+      let newSuggestions
+      let freshData = {}
+      if (usingBuffer) {
+        if (DIAG_ON) {
+          console.log(`[DIAG:tier1-see-more-published-tap${tapN}] draining buffer ${JSON.stringify({ batchSize: drainBatch.length, remainingBefore: publishedBuffer.length, names: drainBatch.map(c => c.name) })}`)
+        }
+        const drained = await analyzeBufferedDrinkSkeletons(drainBatch, selected, template, modifiers, inventoryText, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null)
+        newSuggestions = drained?.suggestions || []
+        // Remove exactly the attempted batch, whether or not each one produced a
+        // suggestion — a candidate the model couldn't confidently write up this
+        // time isn't worth holding onto for a retry that asks the same question
+        // again. more_published_exist is deliberately left untouched: draining
+        // the buffer produces no new information about what's beyond it. The
+        // CTA's visibility (see render) ORs this flag with the buffer itself, so
+        // it stays correctly visible as long as either one still says yes.
+        const drainedNames = new Set(drainBatch.map(c => c.name.trim().toLowerCase()))
+        setPublishedBuffer(prev => prev.filter(c => !drainedNames.has(c.name.trim().toLowerCase())))
+        if (DIAG_ON) console.log(`[DIAG:tier1-see-more-published-tap${tapN}] drained result`, JSON.stringify({ requested: drainBatch, got: newSuggestions.map(s => ({ name: s.recipe_name, tier: s.tier })) }))
+      } else {
+        const excludeNames = baseSuggestions.filter(s => s.origin === 'published' || s.origin === 'published_variation').map(s => s.recipe_name)
+        if (DIAG_ON) {
+          const joined = excludeNames.join(', ')
+          console.log(`[DIAG:tier1-see-more-published-tap${tapN}] exclusion list ${JSON.stringify({ count: excludeNames.length, chars: joined.length, approxWords: joined.split(/\s+/).filter(Boolean).length })}`)
+        }
+        freshData = stripCiteTags(await analyzeExplorationsRecipes(selected, template, modifiers, inventoryText, excludeNames, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null))
+        newSuggestions = freshData?.suggestions || []
+        setMorePublishedExist(freshData?.more_published_exist === true)
+        // A real search can turn up its own new candidates to buffer — append
+        // them (deduped against everything now displayed, including what this
+        // same response just added, and against whatever the buffer already
+        // held) rather than discarding a genuine find just because it wasn't
+        // written up this round.
+        const allDisplayedNames = new Set([...baseSuggestions, ...newSuggestions].map(s => (s.recipe_name || '').trim().toLowerCase()))
+        const existingBufferNames = new Set(publishedBuffer.map(c => c.name.trim().toLowerCase()))
+        const bufferAdditions = (freshData?.buffer || []).filter(c => !existingBufferNames.has(c.name.trim().toLowerCase()) && !allDisplayedNames.has(c.name.trim().toLowerCase()))
+        const nextBuffer = [...publishedBuffer, ...bufferAdditions].sort((a, b) => (TIER_RANK[a.tier] ?? 1) - (TIER_RANK[b.tier] ?? 1)).slice(0, 10)
+        if (DIAG_ON) console.log(`[DIAG:tier1-see-more-published-tap${tapN}] fresh-search buffer merge`, JSON.stringify({ additions: bufferAdditions, newBufferSize: nextBuffer.length }))
+        setPublishedBuffer(nextBuffer)
       }
-      const freshData = stripCiteTags(await analyzeExplorationsRecipes(selected, template, modifiers, inventoryText, excludeNames, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null))
-      const newSuggestions = freshData?.suggestions || []
       const mergedSuggestions = sortByOriginRank([...baseSuggestions, ...newSuggestions])
 
       setResult(prev => ({
@@ -4347,7 +4591,6 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         pairs_well_with: prev?.pairs_well_with || freshData.pairs_well_with || null,
         cross_template_suggestion: prev?.cross_template_suggestion || freshData.cross_template_suggestion || null,
       }))
-      setMorePublishedExist(freshData?.more_published_exist === true)
 
       if (user && currentWhiteboardId && currentRecipeListNodeId && newSuggestions.length > 0) {
         try {
@@ -4382,7 +4625,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     }
   }
 
-  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -5103,15 +5346,20 @@ Rules:
             No published recipes matched — a riff or an original might still work well.
           </div>
         )}
-        {/* Tier-1 re-search — only rendered when the model has told us, this batch, that
-            genuine published matches remain beyond what it returned. Persists across
-            several taps and disappears once more_published_exist goes false. */}
-        {morePublishedExist && (
+        {/* Tier-1 re-search — rendered when the model has told us, this batch, that
+            genuine published matches remain beyond what it returned AND buffered, OR
+            (Session 10, Change 2) when the buffer itself still has undrained candidates —
+            that half of the condition is factual, not a model claim, since the buffer's
+            contents are already known. Persists across several taps and disappears once
+            both the buffer is empty and more_published_exist has gone false. */}
+        {(morePublishedExist || publishedBuffer.length > 0) && (
           <div style={{ marginBottom: 12 }}>
             <button onClick={() => handleSeeMorePublished()} disabled={seeMorePublishedLoading}
               style={{ width: '100%', background: 'none', border: `1px dashed ${C.border}`, borderRadius: 10, color: C.gold, fontSize: 13, fontWeight: 600, padding: '12px 16px', cursor: seeMorePublishedLoading ? 'default' : 'pointer', opacity: seeMorePublishedLoading ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
               {seeMorePublishedLoading && <span style={{ display: 'inline-block', width: 12, height: 12, border: '2px solid currentColor', borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite', flexShrink: 0 }} />}
-              {seeMorePublishedLoading ? SEE_MORE_PUBLISHED_MSGS[seeMorePublishedMsgIdx] : 'See more published recipes →'}
+              {seeMorePublishedLoading
+                ? (seeMorePublishedFromBuffer ? SEE_MORE_PUBLISHED_FROM_BUFFER_MSGS : SEE_MORE_PUBLISHED_MSGS)[seeMorePublishedMsgIdx]
+                : 'See more published recipes →'}
             </button>
             {seeMorePublishedError && <div style={{ fontSize: 13, color: C.red, marginTop: 8 }}>{seeMorePublishedError}</div>}
           </div>
