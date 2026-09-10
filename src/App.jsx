@@ -1104,9 +1104,9 @@ TIERS — sort every result you find into exactly one, and set each suggestion's
 - LOW: a real published recipe with no distinguishing history at all — generic, ingredient-titled blog or SEO content ("Cucumber Gin Sour"). Still genuine and still usable, just without canon standing.
 The signal is the DRINK's provenance, not the site's reputation — a single reputable source (Difford's Guide, for instance) publishes real canon and its own labeled variations side by side, and tier follows which one a given result actually is. Do not default every result to the same tier, and do not inflate a variation into canon just because the source is a good one.
 
-DISPLAY: return up to 4 canon suggestions — a ceiling, not a quota; return fewer when fewer genuinely exist. Alongside them, return 1-2 low-tier suggestions as a baseline — real recipes, not padding to hit a number. If canon is thin (0-1 found), low-tier suggestions may carry more of the result set instead, since there is nothing else to show. The count you return should read as an honest reflection of what is actually out there, not a filled quota — two results should mean the canon is genuinely thin, not that the batch was capped.
+DISPLAY: return every canon-worthy result you found (canon or variation), up to 5 total — a ceiling, not a quota; return fewer when fewer genuinely exist. Do not hold a genuine match back to save it for later — this first pass is its only guaranteed chance to reach the user, so write up everything canon-worthy you found rather than reserving material. Only when canon and variation are thin should low-tier results fill the remaining slots, so the count reads as an honest reflection of what is actually out there — two results should mean the field is genuinely thin, not that the batch was capped.
 
-BUFFER: separately from what you display, report up to 10 further candidate drinks you found and judged genuine but did not write up, as a plain list of {name, source_url, tier}. No summary, no ingredients, no attribution beyond the URL — this is a name and a pointer, not a suggestion, so it costs you nothing extra to include. A candidate glimpsed once in a snippet without confidence it satisfies every featured ingredient does not belong here — the buffer is held to the same quality bar as what you displayed, just not yet written up. Order the buffer canon first.
+CANDIDATES: separately from what you display, name up to 10 further drinks you noticed in the search results above but did not write up, as a plain list of {name, tier}. Do NOT run any additional searches for these and do not try to confirm them — only name drinks that already appeared, even in passing, in results you've already read; a later step verifies and elaborates on them before the user ever sees them, so a rough tier guess here costs you nothing beyond noticing what's in front of you. Order the list canon first.
 
 PREFERRED SOURCES: when multiple sources would serve equally well for the same drink, prefer citing Difford's Guide, Kindred Cocktails, Imbibe, Punch, Wikipedia, or the featured ingredient's own producer site — these have been the most reliable in practice. This is a preference, not a filter: a canonical drink documented only elsewhere must still surface.
 ${excludeNames.length > 0 ? `\nALREADY SURFACED — the user has already seen these recipes, do not return them again (as a suggestion OR in the buffer), find genuinely different published recipes: ${excludeNames.join(', ')}.\n` : ''}
@@ -1164,7 +1164,7 @@ Return ONLY valid JSON with no markdown fences:
     }
   ],
   "buffer": [
-    { "name": "string", "source_url": "string or null", "tier": "canon | variation | low" }
+    { "name": "string", "tier": "canon | variation | low" }
   ]
 }
 cross_template_suggestion must be null (not omitted) when there is no genuine match. more_published_exist must be present (not omitted) on every response. Set "origin" to "published" for every suggestion here regardless of tier — the app derives the user-facing published/published_variation split from "tier" itself, so origin only needs to say "this came from a real published source," which is true of canon, variation, and low alike. buffer must be present (an empty array, not omitted) even when there is nothing left to buffer.`,
@@ -1215,11 +1215,15 @@ cross_template_suggestion must be null (not omitted) when there is no genuine ma
   // anything short of an explicit true is treated as false, so a malformed or omitted
   // field never accidentally shows a CTA the canon can't back up.
   if (data) data.more_published_exist = data.more_published_exist === true
-  // Session 10, Change 1: the buffer is a plain candidate list, not a suggestion —
-  // capped defensively at 10 (the prompt already asks for this, but a data-shape
-  // safety net costs nothing) and deduped against what's actually displayed, in
-  // case the model buffers a name it also wrote up. A candidate with no name is
-  // useless (nothing to drain it into later) and dropped.
+  // Session 11, Change 1: this is now a RAW candidate list — names and tier
+  // guesses noticed in the search results above, never searched or verified
+  // by this call (that's what caused the Session 10 regression). It is not
+  // display-quality and is never set directly as the app's published buffer;
+  // the caller feeds it to analyzeVerifyBufferCandidates as a background call
+  // after results render, and THAT call's output becomes the real buffer.
+  // Still capped defensively at 10 and deduped against what's displayed, in
+  // case the model names a drink it also wrote up. A candidate with no name is
+  // useless (nothing to verify it against) and dropped.
   if (data) {
     const displayedNames = new Set((data.suggestions || []).map(s => (s?.recipe_name || '').trim().toLowerCase()))
     const seenBufferNames = new Set()
@@ -1227,7 +1231,6 @@ cross_template_suggestion must be null (not omitted) when there is no genuine ma
       .filter(b => b?.name && typeof b.name === 'string')
       .map(b => ({
         name: b.name.trim(),
-        source_url: typeof b.source_url === 'string' ? b.source_url : null,
         tier: ['canon', 'variation', 'low'].includes(b?.tier) ? b.tier : null,
       }))
       .filter(b => {
@@ -1720,6 +1723,56 @@ This is a first-pass listing, not the full analysis — the user picks one to op
     })
     .filter(Boolean)
   return { suggestions }
+}
+
+// Session 11, Change 1: verifies the raw candidate names/tier-guesses Build
+// named cheaply (no search — see the CANDIDATES instruction in
+// analyzeExplorationsRecipes) into confirmed buffer entries with a real
+// source_url and a checked tier. The caller fires this as a background call
+// AFTER Build's results have already rendered and never awaits it inline —
+// the verification searches that used to run during Build (Session 10's
+// regression: 39-50s instead of 32.5s) happen here instead, off the critical
+// path, while the user is reading the results already on screen. A failure
+// here must never surface to the user — the caller treats it exactly like an
+// empty buffer, which is where a fresh exploration already starts today.
+async function analyzeVerifyBufferCandidates(candidates, ingredients, template, modifiers, inventoryText, diagLabel = null) {
+  const t = TEMPLATE_MAP[template]
+  const candidateList = candidates.map((c, i) => `${i + 1}. "${c.name}"${c.tier ? ` (guessed tier: ${c.tier})` : ''}`).join('\n')
+  const body = {
+    model: MODEL,
+    max_tokens: 1200,
+    tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+    messages: [{
+      role: 'user',
+      content: `You are an expert craft bartender. While researching cocktails featuring ${ingredients.join(' and ')} in the ${t?.name || template} family, you noticed these drinks in your search results but did not confirm or write them up:
+${candidateList}
+
+For each one, verify it's a real, genuine published recipe that contains every featured ingredient (${ingredients.join(', ')}), and find its source. Use web search as needed — these are real leads from your own earlier search results, not open discovery, so one targeted verification search per candidate is appropriate. Drop any candidate that turns out not to be real, does not genuinely contain every featured ingredient, or that you cannot find a source for — return fewer than given rather than forcing one.
+
+Confirm or correct the guessed tier for each candidate you keep:
+- CANON: a named drink with independent, documented history — a real creator, a bar, or an era distinct from whatever site happens to publish it today.
+- VARIATION: a real, properly sourced recipe that is explicitly a specific source's own take on something else, not independently famous in its own right.
+- LOW: a real published recipe with no distinguishing history — generic, ingredient-titled content.
+
+Return ONLY valid JSON with no markdown fences:
+{
+  "candidates": [
+    { "name": "string — exact name from the numbered list above", "source_url": "string", "tier": "canon | variation | low" }
+  ]
+}`,
+    }],
+  }
+  const text = diagLabel ? (await callClaudeStreamDiag(body, diagLabel)).text : await callClaudeText(body)
+  const data = stripCiteTags(extractJSON(text))
+  return (Array.isArray(data?.candidates) ? data.candidates : [])
+    .filter(c => c?.name && typeof c.name === 'string')
+    .map(c => ({
+      name: c.name.trim(),
+      source_url: typeof c.source_url === 'string' ? c.source_url : null,
+      tier: ['canon', 'variation', 'low'].includes(c?.tier) ? c.tier : null,
+    }))
+    .sort((a, b) => (TIER_RANK[a.tier] ?? 1) - (TIER_RANK[b.tier] ?? 1))
+    .slice(0, 10)
 }
 
 async function refineExplorations(ingredients, template, modifiers, inventoryText, previousNames, feedbackText) {
@@ -3533,6 +3586,7 @@ function RecipeCard({
   template = null,
   modifiers = null,
   onDetailFetched = null,
+  isNew = false,
 }) {
   const [expanded, setExpanded] = useState(!!autoExpand)
   const [savedTo, setSavedTo] = useState(null)
@@ -3780,6 +3834,12 @@ function RecipeCard({
         </div>
         {showSaveButtons && (
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 4 }}>
+            {/* Session 11, Change 2: marks a card added by the most recent See
+                More tap, so results that arrived fast are still findable —
+                paired with the scroll-to-first-new anchor in ExplorationsScreen. */}
+            {isNew && (
+              <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', color: C.gold, background: C.gold + '18', border: `1px solid ${C.gold}44`, borderRadius: 4, padding: '2px 6px' }}>New</span>
+            )}
             <OriginBadge origin={displayed.origin} originFlag={displayed.origin_flag} />
             <DifficultyBadge difficulty={displayed.difficulty} />
           </div>
@@ -3959,8 +4019,12 @@ const EXPLORE_LOADING_MSGS = [
 // treatment as EXPLORE_LOADING_MSGS above, scaled to an inline row instead
 // of a full-screen takeover since the existing results stay visible and
 // usable underneath while these run.
+// Session 11, Change 3: this path is the search fallback (30-74s) — the
+// messaging says so up front, rather than reading identically to the
+// buffered path's much shorter wait until the user has already waited long
+// enough to suspect something's wrong.
 const SEE_MORE_PUBLISHED_MSGS = [
-  'Searching for more published recipes…',
+  'Searching further afield — this can take a minute…',
   'Checking named, attributable cocktails first…',
   'Almost there…',
 ]
@@ -4034,6 +4098,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // Component state only, by design: it does not persist to the DB or the
   // whiteboard, so a refresh loses it — the fallback is a fresh search, which
   // is exactly today's (pre-Session-10) behavior, so nothing regresses.
+  // Session 11, Change 1: starts empty even right after Build now (Build only
+  // emits raw, unverified candidate names — see analyzeExplorationsRecipes'
+  // CANDIDATES instruction) and fills in once the background verification
+  // call (analyzeVerifyBufferCandidates) resolves.
   const [publishedBuffer, setPublishedBuffer] = useState([])
   // Which message set the current See More Published run is showing —
   // decided once, when the tap starts, from whether the buffer had entries
@@ -4041,6 +4109,26 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // buffer empties DURING the drain (state updates as results land), and the
   // messages for an in-flight run shouldn't flip mid-flight because of that.
   const [seeMorePublishedFromBuffer, setSeeMorePublishedFromBuffer] = useState(false)
+  // Session 11, Change 1: the background buffer-fill call in flight, if any —
+  // handleSeeMorePublished joins this rather than treating the buffer as
+  // empty when a tap lands mid-fill (a deliberate choice: the fill is a
+  // single verification call, not open discovery, so joining it is a brief
+  // wait that reuses work already underway instead of discarding it).
+  // bufferFillGenerationRef guards against a fill's result landing after the
+  // user has navigated away or started a new exploration — bumped any time
+  // that happens, and the fill's own .then checks it before ever touching
+  // state, which is what "cancel silently" actually means here: nothing is
+  // aborted over the wire, the result is just discarded on arrival.
+  const bufferFillPromiseRef = useRef(null)
+  const bufferFillGenerationRef = useRef(0)
+  // Session 11, Change 2: recipe_names from the most recently landed See More
+  // batch (Published or Ideas) — drives the "New" badge and the scroll-to-
+  // first-new-result anchor. Cleared at the start of the NEXT See More tap
+  // (the next interaction that would produce a new batch to distinguish), and
+  // on a fresh exploration/reset — not on unrelated interactions like opening
+  // a card, so the marker stays useful while the user works through a batch.
+  const [newBatchNames, setNewBatchNames] = useState(() => new Set())
+  const firstNewCardRef = useRef(null)
   // TEMP DIAGNOSTIC — removable with the rest of the DIAG_ON instrumentation.
   // Starts at 2: the initial Build (handleExplore) is conceptually "tap 1",
   // so the first handleSeeMorePublished call is the 2nd tap.
@@ -4175,6 +4263,13 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     }
   }, [])
 
+  // Session 11, Change 1: leaving this screen entirely (not just changing
+  // step within it — this component stays mounted across those) invalidates
+  // any in-flight background buffer fill, the same silent-cancel mechanism
+  // handleExplore/reset use. No warning, no confirmation: losing the fill
+  // costs only a slower See More next time.
+  useEffect(() => () => { bufferFillGenerationRef.current += 1 }, [])
+
   useEffect(() => {
     const load = async () => {
       if (user) {
@@ -4204,7 +4299,18 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     setNa(pendingRestore.na || false)
     setLowABV(pendingRestore.low_abv || false)
     setResult(pendingRestore.result || null)
-    setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(true); setMoreIdeasExist(false); setMorePublishedExist(false)
+    // Session 11, Change 4: this used to force morePublishedExist to false,
+    // which meant a restored exploration could never reach the See More
+    // Published CTA again — the buffer isn't persisted either, so there was
+    // no path back to more published recipes at all. Neither the buffer nor
+    // this flag survives a restore (nothing here comes from the DB), so the
+    // honest default is the same one the rest of this app uses when it
+    // genuinely doesn't know: lean toward true. A tap with an empty buffer
+    // falls through to a real search, same as any other empty-buffer tap.
+    setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(true); setMoreIdeasExist(false); setMorePublishedExist(true)
+    setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set())
+    bufferFillGenerationRef.current += 1
+    bufferFillPromiseRef.current = null
     setCurrentWhiteboardId(pendingRestore.whiteboardId || null)
     setCurrentIngredientsNodeId(pendingRestore.ingredientsNodeId || null)
     setCurrentRecipeListNodeId(pendingRestore.restoreRecipeListNodeId || null)
@@ -4249,6 +4355,16 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     const id = setInterval(() => setSeeMoreIdeasMsgIdx(prev => (prev + 1) % SEE_MORE_IDEAS_MSGS.length), 8000)
     return () => clearInterval(id)
   }, [seeMoreLoading])
+
+  // Session 11, Change 2: anchors the view on the first new result the moment
+  // a batch lands (Published or Ideas) — the highest-value fix in this
+  // session. A short delay lets the new cards actually paint before measuring
+  // where to scroll; mirrors the existing autoExpand scroll pattern on RecipeCard.
+  useEffect(() => {
+    if (newBatchNames.size === 0) return
+    const id = setTimeout(() => firstNewCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+    return () => clearTimeout(id)
+  }, [newBatchNames])
 
   const upsertHistory = (ingredients, searchTemplate, searchFrozen, searchLowABV, searchNa, searchResult) => {
     const entry = {
@@ -4321,6 +4437,25 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     if (typeof top === 'object') {
       if (top.type === 'whiteboard') onOpenWhiteboard?.(top.id)
       else if (top.type === 'inProgress') onBackToInProgress?.()
+      // Session 11, Change 4: a cross-template redirect (handleCrossTemplateSuggestion)
+      // overwrites template/result/etc. with the new template's results — the
+      // whiteboard sibling node means the original results still exist in the
+      // DB, but nothing restored the live state, so Back landed on 'results'
+      // with the WRONG results still showing. This snapshot, pushed by
+      // handleExplore instead of a bare step string when opts.redirectSnapshot
+      // is given, restores exactly the pieces a redirect overwrites.
+      else if (top.type === 'redirectSource') {
+        setTemplate(top.template)
+        setResult(top.result)
+        setCurrentRecipeListNodeId(top.recipeListNodeId)
+        setPublishedBuffer(top.publishedBuffer)
+        setMorePublishedExist(top.morePublishedExist)
+        setCurrentRecipeNodeIds(top.recipeNodeIds)
+        setNewBatchNames(new Set())
+        bufferFillGenerationRef.current += 1
+        bufferFillPromiseRef.current = null
+        setStep('results')
+      }
     } else {
       setStep(top)
     }
@@ -4341,7 +4476,12 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     const activeTemplate = opts.template ?? template
     const activeContinueFromNodeId = opts.continueFromNodeId !== undefined ? opts.continueFromNodeId : continueFromNodeId
     const fromStep = opts.fromStep !== undefined ? opts.fromStep : stepRef.current
-    setNavStack(prev => [...prev, fromStep])
+    // Session 11, Change 4: a cross-template redirect pushes a full snapshot
+    // of the results being left behind (opts.redirectSnapshot, built by
+    // handleCrossTemplateSuggestion) instead of the bare step string goToStep
+    // normally pushes, so goBack can restore them exactly rather than landing
+    // on 'results' with this call's new data already clobbering them.
+    setNavStack(prev => [...prev, opts.redirectSnapshot ?? fromStep])
     setStep('loading')
     setOriginalsFetched(false)
     setSeeMoreError(null)
@@ -4356,6 +4496,13 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     // scoped to one exploration's search, not carried across a Start Over or
     // a new Build with different ingredients.
     setPublishedBuffer([])
+    setNewBatchNames(new Set())
+    // Session 11, Change 1: invalidate any background fill still in flight
+    // from the exploration this call is replacing — its result, if it lands
+    // after this, must be silently discarded rather than overwriting this
+    // exploration's (empty, freshly-started) buffer.
+    bufferFillGenerationRef.current += 1
+    bufferFillPromiseRef.current = null
     try {
       const modifiers = { frozen, lowABV, na }
       let data
@@ -4375,9 +4522,42 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       }
       setResult(data)
       setMorePublishedExist(data?.more_published_exist === true)
-      setPublishedBuffer(data?.buffer || [])
-      if (DIAG_ON) console.log('[DIAG:tier1-build] tiers+buffer', JSON.stringify({ displayed: (data?.suggestions || []).map(s => ({ name: s.recipe_name, tier: s.tier, origin: s.origin })), buffer: data?.buffer || [] }))
+      if (DIAG_ON) console.log('[DIAG:tier1-build] tiers+candidates', JSON.stringify({ displayed: (data?.suggestions || []).map(s => ({ name: s.recipe_name, tier: s.tier, origin: s.origin })), rawCandidates: data?.buffer || [] }))
       setStep('results')
+      // Session 11, Change 1: fill the buffer in the background, off the
+      // critical path — Build itself no longer searches to verify these, it
+      // only named them cheaply (data.buffer, raw candidates). This call does
+      // the actual verification search per candidate, but fired here, AFTER
+      // results have already rendered, and never awaited: the cost lands in
+      // the dead time while the user reads what's already on screen instead
+      // of adding to Build's response time (Session 10's regression).
+      const rawCandidates = data?.buffer || []
+      if (rawCandidates.length > 0) {
+        const myGeneration = bufferFillGenerationRef.current
+        const fillPromise = analyzeVerifyBufferCandidates(rawCandidates, selected, activeTemplate, modifiers, inventoryText, DIAG_ON ? 'tier1-buffer-fill' : null)
+          .then(verified => {
+            // Cancel silently on navigation: a stale generation means a newer
+            // exploration (or a redirect, or a restore) has since started —
+            // discard the result, no error, no state update. Losing the fill
+            // costs only a slower See More, never a warning or a crash.
+            if (bufferFillGenerationRef.current !== myGeneration) return []
+            setPublishedBuffer(verified)
+            if (DIAG_ON) console.log('[DIAG:tier1-buffer-fill] filled', JSON.stringify({ requested: rawCandidates.map(c => c.name), verified: verified.map(c => ({ name: c.name, tier: c.tier })) }))
+            return verified
+          })
+          .catch(err => {
+            // Fail invisibly (Change 1, requirement 2): the buffer simply
+            // stays empty, exactly where a fresh exploration already starts —
+            // See More Published falls back to its search path with nothing
+            // shown to the user about this having failed.
+            console.warn('[buffer fill] failed silently:', err.message)
+            return []
+          })
+          .finally(() => {
+            if (bufferFillPromiseRef.current === fillPromise) bufferFillPromiseRef.current = null
+          })
+        bufferFillPromiseRef.current = fillPromise
+      }
       let wbId = null
       let recipeListNodeId = null
       let ingredientsNodeId = null
@@ -4477,7 +4657,13 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         .map(s => `${s.recipe_name} (${(s.recipe || []).map(r => r.ingredient).join(', ')})`)
       const freshData = stripCiteTags(await analyzeExplorationsOriginals(selected, activeTemplate, modifiers, inventoryText, excludeNames, DIAG_ON ? 'tier2-3-see-more-ideas' : null))
       const newSuggestions = freshData?.suggestions || []
-      const mergedSuggestions = sortByOriginRank([...baseSuggestions, ...newSuggestions])
+      // Session 11, Change 2: existing cards must not reorder or shift — only
+      // sort the NEW batch among itself, then append it after what's already
+      // there, rather than re-sorting the whole merged list (which used to
+      // pull an existing card to a new position whenever a differently-ranked
+      // suggestion arrived).
+      const mergedSuggestions = [...baseSuggestions, ...sortByOriginRank(newSuggestions)]
+      setNewBatchNames(new Set(newSuggestions.map(s => s.recipe_name)))
 
       setResult(prev => ({
         ...(prev || {}),
@@ -4533,12 +4719,23 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const handleSeeMorePublished = async () => {
     if (seeMorePublishedLoading) return
     const baseSuggestions = result?.suggestions ?? []
-    const drainBatch = publishedBuffer.slice(0, PUBLISHED_BUFFER_DRAIN_BATCH)
-    const usingBuffer = drainBatch.length > 0
-    setSeeMorePublishedFromBuffer(usingBuffer)
     setSeeMorePublishedLoading(true)
     setSeeMorePublishedError(null)
     try {
+      // Session 11, Change 1, requirement 3: a tap landing while the
+      // background fill is still in flight joins it rather than treating the
+      // buffer as empty. This is a deliberate choice (the spec allows either
+      // joining or falling through) — the fill is a single verification call
+      // seeded with names Build already found, not open discovery, so this is
+      // a brief wait that reuses work already underway rather than discarding
+      // it for a full fresh search the buffer might have made unnecessary.
+      let currentBuffer = publishedBuffer
+      if (currentBuffer.length === 0 && bufferFillPromiseRef.current) {
+        currentBuffer = await bufferFillPromiseRef.current
+      }
+      const drainBatch = currentBuffer.slice(0, PUBLISHED_BUFFER_DRAIN_BATCH)
+      const usingBuffer = drainBatch.length > 0
+      setSeeMorePublishedFromBuffer(usingBuffer)
       const modifiers = { frozen, lowABV, na }
       const tapN = diagSeeMorePublishedTapRef.current
       diagSeeMorePublishedTapRef.current += 1
@@ -4546,7 +4743,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       let freshData = {}
       if (usingBuffer) {
         if (DIAG_ON) {
-          console.log(`[DIAG:tier1-see-more-published-tap${tapN}] draining buffer ${JSON.stringify({ batchSize: drainBatch.length, remainingBefore: publishedBuffer.length, names: drainBatch.map(c => c.name) })}`)
+          console.log(`[DIAG:tier1-see-more-published-tap${tapN}] draining buffer ${JSON.stringify({ batchSize: drainBatch.length, remainingBefore: currentBuffer.length, names: drainBatch.map(c => c.name) })}`)
         }
         const drained = await analyzeBufferedDrinkSkeletons(drainBatch, selected, template, modifiers, inventoryText, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null)
         newSuggestions = drained?.suggestions || []
@@ -4569,19 +4766,26 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         freshData = stripCiteTags(await analyzeExplorationsRecipes(selected, template, modifiers, inventoryText, excludeNames, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null))
         newSuggestions = freshData?.suggestions || []
         setMorePublishedExist(freshData?.more_published_exist === true)
-        // A real search can turn up its own new candidates to buffer — append
-        // them (deduped against everything now displayed, including what this
-        // same response just added, and against whatever the buffer already
-        // held) rather than discarding a genuine find just because it wasn't
-        // written up this round.
+        // A fresh search's own raw candidates (Change 1: names/tier-guesses,
+        // never searched by this call) get appended to the buffer as-is —
+        // deduped against everything now displayed and against what's already
+        // buffered. They stay unverified until the NEXT background fill or
+        // drain attempt reaches them; there's no separate background call
+        // fired from here, since this branch only runs once the buffer was
+        // already empty and there's no results-just-rendered moment to hide
+        // a verification cost inside.
         const allDisplayedNames = new Set([...baseSuggestions, ...newSuggestions].map(s => (s.recipe_name || '').trim().toLowerCase()))
-        const existingBufferNames = new Set(publishedBuffer.map(c => c.name.trim().toLowerCase()))
+        const existingBufferNames = new Set(currentBuffer.map(c => c.name.trim().toLowerCase()))
         const bufferAdditions = (freshData?.buffer || []).filter(c => !existingBufferNames.has(c.name.trim().toLowerCase()) && !allDisplayedNames.has(c.name.trim().toLowerCase()))
-        const nextBuffer = [...publishedBuffer, ...bufferAdditions].sort((a, b) => (TIER_RANK[a.tier] ?? 1) - (TIER_RANK[b.tier] ?? 1)).slice(0, 10)
+        const nextBuffer = [...currentBuffer, ...bufferAdditions].sort((a, b) => (TIER_RANK[a.tier] ?? 1) - (TIER_RANK[b.tier] ?? 1)).slice(0, 10)
         if (DIAG_ON) console.log(`[DIAG:tier1-see-more-published-tap${tapN}] fresh-search buffer merge`, JSON.stringify({ additions: bufferAdditions, newBufferSize: nextBuffer.length }))
         setPublishedBuffer(nextBuffer)
       }
-      const mergedSuggestions = sortByOriginRank([...baseSuggestions, ...newSuggestions])
+      // Session 11, Change 2: only sort the NEW batch among itself, then
+      // append after what's already there — see the matching comment in
+      // handleSeeMore.
+      const mergedSuggestions = [...baseSuggestions, ...sortByOriginRank(newSuggestions)]
+      setNewBatchNames(new Set(newSuggestions.map(s => s.recipe_name)))
 
       setResult(prev => ({
         ...(prev || {}),
@@ -4625,7 +4829,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     }
   }
 
-  const reset = () => { setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -4805,11 +5009,24 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // work normally from here); the change is that the named drink appears
   // immediately instead of after a full rebuild.
   const handleCrossTemplateSuggestion = async (suggestedTemplate, drinkName) => {
+    // Session 11, Change 4: capture exactly what this redirect is about to
+    // overwrite, so Back can restore it — handleExplore pushes this onto
+    // navStack instead of the bare 'results' string goToStep normally would,
+    // and goBack knows how to unpack it (see the redirectSource branch there).
+    const redirectSnapshot = {
+      type: 'redirectSource',
+      template,
+      result,
+      recipeListNodeId: currentRecipeListNodeId,
+      publishedBuffer,
+      morePublishedExist,
+      recipeNodeIds: currentRecipeNodeIds,
+    }
     setTemplate(suggestedTemplate)
     // Attach the new recipe_list as a sibling under the same ingredients node
     // (not nested under the current recipe_list) so the whiteboard shows two
     // parallel builds from the same seed ingredients rather than a chain.
-    await handleExplore({ template: suggestedTemplate, continueFromNodeId: currentIngredientsNodeId, redirectDrinkName: drinkName })
+    await handleExplore({ template: suggestedTemplate, continueFromNodeId: currentIngredientsNodeId, redirectDrinkName: drinkName, redirectSnapshot })
   }
 
   // Session 8: RecipeCard fetches its own detail on demand, then reports the
@@ -5305,11 +5522,17 @@ Rules:
           </div>
         )}
         <div style={{ opacity: isFeedbackLoading ? 0.4 : 1, transition: 'opacity 0.3s', pointerEvents: isFeedbackLoading ? 'none' : 'auto' }}>
+          {/* Session 11, Change 2: firstNewAssigned is a plain render-scoped
+              local, not state — it just decides which single card (the first
+              "New"-marked one, across both sections in display order) gets the
+              scroll-anchor ref this render. Recomputed fresh every render;
+              nothing persists across renders through it. */}
+          {(() => { let firstNewAssigned = false; return <>
           {canMake.length > 0 && (
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} /> })}
+                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} /></div> })}
               </div>
             </div>
           )}
@@ -5317,10 +5540,11 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Shopping Required ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; return <RecipeCard key={i} suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} /> })}
+                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} /></div> })}
               </div>
             </div>
           )}
+          </>})()}
         </div>
         {/* Suppressed after Surprise Me (Change 5) — the model already picked the template
             there, so a redirect a moment later reads as second-guessing its own choice. */}
