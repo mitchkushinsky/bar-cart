@@ -1902,6 +1902,14 @@ Pick exactly one template id that best fits these ingredients. Return ONLY valid
 // stale the moment this prompt changes. Ownership is deliberately absent
 // from this prompt — resolved client-side from inventory_tags and applied
 // as presentation only, never as a filter on what gets generated here.
+// Session 12, Change 1: flavor_categories are flavor DIRECTIONS now
+// ("lemon", not "lemon juice") — the form is a separate decision. Forms
+// themselves are NOT generated here (that was tried and reverted): they cost
+// ~13s and ~700-900 extra output tokens on a call that runs on every
+// affinities load, to serve an interaction (adding a flavor by a specific
+// form) that's relevant well under half the time. Forms are fetched on tap
+// instead — see analyzeFlavorForms — paying that cost only when someone
+// actually opens the picker.
 async function analyzeContextualAffinities(ingredients, template, modifiers, baseAffinityData, diagLabel = null) {
   const t = TEMPLATE_MAP[template]
   const sig = TEMPLATE_SIGNATURES[template]
@@ -1930,7 +1938,7 @@ ${buildTemplateContext(template, modifiers)}
 For EACH ingredient listed above, in the SAME ORDER, provide:
 - contextual_prose: 1-2 sentences on how this specific ingredient behaves in a ${t.name} — not a generic flavor profile, a template-specific one. If a modifier above (LOW ABV, NON-ALCOHOLIC, or FROZEN) is active, factor it into the direction too. Example of the right altitude: for Jägermeister in a Flip, how its herbal bitterness plays against egg and sugar in a dry-shaken build — not just "herbal, bittersweet, baking spice."
 - spirit_categories: 2-5 generic spirit/liqueur/fortified-wine CATEGORIES (never brand names) that would genuinely work in this exact template — e.g. "gin", "blanc vermouth", "dry curaçao". Each needs a "role" from this fixed enum: ${RECIPE_ROLES.join(' | ')}.
-- flavor_categories: 2-6 generic flavor/ingredient CATEGORIES (never brand names) that suit this template — e.g. "ginger", "stone fruit", "orgeat". Each needs a "role" from the same fixed enum.
+- flavor_categories: 2-6 flavor DIRECTIONS (never a specific ingredient form, never a brand name) that suit this template — e.g. "ginger", "stone fruit", "honey", NOT "ginger syrup", "peach purée", "honey syrup". A direction names what the flavor IS; how to deliver it is a separate decision the user makes afterward, not asked for here. The one exception: a handful of flavors have no meaningful direction above their single existing form — egg white, soda water, and similar — list those as themselves rather than inventing an abstraction that doesn't exist for them. Each direction needs a "role" from the fixed enum, reflecting this direction's DOMINANT use in this template — e.g. "citrus" for lemon in a Sour, but "garnish" or "bitters" for lemon in an Old Fashioned, since juice isn't the point there.
 
 ${forbiddenNote}
 ${modifierNote}
@@ -1938,7 +1946,11 @@ ${modifierNote}
 Return ONLY valid JSON, no markdown fences:
 {
   "ingredients": [
-    { "contextual_prose": "string", "spirit_categories": [{ "category": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }], "flavor_categories": [{ "category": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }] }
+    {
+      "contextual_prose": "string",
+      "spirit_categories": [{ "category": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }],
+      "flavor_categories": [{ "category": "string — a flavor direction, e.g. \\"lemon\\", never a form like \\"lemon juice\\"", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }]
+    }
   ]
 }
 "ingredients" must have exactly ${ingredients.length} entries, in the same order as listed above.`
@@ -1950,6 +1962,54 @@ Return ONLY valid JSON, no markdown fences:
   }
   // TEMP DIAGNOSTIC: diagLabel opts into the streaming/instrumented path;
   // default (null) behavior below is byte-for-byte what it was before.
+  if (diagLabel) {
+    const r = await callClaudeStreamDiag(body, diagLabel)
+    return extractJSON(r.text)
+  }
+  return await callClaude(body)
+}
+
+// Session 12, Change 2 (revised): forms are fetched on tap, not generated
+// alongside every ingredient's affinities — that cost 13 extra seconds and
+// ~700-900 extra output tokens on a call made on every affinities load, to
+// serve picking a specific form, which is the less common path. Deliberately
+// small: just the flavor, template, and modifiers — no ingredients, no base
+// affinity context, so the rationale reads as template-general rather than
+// naming the ingredient that happened to surface this flavor. Same
+// forbidden-role filtering as everywhere else in this template's world.
+async function analyzeFlavorForms(flavor, template, modifiers, diagLabel = null) {
+  const t = TEMPLATE_MAP[template]
+  const sig = TEMPLATE_SIGNATURES[template]
+  const forbiddenNote = sig?.forbiddenRoles?.length > 0
+    ? `This template forbids the following roles — never include a form whose role would be one of these: ${sig.forbiddenRoles.join(', ')}.`
+    : ''
+  const modifierNote = (modifiers?.lowABV || modifiers?.na)
+    ? `A LOW ABV or NON-ALCOHOLIC modifier is active — do not suggest a full-proof spirit-based form; prefer a session-strength, NA, or fortified-wine-based alternative where one is relevant.`
+    : ''
+
+  const prompt = `You are an expert craft bartender. Someone exploring a ${t?.name || template} has picked "${flavor}" as a flavor direction and wants to know how to actually bring it into the build.
+
+${buildTemplateContext(template, modifiers)}
+
+List 3-4 plausible, specific ingredient forms of "${flavor}" for THIS SPECIFIC template, ranked best-suited first. Forms are ingredient-specific, not a generic template (twist/juice/liqueur/syrup applied to everything) — only include a form that is a real, specific thing someone would actually reach for; coffee has no twist, stone fruit has no useful juice, rooibos is an infusion. Fewer than 3-4 is correct, not a shortfall, whenever fewer genuinely apply — never pad to hit a number. If "${flavor}" is already at its single existing form (egg white, soda water, and similar), return just that one form, not invented alternatives.
+
+Each form needs a "role" from this fixed enum: ${RECIPE_ROLES.join(' | ')} — a form's role can differ from what you'd expect the direction's typical role to be (lemon juice is citrus, lemon peel is garnish, lemon bitters is bitters); tag each form honestly on its own.
+
+${forbiddenNote}
+${modifierNote}
+
+Return ONLY valid JSON, no markdown fences:
+{
+  "forms": [
+    { "form": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish", "rationale": "string — one short line on what this form does in this build" }
+  ]
+}`
+
+  const body = {
+    model: 'claude-sonnet-4-5',
+    max_tokens: 500,
+    messages: [{ role: 'user', content: prompt }],
+  }
   if (diagLabel) {
     const r = await callClaudeStreamDiag(body, diagLabel)
     return extractJSON(r.text)
@@ -2335,6 +2395,10 @@ function CategoryBottlesDrawer({ category, bottles, onAddGeneric, onAddBottle, o
   // get the same row treatment. Owned bottles list first; the generic
   // option is always last, whether or not anything is owned.
   const rowStyle = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', cursor: 'pointer' }
+  // Session 12: outstanding feedback was that these rows don't read as
+  // tappable — a trailing chevron on every row (here and in FlavorFormsDrawer)
+  // is the fix, applied to both per the session brief.
+  const chevron = <span style={{ color: C.textFaint, fontSize: 16, flexShrink: 0 }}>›</span>
   return (
     <>
       <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 99, transition: 'opacity 0.25s' }} />
@@ -2350,12 +2414,77 @@ function CategoryBottlesDrawer({ category, bottles, onAddGeneric, onAddBottle, o
           {bottles.map(b => (
             <div key={b.spirit} onClick={() => onAddBottle(b.spirit)} style={rowStyle}>
               <span style={{ fontSize: 14, color: C.text }}>{b.spirit}</span>
-              {b.location && <span style={{ fontSize: 12, color: C.textMuted }}>📍 {b.location}</span>}
+              <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {b.location && <span style={{ fontSize: 12, color: C.textMuted }}>📍 {b.location}</span>}
+                {chevron}
+              </span>
             </div>
           ))}
           <div onClick={onAddGeneric} style={rowStyle}>
             <span style={{ fontSize: 14, color: C.text }}>{category} (unspecified)</span>
+            {chevron}
           </div>
+        </div>
+      </div>
+    </>
+  )
+}
+
+// Session 12, Change 3 (revised): the picker a flavor chip opens — forms are
+// now fetched HERE, on tap (analyzeFlavorForms), not carried in already, so
+// the drawer opens instantly in a loading state and fills in a beat later.
+// Same drawer pattern as CategoryBottlesDrawer (peer rows, equal weight, no
+// primary-action styling on any one form), plus a free-text row so a short
+// list — or a failed fetch — never blocks the user. Selecting a form or
+// submitting free text both just add an ingredient exactly as tapping a
+// flavor chip always has — this picker only decides WHAT gets added, never
+// how it's handled afterward.
+function FlavorFormsDrawer({ label, forms, loading, error, onSelectForm, onAddFreeText, onClose }) {
+  const [freeText, setFreeText] = useState('')
+  const rowStyle = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', cursor: 'pointer' }
+  const submit = () => { const v = freeText.trim(); if (v) onAddFreeText(v) }
+  return (
+    <>
+      <style>{`@keyframes bcspini { to { transform: rotate(360deg); } }`}</style>
+      <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 99, transition: 'opacity 0.25s' }} />
+      <div style={{ position: 'fixed', bottom: 0, left: '50%', transform: 'translateX(-50%)', width: '100%', maxWidth: 700, background: '#1c1c1c', borderTop: `1px solid ${C.border}`, borderTopLeftRadius: 18, borderTopRightRadius: 18, padding: '20px 20px 36px', zIndex: 100, maxHeight: '72vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 6 }}>
+          <div style={{ fontSize: 20, fontWeight: 800, color: C.text, letterSpacing: '-0.02em' }}>{label}</div>
+          <button onClick={onClose} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.textMuted, fontSize: 20, lineHeight: 1, padding: '2px 9px', cursor: 'pointer', flexShrink: 0 }}>×</button>
+        </div>
+        <div style={{ fontSize: 13, color: C.textFaint, marginBottom: 16 }}>How do you want to bring in {label.toLowerCase()}?</div>
+        {loading && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 0', marginBottom: 20, fontSize: 13, color: C.textFaint }}>
+            <span style={{ display: 'inline-block', width: 12, height: 12, border: '2px solid currentColor', borderTopColor: 'transparent', borderRadius: '50%', animation: 'bcspini 0.6s linear infinite', flexShrink: 0 }} />
+            Finding forms for {label.toLowerCase()}…
+          </div>
+        )}
+        {!loading && error && (
+          <div style={{ fontSize: 13, color: C.red, marginBottom: 20 }}>{error}</div>
+        )}
+        {!loading && !error && forms.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 20 }}>
+            {forms.map(f => (
+              <div key={f.form} onClick={() => onSelectForm(f.form)} style={rowStyle}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 14, color: C.text, marginBottom: f.rationale ? 2 : 0 }}>{f.form}</div>
+                  {f.rationale && <div style={{ fontSize: 12, color: C.textMuted, lineHeight: 1.4 }}>{f.rationale}</div>}
+                </div>
+                <span style={{ color: C.textFaint, fontSize: 16, flexShrink: 0 }}>›</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 8 }}>Something else</div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input autoFocus={false} value={freeText} onChange={e => setFreeText(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') submit() }}
+            placeholder={`e.g. ${label} cordial`}
+            style={{ flex: 1, minWidth: 0, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, padding: '10px 12px', fontSize: 14, outline: 'none', boxSizing: 'border-box' }} />
+          <button onClick={submit} disabled={!freeText.trim()}
+            style={{ background: C.gold, border: 'none', borderRadius: 8, color: '#0f0f0f', fontWeight: 700, fontSize: 13, padding: '0 16px', cursor: freeText.trim() ? 'pointer' : 'default', opacity: freeText.trim() ? 1 : 0.5, flexShrink: 0 }}>
+            Add
+          </button>
         </div>
       </div>
     </>
@@ -4146,6 +4275,15 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const [contextualAffinityLoading, setContextualAffinityLoading] = useState(false)
   const [contextualAffinityError, setContextualAffinityError] = useState(null)
   const [categoryDrawer, setCategoryDrawer] = useState(null) // { category, bottles } | null
+  // Session 12, Change 3 (revised): opened by any flavor chip backed by the
+  // contextual layer (has a {category, role}, not just a bare base-layer
+  // string) — { category, label, loading, forms, error } | null. Forms are
+  // fetched on tap (analyzeFlavorForms), not carried by the chip already, so
+  // the drawer opens immediately in a loading state and fills in once the
+  // call resolves. A flavor chip with no contextual entry at all (base layer
+  // only, or the contextual call itself failed) skips this entirely and
+  // keeps the original direct-add behavior — that fallback is unchanged.
+  const [flavorFormsDrawer, setFlavorFormsDrawer] = useState(null)
   const [combinationData, setCombinationData] = useState(null)
   const [combinationLoading, setCombinationLoading] = useState(false)
   const [combinationError, setCombinationError] = useState(null)
@@ -4947,6 +5085,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       const entries = (data?.ingredients || []).map(entry => ({
         contextual_prose: entry?.contextual_prose || null,
         spirit_categories: (entry?.spirit_categories || []).filter(c => c?.category && !forbidden.includes(c.role)),
+        // Session 12, Change 1: directions only — no "forms" here anymore.
+        // Forms are fetched on tap (analyzeFlavorForms) when the picker
+        // opens, not generated for every direction on every affinities load.
         flavor_categories: (entry?.flavor_categories || []).filter(c => c?.category && !forbidden.includes(c.role)),
       }))
       setContextualAffinityData(entries)
@@ -5086,6 +5227,30 @@ Rules:
     }
   }
 
+  // Session 12, Change 2 (revised): fetches this one flavor's forms on tap —
+  // opens the drawer immediately in a loading state so the tap feels
+  // responsive, then fills in once analyzeFlavorForms resolves. The prev-check
+  // in both the success and failure updater guards against a stale response
+  // landing after the user has already closed the drawer or tapped a
+  // different flavor chip (category will no longer match, so the update is
+  // silently dropped rather than reopening or overwriting the wrong drawer).
+  const openFlavorFormsDrawer = (category, label) => {
+    setFlavorFormsDrawer({ category, label, loading: true, forms: [], error: null })
+    const modifiers = { frozen, lowABV, na }
+    analyzeFlavorForms(category, template, modifiers, DIAG_ON ? 'flavor-forms' : null)
+      .then(data => {
+        const forbidden = TEMPLATE_SIGNATURES[template]?.forbiddenRoles || []
+        const forms = (Array.isArray(data?.forms) ? data.forms : [])
+          .filter(f => f?.form && !forbidden.includes(f.role))
+          .slice(0, 4)
+        setFlavorFormsDrawer(prev => (prev && prev.category === category) ? { ...prev, loading: false, forms } : prev)
+      })
+      .catch(err => {
+        console.warn('[flavor forms] failed:', err.message)
+        setFlavorFormsDrawer(prev => (prev && prev.category === category) ? { ...prev, loading: false, error: 'Could not load suggested forms — you can still type one below.' } : prev)
+      })
+  }
+
   const handleAddAndAnalyze = async (ingredientName) => {
     const trimmed = ingredientName.trim()
     if (!trimmed || selected.map(s => s.trim().toLowerCase()).includes(trimmed.toLowerCase())) return
@@ -5210,15 +5375,27 @@ Rules:
       )
     }
 
-    // Flavor chips have no bottles behind them — nothing to drill into, so
-    // tapping adds the flavor directly as a second exploration ingredient.
-    const renderFlavorChip = (category) => (
-      <span key={category}
-        onClick={() => handleAddAndAnalyze(titleCase(category))}
-        style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.surface, border: `1px solid ${C.border}`, color: C.textMuted, cursor: 'pointer' }}>
-        {titleCase(category)}
-      </span>
-    )
+    // Session 12, Change 3: a flavor chip backed by the contextual layer
+    // opens a picker and fetches its forms on tap (the flavor is a
+    // direction, the form is a decision — see analyzeContextualAffinities /
+    // analyzeFlavorForms). `entry` is the {category, role} object once the
+    // contextual layer has loaded; it's a bare string from the base layer
+    // (row?.flavor_tags, see flavorCats below) while contextual is still
+    // loading or failed, in which case there's nothing to look up a form
+    // for and this falls back to direct-add — the required degrade path,
+    // not a special case of it.
+    const renderFlavorChip = (entry) => {
+      const category = typeof entry === 'string' ? entry : entry.category
+      const hasContextual = entry && typeof entry === 'object'
+      const label = titleCase(category)
+      return (
+        <span key={category}
+          onClick={() => hasContextual ? openFlavorFormsDrawer(category, label) : handleAddAndAnalyze(label)}
+          style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 20, fontSize: 13, fontWeight: 500, margin: '3px 4px 3px 0', background: C.surface, border: `1px solid ${C.border}`, color: C.textMuted, cursor: 'pointer' }}>
+          {label}
+        </span>
+      )
+    }
 
     // The template and any active modifiers vanish from view after the
     // template step otherwise, even though they're the biggest determinant
@@ -5255,7 +5432,11 @@ Rules:
           const resolving = contextualAffinityLoading && !contextual
           const prose = contextual?.contextual_prose || row?.flavor_affinities || 'No affinity data available for this ingredient.'
           const spiritCats = contextual ? (contextual.spirit_categories || []).map(c => c.category) : (row?.spirit_tags || [])
-          const flavorCats = contextual ? (contextual.flavor_categories || []).map(c => c.category) : (row?.flavor_tags || [])
+          // Session 12, Change 3: the full {category, role, forms} objects
+          // once contextual has loaded, so renderFlavorChip can find forms —
+          // plain strings from the base layer otherwise (no forms exist
+          // there), which is exactly the direct-add degrade path.
+          const flavorCats = contextual ? (contextual.flavor_categories || []) : (row?.flavor_tags || [])
           const shimmerStyle = resolving ? { animation: 'bcshimmer 1.6s ease-in-out infinite' } : {}
           return (
             <div key={normName}>
@@ -5296,6 +5477,17 @@ Rules:
             onAddGeneric={() => { setCategoryDrawer(null); handleAddAndAnalyze(categoryDrawer.category) }}
             onAddBottle={(spirit) => { setCategoryDrawer(null); handleAddAndAnalyze(spirit) }}
             onClose={() => setCategoryDrawer(null)}
+          />
+        )}
+        {flavorFormsDrawer && (
+          <FlavorFormsDrawer
+            label={flavorFormsDrawer.label}
+            forms={flavorFormsDrawer.forms}
+            loading={flavorFormsDrawer.loading}
+            error={flavorFormsDrawer.error}
+            onSelectForm={(form) => { setFlavorFormsDrawer(null); handleAddAndAnalyze(form) }}
+            onAddFreeText={(text) => { setFlavorFormsDrawer(null); handleAddAndAnalyze(text) }}
+            onClose={() => setFlavorFormsDrawer(null)}
           />
         )}
         {!showIngredientAdder ? (
