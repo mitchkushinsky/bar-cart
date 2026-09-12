@@ -456,6 +456,24 @@ function inventoryToText(items, tags = {}) {
   return lines.join('\n')
 }
 
+// Session 13, Change 1: strips accents/diacritics before comparing, so
+// "curaçao" and "curacao" resolve as the same word. The tagging model
+// (api/tag-inventory.js) and the exploration/contextual models were never
+// guaranteed to agree on which spelling to use, and both are legitimate —
+// this makes ownership matching robust to that rather than requiring one
+// canonical spelling be retroactively enforced across existing tags.
+const DIACRITIC_MARKS_RE = /[\u0300-\u036f]/g
+function normalizeForMatch(str) {
+  return (str || '').trim().toLowerCase().normalize('NFD').replace(DIACRITIC_MARKS_RE, '')
+}
+
+// Shared with the affinity chip labels (Session 6) and the "Add an
+// Ingredient" generic-category row (Session 13, Change 2) — one title-casing
+// convention so the same category reads identically everywhere it appears.
+function titleCase(s) {
+  return (s || '').replace(/(^|\s)(\p{L})/gu, (_, sep, c) => sep + c.toUpperCase())
+}
+
 // ─── Claude API ───────────────────────────────────────────────────────────────
 
 function stripInternalFields(obj) {
@@ -3265,13 +3283,26 @@ function SavedScreen({ savedSubTab, setSavedSubTab, toMake, favorites, onRemoveT
   const currentList = savedSubTab === 'ondeck' ? toMake : favorites
 
   let filteredList = sourceFilter === 'All' ? currentList : currentList.filter(i => (i.source || 'manual') === sourceFilter)
+  // Session 13, Change 3: ingredientFilter now holds a normalized (trimmed,
+  // lowercased) key, not the raw saved string — match every item whose
+  // primaryIngredients contains that ingredient under ANY casing, not just
+  // the exact one the active chip happens to use.
   if (sourceFilter === 'Exploration' && ingredientFilter) {
-    filteredList = filteredList.filter(i => (i.primaryIngredients || []).includes(ingredientFilter))
+    filteredList = filteredList.filter(i => (i.primaryIngredients || []).some(p => p.trim().toLowerCase() === ingredientFilter))
   }
 
-  const uniqueIngredients = [...new Set(
-    currentList.filter(i => i.source === 'Exploration').flatMap(i => i.primaryIngredients || [])
-  )]
+  // Session 13, Change 3: dedupe case-insensitively and show one consistent,
+  // title-cased label per ingredient — "fig syrup" and "Fig Syrup" used to
+  // produce two separate chips, each hiding the drinks saved under the
+  // other's casing. Keyed by the same normalized string the filter above
+  // matches on, so a chip's key and its filtering are never able to drift
+  // apart from each other.
+  const ingredientLabels = new Map()
+  currentList.filter(i => i.source === 'Exploration').flatMap(i => i.primaryIngredients || []).forEach(ing => {
+    const key = ing.trim().toLowerCase()
+    if (key && !ingredientLabels.has(key)) ingredientLabels.set(key, titleCase(ing.trim()))
+  })
+  const uniqueIngredients = Array.from(ingredientLabels.entries())
 
   const emptyMsg = currentList.length === 0
     ? savedSubTab === 'ondeck' ? 'No recipes on deck yet. Analyze a recipe and tap 🍹 On Deck.'
@@ -3312,12 +3343,12 @@ function SavedScreen({ savedSubTab, setSavedSubTab, toMake, favorites, onRemoveT
       {/* Primary ingredient pills */}
       {sourceFilter === 'Exploration' && uniqueIngredients.length > 0 && (
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 14 }}>
-          {uniqueIngredients.map(ing => {
-            const active = ingredientFilter === ing
+          {uniqueIngredients.map(([key, label]) => {
+            const active = ingredientFilter === key
             return (
-              <button key={ing} onClick={() => setIngredientFilter(active ? null : ing)}
+              <button key={key} onClick={() => setIngredientFilter(active ? null : key)}
                 style={{ background: active ? C.amber + '22' : C.surface, border: `1px solid ${active ? C.amber + '55' : C.border}`, borderRadius: 20, color: active ? C.amber : C.textFaint, fontSize: 11, fontWeight: active ? 600 : 400, padding: '3px 10px', cursor: 'pointer' }}>
-                {ing}
+                {label}
               </button>
             )
           })}
@@ -5340,21 +5371,44 @@ Rules:
 
   if (step === 'affinities') {
     const selectedNorm = selected.map(s => s.trim().toLowerCase())
-    const titleCase = s => s.replace(/(^|\s)(\p{L})/gu, (_, sep, c) => sep + c.toUpperCase())
 
     // Session 4's inventory_tags, not string-matching on bottle names — a
-    // category is "owned" if some in-stock bottle's generic_type or an alias
-    // matches it exactly. Ownership never filters what's shown, only marks it.
+    // category is "owned" if some in-stock bottle's generic_type matches it.
+    // Ownership never filters what's shown, only marks it.
+    // Session 13, Change 1: resolves in two steps, not one. First, find the
+    // generic_type the chip refers to — either the chip text IS a
+    // generic_type, or it's an alias some bottle was tagged with (aliases
+    // name the type, they don't scope to just that bottle). Then collect
+    // every owned bottle sharing that resolved type. A single per-bottle
+    // string match (chip text == this bottle's own generic_type/alias) was
+    // tried first and rejected: it made "Dry Curaçao" find "Dry Curacao" via
+    // its own alias, but never found Cointreau, which is also generic_type
+    // "triple sec" and even carries its own "curaçao" alias — the chip's
+    // literal phrasing just didn't happen to equal that alias's exact
+    // string. Resolving to a shared type is what makes chip wording robust
+    // to which specific bottle's alias it happens to line up with.
+    // normalizeForMatch (accent/case folding) still applies at both steps.
+    // Known remaining limit: a chip naming a property that cuts across
+    // generic_types ("Aged Rum" — aged Jamaican, dark, agricole rums all
+    // qualify, but "aged" is nobody's generic_type or alias) still won't
+    // resolve, because there is no single generic_type or alias to resolve
+    // through. See the Session 13 writeup for why that's an accepted limit
+    // rather than a bug fixed here — the alternative would mean constraining
+    // the model's chip vocabulary to known generic_types, which touches the
+    // generation prompt this session is barred from changing.
     const getOwnedBottlesForCategory = (category) => {
-      const normCat = category.trim().toLowerCase()
+      const normCat = normalizeForMatch(category)
       if (!inventory || !inventoryTags) return []
-      return inventory.filter(item => {
-        if (item.oos) return false
-        const tag = inventoryTags[item.spirit.trim().toLowerCase()]
-        if (!tag) return false
-        if ((tag.generic_type || '').trim().toLowerCase() === normCat) return true
-        return (tag.aliases || []).some(a => (a || '').trim().toLowerCase() === normCat)
-      })
+      const owned = inventory
+        .filter(item => !item.oos)
+        .map(item => ({ item, tag: inventoryTags[item.spirit.trim().toLowerCase()] }))
+        .filter(({ tag }) => tag)
+      const resolvedType = owned.find(({ tag }) =>
+        normalizeForMatch(tag.generic_type) === normCat || (tag.aliases || []).some(a => normalizeForMatch(a) === normCat)
+      )?.tag.generic_type
+      if (!resolvedType) return []
+      const normType = normalizeForMatch(resolvedType)
+      return owned.filter(({ tag }) => normalizeForMatch(tag.generic_type) === normType).map(({ item }) => item)
     }
 
     // Spirit chips always open the drawer, owned or not — the drawer itself
@@ -5510,6 +5564,34 @@ Rules:
               const q = adderQuery.toLowerCase().trim()
               const sugs = (inventory || []).filter(i => !selectedNorm.includes(i.spirit.trim().toLowerCase()) && i.spirit.toLowerCase().includes(q)).slice(0, 6)
               const exact = sugs.some(s => s.spirit.toLowerCase() === q)
+              // Session 13, Change 2: offer the generic category too, same
+              // "<Category> (unspecified)" wording as CategoryBottlesDrawer —
+              // only when the typed text actually matches a generic_type or
+              // one of its aliases (normalizeForMatch, so "curacao" still
+              // finds "triple sec"'s bottles the same way the affinity chip
+              // dot does). Arbitrary text that matches neither a bottle nor a
+              // known category still falls through to free text below,
+              // unchanged.
+              const normQ = normalizeForMatch(adderQuery)
+              let matchedGeneric = null
+              if (inventoryTags) {
+                for (const tag of Object.values(inventoryTags)) {
+                  if (!tag?.generic_type) continue
+                  if (normalizeForMatch(tag.generic_type) === normQ || (tag.aliases || []).some(a => normalizeForMatch(a) === normQ)) {
+                    matchedGeneric = tag.generic_type
+                    break
+                  }
+                }
+              }
+              const genericLabel = matchedGeneric ? titleCase(matchedGeneric) : null
+              const genericAlreadySelected = genericLabel && selectedNorm.includes(genericLabel.trim().toLowerCase())
+              const showGeneric = genericLabel && !genericAlreadySelected
+              // Redundant with the generic row when they'd add the identical
+              // text (typing "Gin" when "gin" is itself the generic_type) —
+              // suppress free text there so there aren't two rows doing the
+              // same thing; a genuinely different typed string still gets its
+              // own free-text row alongside the generic one.
+              const freeTextRedundant = showGeneric && normalizeForMatch(genericLabel) === normQ
               return (
                 <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#1c1c1c', border: `1px solid ${C.border}`, borderRadius: 8, zIndex: 20, overflow: 'hidden', marginTop: 4 }}>
                   {sugs.map(item => (
@@ -5521,9 +5603,17 @@ Rules:
                       {item.category && <span style={{ fontSize: 11, color: C.textFaint }}>{item.category}</span>}
                     </div>
                   ))}
-                  {!exact && (
+                  {showGeneric && (
+                    <div onClick={() => { setShowIngredientAdder(false); setAdderQuery(''); handleAddAndAnalyze(genericLabel) }}
+                      style={{ padding: '10px 14px', cursor: 'pointer', fontSize: 14, borderTop: sugs.length ? `1px solid ${C.border}` : 'none' }}
+                      onMouseEnter={e => e.currentTarget.style.background = C.border}
+                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                      {genericLabel} (unspecified)
+                    </div>
+                  )}
+                  {!exact && !freeTextRedundant && (
                     <div onClick={() => { setShowIngredientAdder(false); setAdderQuery(''); handleAddAndAnalyze(adderQuery.trim()) }}
-                      style={{ padding: '10px 14px', cursor: 'pointer', fontSize: 14, color: C.textMuted, borderTop: sugs.length ? `1px solid ${C.border}` : 'none' }}
+                      style={{ padding: '10px 14px', cursor: 'pointer', fontSize: 14, color: C.textMuted, borderTop: (sugs.length || showGeneric) ? `1px solid ${C.border}` : 'none' }}
                       onMouseEnter={e => e.currentTarget.style.background = C.border}
                       onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
                       Use &quot;{adderQuery.trim()}&quot; →
