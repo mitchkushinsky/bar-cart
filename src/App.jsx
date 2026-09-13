@@ -474,6 +474,59 @@ function titleCase(s) {
   return (s || '').replace(/(^|\s)(\p{L})/gu, (_, sep, c) => sep + c.toUpperCase())
 }
 
+// Session 14, Change 3: hides an Inventory row's generic_type chip when it
+// says nothing the bottle's own name doesn't already say. A single-word
+// generic_type ("amaro", "gin") is never hidden — it's already the most
+// compact form there is, so it can't be a restatement of a longer phrase.
+// For a multi-word generic_type, split off its trailing category-noun (the
+// last word — "whiskey," "bitters," "rum") from the descriptor word(s)
+// before it, and hide only when every descriptor word is already a word in
+// the bottle's own name — e.g. "Homemade Peach Liqueur" already says
+// "peach" and "liqueur," so generic_type "peach liqueur" adds nothing.
+// Bitters gets one narrow, deliberate exception: its trailing "bitters" is
+// treated as already covered by the category chip shown right next to it,
+// because every bitters product in this inventory omits the word "bitters"
+// from its own name by convention ("Bitter Rose," "Thai Green Chili") — so
+// requiring it to appear literally in the name would mean this rule could
+// never fire for the single category it matters most for (Bitters is the
+// largest category in the inventory). This exception is deliberately NOT
+// extended to other umbrella categories like Whiskey: "Rittenhouse Rye"
+// already contains the word "Rye," and giving "Whiskey" the same free pass
+// would wrongly hide "rye whiskey" — a distinction (rye vs. bourbon vs.
+// scotch) that matters for matching, unlike a bitters bottle's precise
+// flavor family, which the category chip alone can't convey.
+function isGenericTypeRedundant(name, category, genericType) {
+  if (!genericType) return false
+  const stem = w => (w.endsWith('s') && w.length > 3) ? w.slice(0, -1) : w
+  const typeTokens = normalizeForMatch(genericType).split(/\s+/).filter(Boolean).map(stem)
+  if (typeTokens.length <= 1) return false
+  const nameTokens = new Set(normalizeForMatch(name).split(/\s+/).filter(Boolean).map(stem))
+  const descriptor = normalizeForMatch(category) === 'bitters' ? typeTokens.slice(0, -1) : typeTokens
+  return descriptor.every(t => nameTokens.has(t))
+}
+
+// Session 14, Change 4: collapses duplicate bottle rows — the same product
+// kept in two spots, e.g. a backup on an overflow shelf — into one, for
+// display contexts where the bottle is a pick-one option (CategoryBottlesDrawer),
+// not a location inventory (InventoryScreen still shows every physical bottle,
+// since that view is about where things physically are). Keeps whichever
+// location doesn't look like backup storage when there's a choice, else the
+// first one encountered; the rest are folded into a small backup count on the
+// kept row rather than dropped silently or shown as a second identical row.
+function dedupeBottlesByName(items) {
+  const groups = new Map()
+  for (const item of items) {
+    const key = item.spirit.trim().toLowerCase()
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(item)
+  }
+  return Array.from(groups.values()).map(group => {
+    if (group.length === 1) return group[0]
+    const primary = group.find(b => !/overflow/i.test(b.location || '')) || group[0]
+    return { ...primary, backupCount: group.length - 1 }
+  })
+}
+
 // ─── Claude API ───────────────────────────────────────────────────────────────
 
 function stripInternalFields(obj) {
@@ -1360,7 +1413,11 @@ First check if the featured ingredients fundamentally clash in cocktail contexts
 Otherwise invent cocktails that showcase the featured ingredients using this priority order, and set each suggestion's "origin" field honestly to reflect which path you actually used — do not default every suggestion to the same value:
 1. DEFAULT — origin: "riff": take the template's usual formula above and substitute the featured ingredients (and available bar inventory) into its ratio slots. This is how most real cocktails are made and should be your primary approach for every suggestion.
 2. LAST RESORT — origin: "original": only when no reasonable substitution into the template's formula exists, invent a drink that still honors the template's mechanic (stirred/shaken/built/etc.) and general spirit-forward-vs-lengthened character. Do not reach for this by default — it should be rare, and you must set origin: "original" honestly rather than mislabeling an actual substitution as a riff.
-For either path, suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate, and check every non-garnish, non-pantry-staple ingredient against the bar inventory above (note the generic type and aliases listed alongside each bottle — a bottle's generic type or an alias matching an ingredient the recipe calls for means the user owns it).
+3. WHEN IT'S ACTUALLY CANON — origin: "published": you have no search tool here, but you still carry real cocktail history in your training. If what you were about to build as a riff or original turns out to genuinely BE a documented drink — not merely similar to one, but the drink itself, reproduced ingredient-for-ingredient, with independent provenance you can name — report that honestly instead of mislabeling it a substitution. Forbidding the label wouldn't stop this from happening, it would just force you to call a known drink a riff. Use the same standard tier-1 search uses elsewhere in this app: CANON is a named drink with independent, documented history (a real creator, a bar, or an era distinct from wherever you know it from); VARIATION is a real, specific source's own documented take on something else, self-declaring by name or framing (e.g. "Difford's split-base version"). Set "tier" to "canon" or "variation" accordingly when origin is "published"; leave "tier" null for riff/original. The bar here is documented provenance, not familiarity or resemblance — a riff that merely evokes or resembles a classic is still a riff, origin "riff". Reserve "published" for when you have actually reproduced the known drink itself and can name what makes it so. This should fire rarely and only honestly, never as a way to make a suggestion sound more impressive.
+CHECK THIS EXPLICITLY BEFORE YOU FINALIZE EACH SUGGESTION'S ORIGIN: look at the recipe_name you were about to give it. If that name is itself the name of a real, independently known cocktail — not a name you invented for this suggestion — you have almost certainly just reproduced that drink, whatever path you took to build it, and origin must be "published" (with tier and attribution filled in), not "riff". Naming a suggestion after a real drink while still calling it a riff is exactly the mislabeling this section exists to prevent — the recipe_name field is not exempt from this check just because it was easy to reach for. A genuinely new riff earns an invented name, one that describes the swap rather than borrowing a canon drink's identity.
+For any of these paths, suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate, and check every non-garnish, non-pantry-staple ingredient against the bar inventory above (note the generic type and aliases listed alongside each bottle — a bottle's generic type or an alias matching an ingredient the recipe calls for means the user owns it).
+
+${ATTRIBUTION_FIELDS_INSTRUCTION} These four fields apply only when origin is "published" above — leave all four null for riff/original, same as tier is left null for them.
 ${excludeNames.length > 0 ? `\nALREADY SURFACED — the user has already seen these suggestions across earlier batches, each shown with its full ingredient list so you can recognize the underlying swap even under a new name — do not return the same swap again under a different invented name:\n${excludeNames.join('\n')}\nJudge distinctness (see below) against this full list, not just against what you're about to return.\n` : ''}
 CRITICAL: Every cocktail MUST feature ALL of the featured ingredients (${ingredients.join(', ')}). Do not omit any featured ingredient from any suggestion.
 
@@ -1372,7 +1429,7 @@ ${CAN_MAKE_NOW_RULE}
 
 ${CAN_MAKE_NOW_SILENT}
 
-This is a first-pass listing, not the full analysis — the user picks one to open before seeing build detail. Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin, can_make_now, summary, recipe (array of {ingredient, amount, role}). The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), in one line — save elaboration for later. Do not omit or leave any of these fields empty. Do NOT include instructions, glass_type, technique_notes, difficulty, difficulty_note, watch_outs, or a per-ingredient ownership breakdown in this response — none of that is being asked for here.
+This is a first-pass listing, not the full analysis — the user picks one to open before seeing build detail. Each suggestion MUST include ALL of these fields: recipe_name, origin, can_make_now, summary, recipe (array of {ingredient, amount, role}) with non-empty values, plus tier, creator, bar, year, and attribution_source (null unless origin is "published", per above). The summary field should include a short characterization of the drink's flavor profile (e.g. "Bright and citrus-forward with a bitter backbone"), in one line — save elaboration for later. Never creator, bar, year, or source in summary — those go in the dedicated fields. Do NOT include instructions, glass_type, technique_notes, difficulty, difficulty_note, watch_outs, or a per-ingredient ownership breakdown in this response — none of that is being asked for here.
 
 Every entry in each suggestion's "recipe" array must include a "role" field from this fixed enum, describing its functional role in the build: ${RECIPE_ROLES.join(' | ')}. "citrus" means citrus juice used as a structural component — a citrus peel or twist used only as garnish is role "garnish", not "citrus". Every ingredient in the recipe gets exactly one role. This is kept even at this first-pass stage because the app checks it structurally before showing you the suggestion at all — a Sour with no citrus role gets caught and corrected here, not after the user has opened it.
 
@@ -1391,9 +1448,14 @@ Return ONLY valid JSON with no markdown fences:
   "suggestions": [
     {
       "recipe_name": "string",
-      "origin": "riff | original",
+      "origin": "riff | original | published",
+      "tier": "canon | variation | null",
       "can_make_now": true,
       "summary": "one line — flavor and character only",
+      "creator": "string or null",
+      "bar": "string or null",
+      "year": "string or null",
+      "attribution_source": "string or null",
       "recipe": [{ "ingredient": "string", "amount": "string", "role": "base | citrus | sweetener | modifier | bitters | lengthener | egg | dairy | garnish" }]
     }
   ]
@@ -1434,13 +1496,19 @@ cross_template_suggestion is always null from this call — leave it exactly as 
   }
 
   // Change 4/5: code-side structural validation against the chosen template's signature.
-  // Every suggestion here is tier-2/3 (riff/original) — tier-1 published recipes never
+  // Most suggestions here are tier-2/3 (riff/original) — tier-1 published recipes never
   // pass through this function. On failure, regenerate that one suggestion once with the
   // specific violation named; if it fails again, drop it. Partial results are expected
   // and fine — never let validation empty a result set that had valid members.
+  // Session 14, Change 5: a suggestion this call self-reports as origin "published" is
+  // exempt from this loop, same as tier-1 is exempt from it entirely — it's presented as
+  // the documented drink or not at all, never "corrected" toward the template's usual
+  // structure, and regenerateOriginalSuggestion's own schema only knows riff/original
+  // anyway, so sending a published suggestion through it would silently demote real canon.
   if (data?.suggestions?.length > 0) {
     const validated = []
     for (const s of data.suggestions) {
+      if (s?.origin === 'published') { validated.push(s); continue }
       const check = validateSuggestionStructure(s, template)
       if (check.valid) { validated.push(s); continue }
       console.warn('[template validation] failed, regenerating once:', { template, recipe_name: s.recipe_name, violations: check.violations, ingredients })
@@ -1464,11 +1532,27 @@ cross_template_suggestion is always null from this call — leave it exactly as 
   // this exact gap: an instrumented "43s" call that actually took ~68s).
   if (diagLabel) console.log(`[DIAG:${diagLabel}] analyzeExplorationsOriginals total fn time ms`, Math.round(performance.now() - __diagT0))
 
-  // Both riff and original map to the same legacy origin_flag value — that field
-  // only ever distinguished "from the web-search call" vs "from this call," and
-  // this call's suggestions were always origin_flag: "original" regardless of
-  // which internal tier the model used. Preserved exactly for Favorites/On Deck.
-  if (data?.suggestions) data.suggestions = data.suggestions.map(s => ({ ...s, origin_flag: 'original' }))
+  // Riff and original map to the same legacy origin_flag value — that field only
+  // ever distinguished "from the web-search call" vs "from this call," and until
+  // Session 14 this call's suggestions were always origin_flag: "original"
+  // regardless of internal tier. Session 14, Change 5: a suggestion can now
+  // self-report origin "published" — when it does, derive origin_flag/tier the
+  // same way tier-1 does (analyzeExplorationsRecipes above), splitting published
+  // into published/published_variation by tier and using origin_flag
+  // "from_recipe", since this is a real documented drink even though this call
+  // never searched to find it. An unrecognized tier under a published origin
+  // falls back to "published" (not variation), the same generous-default bias
+  // tier-1 uses. Anything else (riff/original, or a malformed origin) keeps the
+  // old behavior: tier null, origin_flag "original".
+  if (data?.suggestions) {
+    data.suggestions = data.suggestions.map(s => {
+      if (s?.origin === 'published') {
+        const tier = s?.tier === 'variation' ? 'variation' : 'canon'
+        return { ...s, tier, origin: tier === 'variation' ? 'published_variation' : 'published', origin_flag: 'from_recipe' }
+      }
+      return { ...s, tier: null, origin_flag: 'original' }
+    })
+  }
   // Same normalization rationale as more_published_exist: never trust the literal value,
   // coerce to strict boolean so a malformed/omitted field can't leave a CTA stuck visible.
   if (data) data.more_ideas_exist = data.more_ideas_exist === true
@@ -2433,7 +2517,11 @@ function CategoryBottlesDrawer({ category, bottles, onAddGeneric, onAddBottle, o
             <div key={b.spirit} onClick={() => onAddBottle(b.spirit)} style={rowStyle}>
               <span style={{ fontSize: 14, color: C.text }}>{b.spirit}</span>
               <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                {b.location && <span style={{ fontSize: 12, color: C.textMuted }}>📍 {b.location}</span>}
+                {b.location && (
+                  <span style={{ fontSize: 12, color: C.textMuted }}>
+                    📍 {b.location}{b.backupCount > 0 ? ` (+${b.backupCount} backup${b.backupCount > 1 ? 's' : ''})` : ''}
+                  </span>
+                )}
                 {chevron}
               </span>
             </div>
@@ -2975,6 +3063,8 @@ function InventoryScreen({
   onTagSweep, onSetGenericType,
 }) {
   const [selectedCats, setSelectedCats] = useState(new Set())
+  const [stockFilter, setStockFilter] = useState(null) // Session 14, Change 2: null | 'in' | 'oos'
+  const [query, setQuery] = useState('') // Session 14, Change 1
   const [drawerItem, setDrawerItem] = useState(null)
 
   if (!inventory) return <p style={{ color: C.textMuted, fontSize: 14 }}>Inventory not loaded.</p>
@@ -2984,7 +3074,19 @@ function InventoryScreen({
 
   const categories = Array.from(new Set(inventory.map(i => i.category).filter(Boolean))).sort()
   const anySelected = selectedCats.size > 0
-  const filtered = anySelected ? inventory.filter(i => selectedCats.has(i.category)) : inventory
+  // Session 14, Changes 1/2: category, stock, and search all compose (AND, not
+  // OR) — a search inside a filtered category, or the OOS filter combined with
+  // a category, both narrow the same single list rather than being exclusive
+  // views. normalizeForMatch (Session 13) so an unaccented search still finds
+  // an accented name, e.g. "Clement" finding "Clément."
+  const normQuery = normalizeForMatch(query)
+  const filtered = inventory.filter(i => {
+    if (anySelected && !selectedCats.has(i.category)) return false
+    if (stockFilter === 'in' && i.oos) return false
+    if (stockFilter === 'oos' && !i.oos) return false
+    if (normQuery && !normalizeForMatch(i.spirit).includes(normQuery)) return false
+    return true
+  })
 
   const toggleCat = (cat) => {
     setSelectedCats(prev => {
@@ -2994,6 +3096,11 @@ function InventoryScreen({
       return next
     })
   }
+
+  // Session 14, Change 2: tapping the active filter clears it, same toggle
+  // feel as a category pill — but exclusive with itself (in-stock and OOS
+  // can't both be active, there's no bottle that's both).
+  const toggleStock = (val) => setStockFilter(prev => prev === val ? null : val)
 
   const groups = {}
   for (const item of filtered) {
@@ -3006,10 +3113,32 @@ function InventoryScreen({
 
   return (
     <div>
+      {/* Session 14, Change 2: these were read-only counts sitting next to the
+          category pills, which already look and act like filters — visually
+          implying they're interactive when they weren't. Same pill affordance
+          as the category pills below (toggle, active-state border/background/
+          weight), just keyed to their own green/amber identity rather than
+          gold, so the in-stock/OOS meaning isn't lost when made tappable. */}
       <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
-        <span style={{ fontSize: 13, background: C.green + '22', color: C.green, border: `1px solid ${C.green}44`, borderRadius: 20, padding: '3px 10px', fontWeight: 600 }}>{inStockCount} in stock</span>
-        {oosCount > 0 && <span style={{ fontSize: 13, background: C.amber + '22', color: C.amber, border: `1px solid ${C.amber}44`, borderRadius: 20, padding: '3px 10px', fontWeight: 600 }}>{oosCount} OOS</span>}
+        <button onClick={() => toggleStock('in')} style={{ fontSize: 13, background: stockFilter === 'in' ? C.green + '22' : C.surface, color: stockFilter === 'in' ? C.green : C.textMuted, border: `1px solid ${stockFilter === 'in' ? C.green + '44' : C.border}`, borderRadius: 20, padding: '3px 10px', fontWeight: stockFilter === 'in' ? 700 : 600, cursor: 'pointer', transition: 'background 0.15s, color 0.15s' }}>
+          {inStockCount} in stock
+        </button>
+        {oosCount > 0 && (
+          <button onClick={() => toggleStock('oos')} style={{ fontSize: 13, background: stockFilter === 'oos' ? C.amber + '22' : C.surface, color: stockFilter === 'oos' ? C.amber : C.textMuted, border: `1px solid ${stockFilter === 'oos' ? C.amber + '44' : C.border}`, borderRadius: 20, padding: '3px 10px', fontWeight: stockFilter === 'oos' ? 700 : 600, cursor: 'pointer', transition: 'background 0.15s, color 0.15s' }}>
+            {oosCount} OOS
+          </button>
+        )}
       </div>
+
+      {/* Session 14, Change 1: composes with the category pills and stock
+          filters above/below — all three narrow the same list together. */}
+      <input
+        type="text"
+        value={query}
+        onChange={e => setQuery(e.target.value)}
+        placeholder="Search bottles…"
+        style={{ width: '100%', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, color: C.text, padding: '10px 14px', fontSize: 14, outline: 'none', boxSizing: 'border-box', marginBottom: 16 }}
+      />
 
       {/* Untagged banner — self-clearing at zero, so no stale control lingers */}
       {inventoryTagsError && (
@@ -3056,6 +3185,10 @@ function InventoryScreen({
         })}
       </div>
 
+      {sortedLocs.length === 0 && (
+        <p style={{ color: C.textMuted, fontSize: 14 }}>No bottles match the current filters.</p>
+      )}
+
       {sortedLocs.map(loc => (
         <div key={loc} style={{ marginBottom: 24 }}>
           <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>{loc}</div>
@@ -3065,13 +3198,16 @@ function InventoryScreen({
               const isExpired = expiry && expiry < now
               const expiringSoon = expiry && !isExpired && expiry <= in30
               const genericType = inventoryTags?.[item.spirit.trim().toLowerCase()]?.generic_type
+              // Session 14, Change 3: suppress a generic_type chip that says
+              // nothing item.category + item.spirit don't already say.
+              const showGenericType = genericType && !isGenericTypeRedundant(item.spirit, item.category, genericType)
               return (
                 <div key={i} onClick={() => setDrawerItem({ ingredient: item.spirit, location: item.location })} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', background: C.surface, borderRadius: 8, flexWrap: 'wrap', cursor: 'pointer' }}>
                   <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: item.oos ? C.amber : C.green, flexShrink: 0 }} />
                   <span style={{ fontSize: 14, flex: 1, minWidth: 120 }}>{item.spirit}</span>
                   {item.subLocation && <span style={{ fontSize: 12, color: C.textMuted }}>{item.subLocation}</span>}
                   {item.category && <span style={{ fontSize: 11, color: C.textMuted, background: C.border, borderRadius: 4, padding: '2px 6px' }}>{item.category}</span>}
-                  {genericType && <span style={{ fontSize: 11, fontWeight: 600, color: C.gold, background: C.gold + '15', border: `1px solid ${C.gold}33`, borderRadius: 4, padding: '2px 6px' }}>{genericType}</span>}
+                  {showGenericType && <span style={{ fontSize: 11, fontWeight: 600, color: C.gold, background: C.gold + '15', border: `1px solid ${C.gold}33`, borderRadius: 4, padding: '2px 6px' }}>{genericType}</span>}
                   {item.oos && <span style={{ fontSize: 11, fontWeight: 700, color: C.amber }}>OOS</span>}
                   {isExpired && <span style={{ fontSize: 11, fontWeight: 700, color: C.red, background: C.red + '18', border: `1px solid ${C.red}44`, borderRadius: 4, padding: '2px 6px' }}>Exp {expiry.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' })}</span>}
                   {expiringSoon && <span style={{ fontSize: 11, fontWeight: 700, color: C.amber, background: C.amber + '18', border: `1px solid ${C.amber}44`, borderRadius: 4, padding: '2px 6px' }}>Exp {expiry.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' })}</span>}
@@ -5408,7 +5544,11 @@ Rules:
       )?.tag.generic_type
       if (!resolvedType) return []
       const normType = normalizeForMatch(resolvedType)
-      return owned.filter(({ tag }) => normalizeForMatch(tag.generic_type) === normType).map(({ item }) => item)
+      const matches = owned.filter(({ tag }) => normalizeForMatch(tag.generic_type) === normType).map(({ item }) => item)
+      // Session 14, Change 4: a backup bottle (same product, second location)
+      // is correct at the tagging layer but noise in this pick-one list —
+      // collapse it to one row before the drawer ever sees it.
+      return dedupeBottlesByName(matches)
     }
 
     // Spirit chips always open the drawer, owned or not — the drawer itself
