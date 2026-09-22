@@ -76,6 +76,13 @@
 // alter table to_make add column if not exists replacements jsonb default '[]';
 // alter table to_make add column if not exists name_user_supplied boolean default false;
 //
+// Session 16: "Reset Tried" on replace (Change 3) would need a tried/tried_at
+// pair on favorites/to_make (mirroring exploration_nodes' own shape) to have
+// anywhere to reset. Held, not applied — Tried stays a whiteboard-node-only
+// concept for now, so the reset in handleReplaceDecision is a no-op rather
+// than a write against columns that don't exist. Revisit if Tried is ever
+// wanted on the Saved screen itself.
+//
 // create table if not exists in_the_lab (
 //   id uuid default gen_random_uuid() primary key,
 //   user_id uuid references auth.users not null,
@@ -2175,6 +2182,13 @@ Return ONLY valid JSON, no markdown fences:
 }
 
 async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, tastingContext) {
+  // Session 16, Change 3: only relevant when this suggestion is itself a
+  // documented drink — a riff/original adjustment doesn't need this, since
+  // adjusting an invented drink doesn't misrepresent anything. Conditional
+  // so the prompt doesn't carry irrelevant instructions for the common case.
+  const demotionNamingNote = (suggestion?.origin === 'published' || suggestion?.origin === 'published_variation')
+    ? `\n\nThis is currently a documented, published recipe (${suggestion.recipe_name}). If your adjustment changes it into your own variation rather than the documented build, give it a new name that reflects the change — never return the original published name for a build that's no longer that published recipe.`
+    : ''
   const body = {
     model: MODEL,
     max_tokens: 1500,
@@ -2185,7 +2199,7 @@ async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, ta
 Current suggestion:
 ${JSON.stringify(stripInternalFields(suggestion), null, 2)}
 
-The user's feedback: "${feedbackText}"${tastingContext ? `\n\n${tastingContext}` : ''}
+The user's feedback: "${feedbackText}"${tastingContext ? `\n\n${tastingContext}` : ''}${demotionNamingNote}
 
 BAR INVENTORY:
 ${inventoryText}
@@ -2873,6 +2887,39 @@ function formatLineageLine(parentRecipe, replacements) {
   return `${article} ${parentRecipe} with ${clauses.join(' and ')}.`
 }
 
+// Session 15, 3d's rule, generalized: once a drink leaves tier-1 it cannot
+// return — a published or published_variation parent's tweak is a riff (a
+// canonical formula with a part changed is the definition of a riff), any
+// other origin's tweak stays what it was. Was inline in handleTweakApply
+// (Explorations tweak); Session 16 needed the identical check for Adjust's
+// replace-a-saved-recipe path (Change 3), so it's shared here rather than
+// re-implemented a second time with a chance to drift from the first.
+function demotesToRiff(origin) {
+  return origin === 'published' || origin === 'published_variation'
+}
+
+// Session 16, Change 3 ("On keeping both"): numbers a kept variation within
+// its own name family — "{name} v2", next unused number, flat (a variation
+// of v2 is v3, never v2.1). baseName is the family's root, recovered by
+// stripping any existing " vN" suffix off the name being varied, so varying
+// an already-numbered v2 stays in the same family instead of starting a new
+// "v2 v2". existingNames is whatever list this recipe lives in (to_make or
+// favorites' own recipe_name values) — name matching here is deliberate and
+// safe: this only numbers a display label, it never decides what gets
+// saved, removed, or overwritten.
+function nextVariantName(name, existingNames) {
+  const m = (name || '').match(/^(.*) v(\d+)$/)
+  const baseName = m ? m[1] : (name || '')
+  const re = new RegExp(`^${baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} v(\\d+)$`)
+  let maxN = 1
+  for (const existing of existingNames || []) {
+    if (existing === baseName) maxN = Math.max(maxN, 1)
+    const mm = (existing || '').match(re)
+    if (mm) maxN = Math.max(maxN, parseInt(mm[1], 10))
+  }
+  return `${baseName} v${maxN + 1}`
+}
+
 // Session 15, Change 4: one control, two labels. Both a riff/original's name
 // and a published recipe's name become editable through the exact same
 // inline-edit mechanism — the label is the only thing that differs, because
@@ -2950,7 +2997,7 @@ function DifficultyBadge({ difficulty }) {
 // ─── Results ──────────────────────────────────────────────────────────────────
 
 // TODO: unify with shared RecipeCard once the Analyze/Name/Menu flow is in scope (Session 1.5)
-function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onToggleFavorite, toMake, onToggleToMake, onFeedback, feedbackLoading, inventory, feedbackError, onOpenAttributionEdit, onRename }) {
+function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onSaveFavorite, toMake, onSaveToMake, onFeedback, feedbackLoading, inventory, feedbackError, onOpenAttributionEdit, onRename, pendingReplace, onReplaceDecision }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
   const adjustmentNoteRef = useRef(null)
@@ -2987,8 +3034,14 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
   }
   const ingredientCount = result.ingredients?.length || 0
   const variationCount = result.variations?.length || 0
-  const isFav = favorites.some(f => f.recipeName === result.recipe_name)
-  const isToMake = toMake.some(f => f.recipeName === result.recipe_name)
+  // Session 16, Change 1: matched by id (toMakeId/favoriteId, tracked
+  // separately — see viewToMake/viewFavorite), never by recipe_name. A name
+  // match here was the other half of the data-loss bug: this drove which
+  // label the button showed, and the click handler underneath it (before
+  // Change 2) deleted on a second tap regardless of which list the name
+  // happened to match in.
+  const isFav = !!result.favoriteId && favorites.some(f => f.id === result.favoriteId)
+  const isToMake = !!result.toMakeId && toMake.some(f => f.id === result.toMakeId)
 
   const handleFeedbackSubmit = async () => {
     if (!feedbackText.trim()) return
@@ -2996,13 +3049,20 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
     if (ok) setFeedbackText('')
   }
 
+  // Session 16, Change 2: save only ever inserts now (see saveToMake/
+  // saveFavorite) — these handlers are only reachable at all when NOT
+  // already saved, since the button itself becomes a static "Saved"
+  // indicator once isToMake/isFav is true (below). Guarded here too, same
+  // defensive-early-return reasoning as RecipeCard's handleOnDeck.
   const handleToggleToMake = async () => {
+    if (isToMake) return
     setSaveError(null)
-    try { await onToggleToMake(result) } catch (err) { setSaveError(err.message || 'Could not save this recipe. Please try again.') }
+    try { await onSaveToMake(result) } catch (err) { setSaveError(err.message || 'Could not save this recipe. Please try again.') }
   }
   const handleToggleFavorite = async () => {
+    if (isFav) return
     setSaveError(null)
-    try { await onToggleFavorite(result) } catch (err) { setSaveError(err.message || 'Could not save this recipe. Please try again.') }
+    try { await onSaveFavorite(result) } catch (err) { setSaveError(err.message || 'Could not save this recipe. Please try again.') }
   }
 
   return (
@@ -3018,20 +3078,46 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
       {result.origin === 'riff' && result.parentRecipe && (
         <p style={{ fontSize: 13, color: C.textFaint, marginTop: -4, marginBottom: 10 }}>{formatLineageLine(result.parentRecipe, result.replacements)}</p>
       )}
-      {/* Action buttons */}
+      {/* Session 16, Change 3 ("On keeping both"): the number in the name
+          gives a kept variation its identity; this says what it actually is. */}
+      {result.tweakLabel && (
+        <p style={{ fontSize: 13, color: C.textFaint, marginTop: -4, marginBottom: 10, fontStyle: 'italic' }}>{result.tweakLabel}</p>
+      )}
+      {/* Session 16, Change 3: appears once a modification to a saved recipe
+          completes — the user decides with the revised result already in
+          front of them, per the session brief. */}
+      {pendingReplace && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', background: C.gold + '18', border: `1px solid ${C.gold}44`, borderRadius: 10, padding: '12px 16px', marginBottom: 16 }}>
+          <span style={{ fontSize: 14, color: C.text, flex: 1, minWidth: 200 }}>Replace this saved recipe with the adjusted version?</span>
+          <button onClick={() => onReplaceDecision(true)} style={{ background: C.gold, border: 'none', borderRadius: 8, color: '#0f0f0f', fontSize: 13, fontWeight: 700, padding: '7px 14px', cursor: 'pointer' }}>Yes, replace</button>
+          <button onClick={() => onReplaceDecision(false)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.textMuted, fontSize: 13, padding: '7px 14px', cursor: 'pointer' }}>No, keep both</button>
+        </div>
+      )}
+      {/* Action buttons — Session 16, Change 2: once saved, this is a static
+          indicator, not a button. There is no tap that turns "Saved" back
+          into "not saved" here; that only ever happens through the explicit
+          × control on ToMakeCard/FavoriteCard. */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
-        <button
-          onClick={handleToggleToMake}
-          style={{ background: 'none', border: `1px solid ${isToMake ? C.blue : C.border}`, borderRadius: 20, color: isToMake ? C.blue : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
-        >
-          {isToMake ? '🍹 Saved to On Deck' : '🍹 On Deck'}
-        </button>
-        <button
-          onClick={handleToggleFavorite}
-          style={{ background: 'none', border: `1px solid ${isFav ? C.gold : C.border}`, borderRadius: 20, color: isFav ? C.gold : C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
-        >
-          {isFav ? '♥ Saved' : '♡ Save to Favorites'}
-        </button>
+        {isToMake ? (
+          <div style={{ fontSize: 13, color: C.blue, padding: '6px 14px' }}>🍹 Saved to On Deck</div>
+        ) : (
+          <button
+            onClick={handleToggleToMake}
+            style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
+          >
+            🍹 On Deck
+          </button>
+        )}
+        {isFav ? (
+          <div style={{ fontSize: 13, color: C.gold, padding: '6px 14px' }}>♥ Saved</div>
+        ) : (
+          <button
+            onClick={handleToggleFavorite}
+            style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
+          >
+            ♡ Save to Favorites
+          </button>
+        )}
       </div>
       {saveError && <div style={{ fontSize: 13, color: C.red, marginBottom: 12 }}>{saveError}</div>}
 
@@ -4043,9 +4129,10 @@ function RecipeCard({
   onDetailFetched = null,
   isNew = false,
   onRename = null,
+  toMake = null,
+  onSaved = null,
 }) {
   const [expanded, setExpanded] = useState(!!autoExpand)
-  const [savedTo, setSavedTo] = useState(null)
   const [saveError, setSaveError] = useState(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState(false)
@@ -4071,6 +4158,15 @@ function RecipeCard({
   // handleRecipeRename) shows correctly without the user re-typing it.
   const [nameOverride, setNameOverride] = useState(suggestion.display_name ?? null)
   const [nameUserSupplied, setNameUserSupplied] = useState(suggestion.name_user_supplied === true)
+  // Session 16, Change 1: same override shape as nameOverride above, same
+  // reason — "is this saved" must be DERIVED from the real to_make list by
+  // id every render, never from local state that resets to null on every
+  // mount (that reset, combined with the old save button being a toggle,
+  // is exactly what deleted "Astor Blanc" — see the Session 16 investigation).
+  // Seeded from suggestion.to_make_id so a restored whiteboard node (which
+  // persists a save the same way it persists a rename, see handleRecipeSaved)
+  // correctly shows as saved without the id needing to be looked up by name.
+  const [toMakeIdOverride, setToMakeIdOverride] = useState(suggestion.to_make_id ?? null)
   const recipeNodeIdRef = useRef(restoreRecipeNodeId || recipeNodeIds?.[suggestion.recipe_name] || null)
   const cardRef = useRef(null)
   const pendingTriedRef = useRef(null)
@@ -4118,6 +4214,14 @@ function RecipeCard({
   const displayed = effectiveName
     ? { ...baseDisplayed, recipe_name: effectiveName, name_user_supplied: nameUserSupplied || baseDisplayed.name_user_supplied === true }
     : baseDisplayed
+  // Session 16, Change 1: matched by id against the real toMake list, not by
+  // name and not by a local flag — self-healing (if the row is ever removed
+  // via the × control, this correctly flips back to unsaved on the next
+  // render, no special-casing needed) and correct across a remount (the id
+  // survives in suggestion.to_make_id via the same node-payload persistence
+  // rename already uses, see handleRecipeSaved).
+  const toMakeId = toMakeIdOverride ?? baseDisplayed.to_make_id ?? null
+  const isSaved = !!toMakeId && (toMake || []).some(t => t.id === toMakeId)
 
   // Sync ref when eager recipe-node writes complete after cards have already rendered.
   // Flush any tried/notes/rename mutations that arrived before the ID was known.
@@ -4193,13 +4297,26 @@ function RecipeCard({
   // (rendered only inside the expanded section) wouldn't be visible on a
   // still-collapsed card.
   const [onDeckSaving, setOnDeckSaving] = useState(false)
+  // Session 16, Change 2: guarded by isSaved so this is unreachable in the
+  // normal flow (the button itself becomes a static "Saved" indicator once
+  // isSaved is true — see the render below), but kept as a defensive
+  // early-return too: there is now no code path left, anywhere, where tapping
+  // Save on an already-saved recipe can turn into a delete.
   const handleOnDeck = async () => {
+    if (isSaved) return
     setSaveError(null)
     setOnDeckSaving(true)
     try {
       const full = await ensureDetail()
-      await onSaveOnDeck(full, primaryIngredients)
-      setSavedTo('ondeck')
+      const newId = await onSaveOnDeck(full, primaryIngredients)
+      setToMakeIdOverride(newId ?? null)
+      // Session 16, Change 1: lifts the new id to ExplorationsScreen the same
+      // way handleRename lifts a rename — onSaved persists it onto this
+      // suggestion's own exploration_node (and best-effort into the sibling
+      // recipe_list), so a later remount (navigate to Saved, back via In
+      // Progress — the exact sequence that triggered the original bug) still
+      // knows this card is saved without ever comparing names.
+      onSaved?.(suggestion.recipe_name, newId ?? null)
     } catch (err) {
       setSaveError(err?.message || 'Could not save to On Deck.')
     } finally {
@@ -4327,9 +4444,8 @@ function RecipeCard({
     // "Correct the name" on an already-tweaked drink that is no longer the sourced
     // recipe it started as — caught while wiring Change 4's origin-based rename label.
     const parentOrigin = displayed.origin
-    const demotesToRiff = parentOrigin === 'published' || parentOrigin === 'published_variation'
     const stampedResult = parentOrigin
-      ? { ...result, origin: demotesToRiff ? 'riff' : parentOrigin, parent_recipe: null, replacements: null }
+      ? { ...result, origin: demotesToRiff(parentOrigin) ? 'riff' : parentOrigin, parent_recipe: null, replacements: null }
       : result
     setTweakedSuggestion(stampedResult)
     setTweakDone(true)
@@ -4346,6 +4462,11 @@ function RecipeCard({
     // model-provided name on the fresh tweak result is what displays until renamed again.
     setNameOverride(null)
     setNameUserSupplied(false)
+    // Session 16, Change 1: same reasoning — the tweak is untasted AND unsaved.
+    // The parent's to_make_id belongs to the parent's exact content; carrying it
+    // forward would make the tweaked card show as already-saved when the saved
+    // row is actually still the pre-tweak version.
+    setToMakeIdOverride(null)
     if (user && whiteboardId && parentNodeId) {
       try {
         const payload = conversation?.length > 0
@@ -4511,7 +4632,7 @@ function RecipeCard({
           style={{ background: tried ? C.green + '22' : 'none', border: `1px solid ${tried ? C.green : C.border}`, borderRadius: 20, color: tried ? C.green : C.textMuted, fontSize: 12, fontWeight: tried ? 700 : 400, padding: '4px 12px', cursor: 'pointer', transition: 'all 0.15s' }}>
           {tried ? '✓ Tried' : 'Mark Tried'}
         </button>
-        {showSaveButtons && (savedTo ? (
+        {showSaveButtons && (isSaved ? (
           <div style={{ fontSize: 13, color: C.textFaint }}>✓ Saved to On Deck</div>
         ) : (
           <button onClick={handleOnDeck} disabled={onDeckSaving}
@@ -4615,7 +4736,7 @@ function TemplateInfoSheet({ template, onClose }) {
   )
 }
 
-function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnDeck, user, pendingRestore, onRestoreConsumed, onBackToInProgress, onOpenWhiteboard }) {
+function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnDeck, toMake, user, pendingRestore, onRestoreConsumed, onBackToInProgress, onOpenWhiteboard }) {
   const [step, setStep] = useState('ingredients')
   const [navStack, setNavStack] = useState([])
   const [selected, setSelected] = useState([])
@@ -4845,6 +4966,53 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       const updatedList = result.suggestions.map(x => x.recipe_name === originalName ? renamedSuggestion : x)
       supabase.from('exploration_nodes').update({ payload: { recipes: updatedList } }).eq('id', currentRecipeListNodeId)
         .then(({ error }) => { if (error) console.warn('[rename] sibling list sync failed (non-fatal, primary save already succeeded):', error.message) })
+    }
+  }
+
+  // Session 16, Change 1: the save-side twin of handleRecipeRename above —
+  // identical shape, identical reasoning (primary write to this suggestion's
+  // own node by stable id; best-effort sibling-list sync so a restored
+  // sibling card also shows as saved). This is what makes RecipeCard's
+  // isSaved check survive a remount: without persisting to_make_id
+  // somewhere durable, a fresh mount (navigate to Saved and back via In
+  // Progress — the exact sequence in the original bug) would have nothing to
+  // derive "already saved" from at all.
+  const handleRecipeSaved = async (originalName, newId) => {
+    const nodeId = currentRecipeNodeIds[originalName]
+    const existing = (result?.suggestions || []).find(x => x.recipe_name === originalName)
+    const savedSuggestion = existing
+      ? { ...existing, to_make_id: newId }
+      : { recipe_name: originalName, to_make_id: newId }
+    const nodePayload = { recipe: savedSuggestion }
+
+    if (nodeId && user) {
+      const { error } = await supabase.from('exploration_nodes').update({ payload: nodePayload }).eq('id', nodeId)
+      if (error) { console.warn('[save] node persist failed (non-fatal, to_make row already saved):', error.message) }
+    } else if (user && currentWhiteboardId && currentRecipeListNodeId) {
+      try {
+        const { data, error } = await supabase.from('exploration_nodes')
+          .insert({ whiteboard_id: currentWhiteboardId, parent_node_id: currentRecipeListNodeId, node_type: 'recipe', payload: nodePayload })
+          .select('id').single()
+        if (error) throw error
+        if (data?.id) setCurrentRecipeNodeIds(prev => ({ ...prev, [originalName]: data.id }))
+      } catch (err) {
+        console.warn('[save] node create failed (non-fatal, to_make row already saved):', err.message)
+      }
+    }
+    // Unlike rename, a failure here is never re-thrown to the caller — the
+    // to_make insert this follows has already succeeded and must not be
+    // reported as failed just because the node-side bookkeeping didn't land.
+    // Worst case if this fails: the card shows as unsaved again after a
+    // remount, which is the pre-existing (if wrong) behavior, not a new one.
+
+    setResult(prev => prev ? {
+      ...prev,
+      suggestions: (prev.suggestions || []).map(x => x.recipe_name === originalName ? savedSuggestion : x),
+    } : prev)
+    if (user && currentRecipeListNodeId && result?.suggestions) {
+      const updatedList = result.suggestions.map(x => x.recipe_name === originalName ? savedSuggestion : x)
+      supabase.from('exploration_nodes').update({ payload: { recipes: updatedList } }).eq('id', currentRecipeListNodeId)
+        .then(({ error }) => { if (error) console.warn('[save] sibling list sync failed (non-fatal):', error.message) })
     }
   }
 
@@ -6296,7 +6464,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} /></div> })}
+                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} toMake={toMake} onSaved={(name, id) => handleRecipeSaved(name, id)} /></div> })}
               </div>
             </div>
           )}
@@ -6304,7 +6472,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Shopping Required ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} /></div> })}
+                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} toMake={toMake} onSaved={(name, id) => handleRecipeSaved(name, id)} /></div> })}
               </div>
             </div>
           )}
@@ -6905,7 +7073,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
   )
 }
 
-function CreateScreen({ createSubTab, setCreateSubTab, inventory, inventoryText, inventoryTags, onSaveOnDeck, user, pendingRestore, onRestoreConsumed, onBackToInProgress, onOpenWhiteboard }) {
+function CreateScreen({ createSubTab, setCreateSubTab, inventory, inventoryText, inventoryTags, onSaveOnDeck, toMake, user, pendingRestore, onRestoreConsumed, onBackToInProgress, onOpenWhiteboard }) {
   return (
     <div>
       <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 16 }}>Create</div>
@@ -6923,6 +7091,7 @@ function CreateScreen({ createSubTab, setCreateSubTab, inventory, inventoryText,
           inventoryText={inventoryText}
           inventoryTags={inventoryTags}
           onSaveOnDeck={onSaveOnDeck}
+          toMake={toMake}
           user={user}
           pendingRestore={pendingRestore}
           onRestoreConsumed={onRestoreConsumed}
@@ -7123,6 +7292,13 @@ export default function App() {
   const [feedbackLoading, setFeedbackLoading] = useState(false)
   const [adjustmentNote, setAdjustmentNote] = useState(null)
   const [resultSource, setResultSource] = useState(null) // 'ondeck' | 'favorites' | null
+  // Session 16, Change 3: set once a modification to a SAVED recipe completes,
+  // holding what handleReplaceDecision needs to either update the original
+  // row in place or leave it untouched — { table, id, originalName,
+  // originalNameUserSupplied }. null means either nothing is pending, or the
+  // recipe being adjusted isn't actually saved (Test 12: adjusting something
+  // unsaved never shows this prompt at all).
+  const [pendingReplace, setPendingReplace] = useState(null)
   const sourceScrollRef = useRef(0)
   const [sharedImage, setSharedImage] = useState(null) // pending share-target file awaiting mode selection
 
@@ -7380,43 +7556,45 @@ export default function App() {
   }
 
   // Favorites helpers
-  const toggleFavorite = async (res, extras = {}) => {
+  // Session 16, Change 2: this used to be toggleFavorite — save and delete
+  // the same control, matched by recipe_name. That's the root of the
+  // data-loss bug (see Session 16 investigation): a second save on a
+  // recipe whose name already matched something in `favorites` silently
+  // deleted it instead of saving. Save now only ever inserts. The only way
+  // to remove a favorite is the explicit, clearly-labeled × control
+  // (removeFavorite below), unchanged. Returns the saved row's id (or the
+  // local id, signed out) so the caller can track "is this exact row still
+  // there" by id going forward — never by name again.
+  const saveFavorite = async (res, extras = {}) => {
     const {
       source = 'manual', origin = null, originFlag = null, difficulty = null, primaryIngredients = [],
       creator = null, bar = null, year = null, attributionSource = null, attributionUserSupplied = false,
       parentRecipe = null, replacements = null, nameUserSupplied = false,
     } = extras
     if (user) {
-      const existing = favorites.find(f => f.recipeName === res.recipe_name)
-      if (existing) {
-        await supabase.from('favorites').delete().eq('id', existing.id)
-        setFavorites(prev => prev.filter(f => f.id !== existing.id))
-      } else {
-        const { data, error } = await supabase.from('favorites').insert({
-          user_id: user.id, recipe_name: res.recipe_name, summary: res.summary || null,
-          recipe: res.recipe || [], instructions: res.instructions || null,
-          ingredients: res.ingredients || [], variations: res.variations || [],
-          glass_type: res.glass_type || null, source, origin, origin_flag: originFlag,
-          difficulty, primary_ingredients: primaryIngredients, saved_at: new Date().toISOString(),
-          creator, bar, year, attribution_source: attributionSource, attribution_user_supplied: attributionUserSupplied,
-          parent_recipe: parentRecipe, replacements, name_user_supplied: nameUserSupplied,
-        }).select().single()
-        // 3d's insert silently no-op'd against a missing column while the UI
-        // still claimed success. Throw instead — a write that didn't happen
-        // must never be reported as one that did.
-        if (error) {
-          const err = new Error(error.message || 'Could not save this recipe. Please try again.')
-          err.code = 'db_write_failed'
-          throw err
-        }
-        if (data) setFavorites(prev => [dbFavToLocal(data), ...prev])
+      const { data, error } = await supabase.from('favorites').insert({
+        user_id: user.id, recipe_name: res.recipe_name, summary: res.summary || null,
+        recipe: res.recipe || [], instructions: res.instructions || null,
+        ingredients: res.ingredients || [], variations: res.variations || [],
+        glass_type: res.glass_type || null, source, origin, origin_flag: originFlag,
+        difficulty, primary_ingredients: primaryIngredients, saved_at: new Date().toISOString(),
+        creator, bar, year, attribution_source: attributionSource, attribution_user_supplied: attributionUserSupplied,
+        parent_recipe: parentRecipe, replacements, name_user_supplied: nameUserSupplied,
+      }).select().single()
+      // 3d's insert silently no-op'd against a missing column while the UI
+      // still claimed success. Throw instead — a write that didn't happen
+      // must never be reported as one that did.
+      if (error) {
+        const err = new Error(error.message || 'Could not save this recipe. Please try again.')
+        err.code = 'db_write_failed'
+        throw err
       }
+      if (data) setFavorites(prev => [dbFavToLocal(data), ...prev])
+      return data?.id ?? null
     } else {
-      setFavorites(prev => {
-        const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
-        if (existing >= 0) return prev.filter((_, i) => i !== existing)
-        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, note: '', source, origin, originFlag, difficulty, primaryIngredients, creator, bar, year, attributionSource, attributionUserSupplied, parentRecipe, replacements, nameUserSupplied, savedAt: new Date().toISOString() }, ...prev]
-      })
+      const id = Date.now()
+      setFavorites(prev => [{ id, recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, note: '', source, origin, originFlag, difficulty, primaryIngredients, creator, bar, year, attributionSource, attributionUserSupplied, parentRecipe, replacements, nameUserSupplied, savedAt: new Date().toISOString() }, ...prev])
+      return id
     }
   }
 
@@ -7459,42 +7637,41 @@ export default function App() {
   }
 
   // To Make helpers
-  const toggleToMake = async (res, extras = {}) => {
+  // Session 16, Change 2: to_make's own saveFavorite analog — see that
+  // function's comment for why this is insert-only now. This exact function,
+  // under its old name toggleToMake, is what deleted "Astor Blanc" 94 seconds
+  // after saving it: the toggle's existing-by-name branch fired on a second
+  // call, and there was no confirmation and no distinct update path. Removal
+  // stays exclusively on removeFromToMake (the × control), unchanged.
+  const saveToMake = async (res, extras = {}) => {
     const {
       source = 'manual', origin = null, originFlag = null, difficulty = null, primaryIngredients = [],
       creator = null, bar = null, year = null, attributionSource = null, attributionUserSupplied = false,
       parentRecipe = null, replacements = null, nameUserSupplied = false,
     } = extras
     if (user) {
-      const existing = toMake.find(f => f.recipeName === res.recipe_name)
-      if (existing) {
-        await supabase.from('to_make').delete().eq('id', existing.id)
-        setToMake(prev => prev.filter(f => f.id !== existing.id))
-      } else {
-        const { data, error } = await supabase.from('to_make').insert({
-          user_id: user.id, recipe_name: res.recipe_name, summary: res.summary || null,
-          recipe: res.recipe || [], instructions: res.instructions || null,
-          ingredients: res.ingredients || [], variations: res.variations || [],
-          glass_type: res.glass_type || null, source, origin, origin_flag: originFlag,
-          difficulty, primary_ingredients: primaryIngredients, saved_at: new Date().toISOString(),
-          creator, bar, year, attribution_source: attributionSource, attribution_user_supplied: attributionUserSupplied,
-          parent_recipe: parentRecipe, replacements, name_user_supplied: nameUserSupplied,
-        }).select().single()
-        // Same failure as 3d, avoided the same way: a write that didn't
-        // happen must never be reported as one that did.
-        if (error) {
-          const err = new Error(error.message || 'Could not save this recipe. Please try again.')
-          err.code = 'db_write_failed'
-          throw err
-        }
-        if (data) setToMake(prev => [dbToMakeToLocal(data), ...prev])
+      const { data, error } = await supabase.from('to_make').insert({
+        user_id: user.id, recipe_name: res.recipe_name, summary: res.summary || null,
+        recipe: res.recipe || [], instructions: res.instructions || null,
+        ingredients: res.ingredients || [], variations: res.variations || [],
+        glass_type: res.glass_type || null, source, origin, origin_flag: originFlag,
+        difficulty, primary_ingredients: primaryIngredients, saved_at: new Date().toISOString(),
+        creator, bar, year, attribution_source: attributionSource, attribution_user_supplied: attributionUserSupplied,
+        parent_recipe: parentRecipe, replacements, name_user_supplied: nameUserSupplied,
+      }).select().single()
+      // Same failure as 3d, avoided the same way: a write that didn't
+      // happen must never be reported as one that did.
+      if (error) {
+        const err = new Error(error.message || 'Could not save this recipe. Please try again.')
+        err.code = 'db_write_failed'
+        throw err
       }
+      if (data) setToMake(prev => [dbToMakeToLocal(data), ...prev])
+      return data?.id ?? null
     } else {
-      setToMake(prev => {
-        const existing = prev.findIndex(f => f.recipeName === res.recipe_name)
-        if (existing >= 0) return prev.filter((_, i) => i !== existing)
-        return [{ id: Date.now(), recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, source, origin, originFlag, difficulty, primaryIngredients, creator, bar, year, attributionSource, attributionUserSupplied, parentRecipe, replacements, nameUserSupplied, savedAt: new Date().toISOString() }, ...prev]
-      })
+      const id = Date.now()
+      setToMake(prev => [{ id, recipeName: res.recipe_name, summary: res.summary, recipe: res.recipe, instructions: res.instructions || null, ingredients: res.ingredients, variations: res.variations, glassType: res.glass_type || null, source, origin, originFlag, difficulty, primaryIngredients, creator, bar, year, attributionSource, attributionUserSupplied, parentRecipe, replacements, nameUserSupplied, savedAt: new Date().toISOString() }, ...prev])
+      return id
     }
   }
 
@@ -7517,10 +7694,24 @@ export default function App() {
     setToMake(prev => prev.map(f => f.id === id ? { ...f, recipeName: name, nameUserSupplied: true } : f))
   }
 
+  // Session 16, Change 1: toMakeId/favoriteId are the two id fields Results
+  // matches "is this saved" against (id, never recipe_name — see the Session
+  // 16 investigation). They're tracked separately, not aliased to a single
+  // `result.id`, because a recipe viewed from one list can independently be
+  // saved to the other (Save to Favorites while viewing something opened
+  // from On Deck) — that needs its own id, distinct from the one it was
+  // opened with. Opening from a specific list always knows THAT list's id;
+  // the other one starts null. There is no cross-reference between to_make
+  // and favorites in the schema (never has been), so if this exact drink was
+  // independently saved to the other list before, that's genuinely not
+  // knowable here without a name guess — deliberately not attempted (see the
+  // Session 16 report on remaining name-matches). Saving it fresh from this
+  // view still works correctly, it just doesn't retroactively detect a prior,
+  // separately-made save under the same name.
   const viewToMake = (item) => {
     sourceScrollRef.current = window.scrollY
     setError(null); setAdjustmentNote(null)
-    setResult({ id: item.id, recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType, origin: item.origin, origin_flag: item.originFlag, difficulty: item.difficulty, source: item.source, creator: item.creator, bar: item.bar, year: item.year, attributionSource: item.attributionSource, attributionUserSupplied: item.attributionUserSupplied, parentRecipe: item.parentRecipe, replacements: item.replacements, nameUserSupplied: item.nameUserSupplied })
+    setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType, origin: item.origin, origin_flag: item.originFlag, difficulty: item.difficulty, source: item.source, creator: item.creator, bar: item.bar, year: item.year, attributionSource: item.attributionSource, attributionUserSupplied: item.attributionUserSupplied, parentRecipe: item.parentRecipe, replacements: item.replacements, nameUserSupplied: item.nameUserSupplied, toMakeId: item.id, favoriteId: null })
     setResultSource('ondeck')
     setScreen('detail')
   }
@@ -7528,7 +7719,7 @@ export default function App() {
   const viewFavorite = (fav) => {
     sourceScrollRef.current = window.scrollY
     setError(null); setAdjustmentNote(null)
-    setResult({ id: fav.id, recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType, origin: fav.origin, origin_flag: fav.originFlag, difficulty: fav.difficulty, source: fav.source, creator: fav.creator, bar: fav.bar, year: fav.year, attributionSource: fav.attributionSource, attributionUserSupplied: fav.attributionUserSupplied, parentRecipe: fav.parentRecipe, replacements: fav.replacements, nameUserSupplied: fav.nameUserSupplied })
+    setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType, origin: fav.origin, origin_flag: fav.originFlag, difficulty: fav.difficulty, source: fav.source, creator: fav.creator, bar: fav.bar, year: fav.year, attributionSource: fav.attributionSource, attributionUserSupplied: fav.attributionUserSupplied, parentRecipe: fav.parentRecipe, replacements: fav.replacements, nameUserSupplied: fav.nameUserSupplied, favoriteId: fav.id, toMakeId: null })
     setResultSource('favorites')
     setScreen('detail')
   }
@@ -7655,10 +7846,24 @@ export default function App() {
 
   const handleFeedback = async (feedbackText) => {
     if (!result) return false
+    // Session 16, Change 3: is the recipe actually being adjusted right now a
+    // SAVED one — matched by id, same rule as everywhere else this session
+    // (Change 1). Gates whether the replace prompt appears at all (Test 12:
+    // adjusting something unsaved must behave exactly as before, no prompt).
+    const savedTable = resultSource === 'ondeck' && result.toMakeId ? 'to_make' : resultSource === 'favorites' && result.favoriteId ? 'favorites' : null
+    const savedId = savedTable === 'to_make' ? result.toMakeId : savedTable === 'favorites' ? result.favoriteId : null
+    const isSaved = !!savedId
     setFeedbackLoading(true); setError(null)
     try {
       let revised
-      if (lastRequestBody) {
+      // Session 16: a saved recipe always goes through the single-suggestion
+      // path, never the lastRequestBody re-ask — that field can be stale
+      // from an earlier, unrelated Analyze-mode session (viewToMake/
+      // viewFavorite never clear it, a pre-existing gap this doesn't fix
+      // generally, only routes around for this flow), and the
+      // single-suggestion path is what reliably returns tweak_label, which
+      // Change 3's "keep both" naming needs.
+      if (!isSaved && lastRequestBody) {
         const feedbackBody = {
           model: MODEL,
           max_tokens: MAX_TOKENS,
@@ -7672,7 +7877,13 @@ export default function App() {
         setLastRequestBody(feedbackBody)
         setAdjustmentNote(revised.adjustment_note || null)
       } else {
-        revised = await tweakSingleSuggestion(result, feedbackText)
+        // Session 16: now passes inventoryText/tastingContext, which this
+        // call site never did — BAR INVENTORY was rendering as "undefined"
+        // in the prompt, silently defeating OWNERSHIP_STATUS_RULES for every
+        // On Deck/Favorites adjustment before this. Noticed while touching
+        // this exact call for Change 3; fixed in passing, not a behavior
+        // change to the ownership rules themselves, just the data reaching them.
+        revised = await tweakSingleSuggestion(result, feedbackText, inventoryText, null)
         setAdjustmentNote(null)
       }
       setError(null)
@@ -7681,12 +7892,25 @@ export default function App() {
       // to "return the same JSON structure," which means it may well echo
       // back its own guess rather than the user's correction. Protect at the
       // merge point rather than trusting the model to leave them alone.
-      // Session 15, Change 4: a user-supplied name gets the exact same
-      // protection, for the exact same reason — recipe_name is part of "the
-      // same JSON structure" handed back to the model too.
       let protectedRevised = result?.attributionUserSupplied
         ? { ...revised, creator: result.creator, bar: result.bar, year: result.year, attributionSource: result.attributionSource, attributionUserSupplied: true }
         : revised
+
+      if (isSaved) {
+        // Session 16, Change 3: name handling for a saved recipe is decided
+        // at replace/keep-both time (handleReplaceDecision), not here — the
+        // blanket "keep the user's name" protection below is for the
+        // unsaved path only, where there's no such decision to make.
+        setPendingReplace({ table: savedTable, id: savedId, originalName: result.recipe_name, originalNameUserSupplied: result.nameUserSupplied === true })
+        setResult(prev => prev ? { ...processResult(protectedRevised), toMakeId: prev.toMakeId, favoriteId: prev.favoriteId } : prev)
+        return true
+      }
+
+      // Session 15, Change 4: a user-supplied name gets the exact same
+      // protection as attribution, for the exact same reason — recipe_name
+      // is part of "the same JSON structure" handed back to the model too.
+      // Unsaved-only (see above): a saved recipe's name is decided by
+      // handleReplaceDecision instead.
       if (result?.nameUserSupplied) {
         protectedRevised = { ...protectedRevised, recipe_name: result.recipe_name, nameUserSupplied: true }
       }
@@ -7700,28 +7924,108 @@ export default function App() {
     }
   }
 
+  // Session 16, Change 3: throws on a real write failure, same as every
+  // other saved-recipe write this file makes (Session 7b/9's rule, kept).
+  const replaceSavedRecipe = async (table, id, fields) => {
+    if (user) {
+      const { error } = await supabase.from(table).update(fields).eq('id', id)
+      if (error) throw new Error(error.message || 'Could not save the replacement. Please try again.')
+    }
+  }
+
+  // Session 16, Change 3: the decision after handleFeedback has already shown
+  // the adjusted recipe (result now holds the revised content; pendingReplace
+  // holds what's needed to act on the ORIGINAL saved row).
+  const handleReplaceDecision = async (replace) => {
+    const decision = pendingReplace
+    if (!decision) return
+    setPendingReplace(null)
+    const { table, id, originalName, originalNameUserSupplied } = decision
+    const setter = table === 'to_make' ? setToMake : setFavorites
+    const idField = table === 'to_make' ? 'toMakeId' : 'favoriteId'
+
+    if (replace) {
+      // On replace rules, in order: keep the same row id (update in place,
+      // never delete-and-insert); reset Tried — held as a no-op for now,
+      // to_make/favorites have no tried column (see the file header), so
+      // there's nothing to reset yet; keep tasting notes (omitted from the
+      // update payload below, never touched); a Favorite stays a Favorite —
+      // this function only ever updates the table the recipe was already
+      // in; a published recipe demotes to riff under 3d and must not keep
+      // its canonical name (tweakSingleSuggestion was already asked not to,
+      // above — this is the guaranteed fallback if it didn't listen); the
+      // user's own rename outranks all of that, unconditionally.
+      const demote = demotesToRiff(result.origin)
+      let finalName = originalNameUserSupplied ? originalName : result.recipe_name
+      if (!originalNameUserSupplied && demote && finalName.trim().toLowerCase() === originalName.trim().toLowerCase()) {
+        finalName = `${finalName} (Riff)`
+      }
+      const fields = {
+        recipe_name: finalName, summary: result.summary || null,
+        recipe: result.recipe || [], instructions: result.instructions || null,
+        ingredients: result.ingredients || [], variations: result.variations || [],
+        glass_type: result.glass_type || null,
+        origin: demote ? 'riff' : result.origin, origin_flag: demote ? 'original' : result.origin_flag,
+        difficulty: result.difficulty || null,
+        parent_recipe: null, replacements: null,
+        name_user_supplied: originalNameUserSupplied,
+      }
+      try {
+        await replaceSavedRecipe(table, id, fields)
+      } catch (err) {
+        setError(err.message || 'Could not save the replacement. Please try again.')
+        return
+      }
+      setter(prev => prev.map(f => f.id === id ? { ...f, recipeName: finalName, summary: fields.summary, recipe: fields.recipe, instructions: fields.instructions, ingredients: fields.ingredients, variations: fields.variations, glassType: fields.glass_type, origin: fields.origin, originFlag: fields.origin_flag, difficulty: fields.difficulty, parentRecipe: null, replacements: null, nameUserSupplied: originalNameUserSupplied } : f))
+      setResult(prev => prev ? { ...prev, recipe_name: finalName, origin: fields.origin, origin_flag: fields.origin_flag, parentRecipe: null, replacements: null, nameUserSupplied: originalNameUserSupplied, [idField]: id } : prev)
+    } else {
+      // Session 16, Change 3 ("On keeping both"): the original is untouched
+      // (nothing to write — it was never modified). The just-shown variation
+      // needs a name that won't collide with it, or this recreates the exact
+      // name-collision problem behind the bug this session fixes.
+      const existingNames = (table === 'to_make' ? toMake : favorites).map(f => f.recipeName)
+      const variantName = nextVariantName(originalName, existingNames)
+      // Same 3d demotion as the replace branch above, for the same reason:
+      // an adjusted published recipe is no longer the documented build
+      // whether the user chose to replace the original or keep both. Not
+      // called out by name in the spec's "keeping both" bullets (those only
+      // cover naming), but demotesToRiff's own rule ("a published parent's
+      // tweak is a riff") doesn't carry a replace-vs-keep-both condition —
+      // this is applying that existing rule consistently, not adding a new one.
+      const demote = demotesToRiff(result.origin)
+      setResult(prev => prev ? {
+        ...prev, recipe_name: variantName, tweakLabel: prev.tweak_label || null, toMakeId: null, favoriteId: null,
+        origin: demote ? 'riff' : prev.origin, origin_flag: demote ? 'original' : prev.origin_flag,
+        nameUserSupplied: false,
+      } : prev)
+    }
+  }
+
   const [attributionDrawerOpen, setAttributionDrawerOpen] = useState(false)
   const [attributionSaving, setAttributionSaving] = useState(false)
   const [attributionError, setAttributionError] = useState(null)
 
   // Structured attribution edit — the Session 4 inventory drawer's affordance,
   // applied here. Writes through to the saved row when one exists (viewing an
-  // on-deck/favorite item sets result.id + resultSource); otherwise just
-  // updates the in-progress, not-yet-saved result, which will carry the edit
-  // through whenever it's eventually saved (toggleToMake/toggleFavorite
-  // already read these fields off the result the same way they read origin).
+  // on-deck/favorite item sets toMakeId/favoriteId + resultSource, Session 16);
+  // otherwise just updates the in-progress, not-yet-saved result, which will
+  // carry the edit through whenever it's eventually saved (saveToMake/
+  // saveFavorite already read these fields off the result the same way they
+  // read origin). Session 16: reads the resultSource-specific id, not a
+  // generic result.id — see viewToMake/viewFavorite for why there are two.
   const handleUpdateAttribution = async (fields) => {
     setAttributionSaving(true)
     setAttributionError(null)
     try {
       const withFlag = { ...fields, attributionUserSupplied: true }
-      if (result?.id && resultSource) {
+      const savedId = resultSource === 'ondeck' ? result?.toMakeId : resultSource === 'favorites' ? result?.favoriteId : null
+      if (savedId && resultSource) {
         const table = resultSource === 'ondeck' ? 'to_make' : 'favorites'
         if (user) {
           const { error } = await supabase.from(table).update({
             creator: fields.creator, bar: fields.bar, year: fields.year,
             attribution_source: fields.attributionSource, attribution_user_supplied: true,
-          }).eq('id', result.id)
+          }).eq('id', savedId)
           if (error) {
             const err = new Error(error.message || 'Could not save attribution. Please try again.')
             err.code = 'db_write_failed'
@@ -7729,7 +8033,7 @@ export default function App() {
           }
         }
         const setter = resultSource === 'ondeck' ? setToMake : setFavorites
-        setter(prev => prev.map(f => f.id === result.id ? { ...f, ...withFlag } : f))
+        setter(prev => prev.map(f => f.id === savedId ? { ...f, ...withFlag } : f))
       }
       setResult(prev => ({ ...prev, ...withFlag }))
       setAttributionDrawerOpen(false)
@@ -7747,14 +8051,15 @@ export default function App() {
   // write failure (not swallowed) so RenameControl's Save button can tell a
   // failed write from a successful one, same as everywhere else renaming lands.
   const handleRenameResult = async (newName) => {
-    if (result?.id && resultSource) {
+    const savedId = resultSource === 'ondeck' ? result?.toMakeId : resultSource === 'favorites' ? result?.favoriteId : null
+    if (savedId && resultSource) {
       const table = resultSource === 'ondeck' ? 'to_make' : 'favorites'
       if (user) {
-        const { error } = await supabase.from(table).update({ recipe_name: newName, name_user_supplied: true }).eq('id', result.id)
+        const { error } = await supabase.from(table).update({ recipe_name: newName, name_user_supplied: true }).eq('id', savedId)
         if (error) throw new Error(error.message || 'Could not save name.')
       }
       const setter = resultSource === 'ondeck' ? setToMake : setFavorites
-      setter(prev => prev.map(f => f.id === result.id ? { ...f, recipeName: newName, nameUserSupplied: true } : f))
+      setter(prev => prev.map(f => f.id === savedId ? { ...f, recipeName: newName, nameUserSupplied: true } : f))
     }
     setResult(prev => prev ? { ...prev, recipe_name: newName, nameUserSupplied: true } : prev)
   }
@@ -7801,9 +8106,11 @@ export default function App() {
 
   // Async and re-throws on failure (rather than swallowing) so RecipeCard's
   // save button can tell a real success from a failed write and stop
-  // reporting "Saved" when nothing persisted.
+  // reporting "Saved" when nothing persisted. Session 16: returns the saved
+  // row's id so RecipeCard can track "is this exact row still saved" by id
+  // (Change 1) instead of local state that resets on remount.
   const handleSaveOnDeckFromExploration = async (suggestion, primaryIngredients) => {
-    await toggleToMake({ recipe_name: suggestion.recipe_name, summary: suggestion.summary, recipe: suggestion.recipe, instructions: suggestion.instructions, ingredients: suggestion.ingredients, variations: suggestion.variations || [], glass_type: suggestion.glass_type }, { source: 'Exploration', origin: suggestion.origin, originFlag: suggestion.origin_flag, difficulty: suggestion.difficulty, primaryIngredients, creator: suggestion.creator, bar: suggestion.bar, year: suggestion.year, attributionSource: suggestion.attribution_source, parentRecipe: suggestion.parent_recipe, replacements: suggestion.replacements, nameUserSupplied: suggestion.name_user_supplied === true })
+    return await saveToMake({ recipe_name: suggestion.recipe_name, summary: suggestion.summary, recipe: suggestion.recipe, instructions: suggestion.instructions, ingredients: suggestion.ingredients, variations: suggestion.variations || [], glass_type: suggestion.glass_type }, { source: 'Exploration', origin: suggestion.origin, originFlag: suggestion.origin_flag, difficulty: suggestion.difficulty, primaryIngredients, creator: suggestion.creator, bar: suggestion.bar, year: suggestion.year, attributionSource: suggestion.attribution_source, parentRecipe: suggestion.parent_recipe, replacements: suggestion.replacements, nameUserSupplied: suggestion.name_user_supplied === true })
   }
 
   return (
@@ -7916,6 +8223,7 @@ export default function App() {
           inventoryText={inventoryText}
           inventoryTags={inventoryTags}
           onSaveOnDeck={handleSaveOnDeckFromExploration}
+          toMake={toMake}
           user={user}
           pendingRestore={pendingExplorationRestore}
           onRestoreConsumed={() => setPendingExplorationRestore(null)}
@@ -8023,15 +8331,23 @@ export default function App() {
             shoppingList={shoppingList}
             onAddToList={addToShopping}
             favorites={favorites}
-            onToggleFavorite={res => toggleFavorite(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty, creator: res.creator, bar: res.bar, year: res.year, attributionSource: res.attributionSource, attributionUserSupplied: res.attributionUserSupplied, parentRecipe: res.parentRecipe, replacements: res.replacements, nameUserSupplied: res.nameUserSupplied })}
+            onSaveFavorite={async res => {
+              const newId = await saveFavorite(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty, creator: res.creator, bar: res.bar, year: res.year, attributionSource: res.attributionSource, attributionUserSupplied: res.attributionUserSupplied, parentRecipe: res.parentRecipe, replacements: res.replacements, nameUserSupplied: res.nameUserSupplied })
+              setResult(prev => prev ? { ...prev, favoriteId: newId } : prev)
+            }}
             toMake={toMake}
-            onToggleToMake={res => toggleToMake(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty, creator: res.creator, bar: res.bar, year: res.year, attributionSource: res.attributionSource, attributionUserSupplied: res.attributionUserSupplied, parentRecipe: res.parentRecipe, replacements: res.replacements, nameUserSupplied: res.nameUserSupplied })}
+            onSaveToMake={async res => {
+              const newId = await saveToMake(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty, creator: res.creator, bar: res.bar, year: res.year, attributionSource: res.attributionSource, attributionUserSupplied: res.attributionUserSupplied, parentRecipe: res.parentRecipe, replacements: res.replacements, nameUserSupplied: res.nameUserSupplied })
+              setResult(prev => prev ? { ...prev, toMakeId: newId } : prev)
+            }}
             onFeedback={handleFeedback}
             feedbackLoading={feedbackLoading}
             inventory={inventory}
             feedbackError={error}
             onOpenAttributionEdit={() => setAttributionDrawerOpen(true)}
             onRename={handleRenameResult}
+            pendingReplace={pendingReplace}
+            onReplaceDecision={handleReplaceDecision}
           />
         </>
       )}
