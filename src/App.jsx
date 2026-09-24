@@ -3026,6 +3026,25 @@ function nextVariantName(name, existingNames) {
   return `${baseName} v${maxN + 1}`
 }
 
+// Session 18, Change 4: to_make/favorites both enforce UNIQUE(user_id,
+// recipe_name) at the database level (see the Session 18 investigation) —
+// that's the one durable identity rule the schema has, and code paths that
+// write recipe_name (save, rename) can still collide with it even after
+// Change 1's On-Deck/Favorites move and the rename pre-check below, e.g. a
+// name independently saved through a different path/session. Postgres error
+// code 23505 is the one reliable signal; everything else keeps the existing
+// generic message rather than guessing at a friendlier one it can't back up.
+function friendlySaveError(error, recipeName, listLabel) {
+  if (error?.code === '23505') {
+    const err = new Error(`You already have a recipe named "${recipeName}" in ${listLabel}.`)
+    err.code = 'duplicate_name'
+    return err
+  }
+  const err = new Error(error?.message || 'Could not save this recipe. Please try again.')
+  err.code = 'db_write_failed'
+  return err
+}
+
 // Session 15, Change 4: one control, two labels. Both a riff/original's name
 // and a published recipe's name become editable through the exact same
 // inline-edit mechanism — the label is the only thing that differs, because
@@ -3202,11 +3221,18 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
       {/* Action buttons — Session 16, Change 2: once saved, this is a static
           indicator, not a button. There is no tap that turns "Saved" back
           into "not saved" here; that only ever happens through the explicit
-          × control on ToMakeCard/FavoriteCard. */}
+          × control on ToMakeCard/FavoriteCard. Session 18: On Deck and
+          Favorites are now mutually exclusive (see Change 1) — once this
+          recipe is a Favorite, On Deck has nothing to offer or claim, so
+          neither the button nor the indicator renders at all. This is what
+          actually fixes the mislabelled-control bug from the Session 18
+          investigation (viewing a Favorite showed "🍹 On Deck" as a live
+          offer to save): there's no longer a control there to mislabel. */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
-        {isToMake ? (
+        {isToMake && (
           <div style={{ fontSize: 13, color: C.blue, padding: '6px 14px' }}>🍹 Saved to On Deck</div>
-        ) : (
+        )}
+        {!isToMake && !isFav && (
           <button
             onClick={handleToggleToMake}
             style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
@@ -3758,7 +3784,7 @@ function ToMakeCard({ item, onRemove, onView, onUpdateName }) {
 
 const SOURCE_OPTIONS = ['All', 'Recipe Screenshot', 'Bar Menu', 'Cocktail Name', 'Exploration']
 
-function SavedScreen({ savedSubTab, setSavedSubTab, toMake, favorites, onRemoveToMake, onRemoveFavorite, onViewToMake, onViewFavorite, onUpdateNote, onUpdateToMakeName, onUpdateFavoriteName }) {
+function SavedScreen({ savedSubTab, setSavedSubTab, toMake, favorites, onRemoveToMake, onRemoveFavorite, onViewToMake, onViewFavorite, onUpdateNote, onUpdateToMakeName, onUpdateFavoriteName, pendingFavoriteRemoval, onUndoFavoriteRemoval }) {
   const [sourceFilter, setSourceFilter] = useState('All')
   const [ingredientFilter, setIngredientFilter] = useState(null)
 
@@ -3798,6 +3824,17 @@ function SavedScreen({ savedSubTab, setSavedSubTab, toMake, favorites, onRemoveT
 
   return (
     <div>
+      {/* Session 18, Change 2: covers the misclick, the real risk in an
+          instant, unconfirmed delete — not a third list state, so it's a
+          dismissible banner, not a row anywhere. Shown regardless of which
+          sub-tab is active since the removal that triggered it may have
+          just switched the list out from under the user. */}
+      {pendingFavoriteRemoval && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 14px', marginBottom: 14, fontSize: 13 }}>
+          <span style={{ color: C.textMuted }}>Removed "{pendingFavoriteRemoval.fav.recipeName}" from Favorites</span>
+          <button onClick={onUndoFavoriteRemoval} style={{ background: 'none', border: 'none', color: C.gold, fontSize: 13, fontWeight: 700, cursor: 'pointer', padding: 0, whiteSpace: 'nowrap' }}>Undo</button>
+        </div>
+      )}
       {/* Sub-tabs */}
       <div style={{ display: 'flex', borderBottom: `1px solid ${C.border}`, marginBottom: 16 }}>
         {SUB_TABS.map(({ id, label, count, color }) => {
@@ -7301,6 +7338,33 @@ export default function App() {
   useEffect(() => { if (!user) localStorage.setItem('bar-cart-favorites', JSON.stringify(favorites)) }, [favorites, user])
   useEffect(() => { if (!user) localStorage.setItem('bar-cart-to-make', JSON.stringify(toMake)) }, [toMake, user])
 
+  // Session 18, Change 2: a removed Favorite is held here, out of local
+  // state but not yet deleted from the database, for a short undo window —
+  // see removeFavoriteWithUndo below. The ref (not state) holds the pending
+  // row + its timeout id so the flush-on-unmount effect can always reach the
+  // latest pending removal without stale-closure trouble.
+  const [pendingFavoriteRemoval, setPendingFavoriteRemoval] = useState(null)
+  const pendingFavoriteRemovalRef = useRef(null)
+
+  // A pending removal that never gets flushed (tab closed before the timer
+  // fires) would leave the row alive in the database forever while the UI
+  // already shows it gone — same "write that didn't happen must never look
+  // like one that did" concern as everywhere else in this file, just
+  // inverted (a delete that DID need to happen must not look skipped).
+  // Unmount only happens on a full page reload/close in this SPA, so this is
+  // the one chance to commit it before it's lost; nothing else to do if that
+  // fails, so it's logged, not thrown, into the void of an unmounting page.
+  useEffect(() => () => {
+    const pending = pendingFavoriteRemovalRef.current
+    if (pending) {
+      clearTimeout(pending.timer)
+      if (pending.needsDbDelete) {
+        supabase.from('favorites').delete().eq('id', pending.id)
+          .then(({ error }) => { if (error) console.error('[favorites] flush-on-unmount remove failed:', error.message) })
+      }
+    }
+  }, [])
+
   // DB helpers
   const dbFavToLocal = (row) => ({
     id: row.id, recipeName: row.recipe_name, summary: row.summary,
@@ -7703,12 +7767,10 @@ export default function App() {
       }).select().single()
       // 3d's insert silently no-op'd against a missing column while the UI
       // still claimed success. Throw instead — a write that didn't happen
-      // must never be reported as one that did.
-      if (error) {
-        const err = new Error(error.message || 'Could not save this recipe. Please try again.')
-        err.code = 'db_write_failed'
-        throw err
-      }
+      // must never be reported as one that did. Session 18, Change 4: a
+      // 23505 here means this exact name already has a favorite — friendlier
+      // than the raw constraint text, without guessing at any other error.
+      if (error) throw friendlySaveError(error, res.recipe_name, 'Favorites')
       if (data) setFavorites(prev => [dbFavToLocal(data), ...prev])
       return data?.id ?? null
     } else {
@@ -7718,15 +7780,49 @@ export default function App() {
     }
   }
 
-  // Session 9, Change 2: same swallowed-error pattern as the shopping list
-  // helpers above — awaited but never checked, so local state moved on
-  // regardless of whether the write actually happened.
-  const removeFavorite = async (id) => {
-    if (user) {
-      const { error } = await supabase.from('favorites').delete().eq('id', id)
-      if (error) { console.error('[favorites] remove failed:', error.message); return }
+  const FAVORITE_UNDO_WINDOW_MS = 5000
+
+  // Session 18, Change 2: replaces the old immediate-delete removeFavorite
+  // — "a Favorite is something the user made and liked," so the misclick
+  // that immediate delete exposed is the real risk, not the eventual
+  // removal itself. The row leaves local state (and so the visible list)
+  // immediately, same as before, but the actual database delete is held for
+  // a few seconds so Undo can cancel it for free — no re-insert, no new id,
+  // nothing to reconcile. Only one removal is ever pending at a time: a
+  // second remove while one is already pending commits the first
+  // immediately rather than silently dropping it or stacking undo banners.
+  const removeFavoriteWithUndo = (id) => {
+    const fav = favorites.find(f => f.id === id)
+    if (!fav) return
+    const prior = pendingFavoriteRemovalRef.current
+    if (prior) {
+      clearTimeout(prior.timer)
+      if (prior.needsDbDelete) {
+        supabase.from('favorites').delete().eq('id', prior.id)
+          .then(({ error }) => { if (error) console.error('[favorites] remove failed:', error.message) })
+      }
     }
     setFavorites(prev => prev.filter(f => f.id !== id))
+    const timer = setTimeout(() => {
+      if (user) {
+        supabase.from('favorites').delete().eq('id', id)
+          .then(({ error }) => { if (error) console.error('[favorites] remove failed:', error.message) })
+      }
+      pendingFavoriteRemovalRef.current = null
+      setPendingFavoriteRemoval(null)
+    }, FAVORITE_UNDO_WINDOW_MS)
+    const pending = { id, fav, timer, needsDbDelete: !!user }
+    pendingFavoriteRemovalRef.current = pending
+    setPendingFavoriteRemoval(pending)
+  }
+
+  const undoFavoriteRemoval = () => {
+    const pending = pendingFavoriteRemovalRef.current
+    if (!pending) return
+    clearTimeout(pending.timer)
+    pendingFavoriteRemovalRef.current = null
+    setPendingFavoriteRemoval(null)
+    setFavorites(prev => [pending.fav, ...prev])
   }
 
   // Throws on failure (rather than swallowing) so FavoriteCard's explicit
@@ -7748,10 +7844,25 @@ export default function App() {
   // as success). name_user_supplied is set unconditionally here — every path
   // that reaches this function is, by definition, the user correcting or
   // authoring a name by hand.
+  // Session 18, Change 4: renaming writes recipe_name the same as a save
+  // does, and is reachable on an already-saved item (Session 15) — so it can
+  // hit the exact same UNIQUE(user_id, recipe_name) constraint a save can.
+  // Checked against the already-loaded favorites list, the same source
+  // nextVariantName's own collision check already trusts, rather than a
+  // second round-trip to ask the database the same question. The live
+  // .update() below still gets the same friendly translation as a backstop
+  // (another tab renaming into the same name between this check and the
+  // write, for instance) — this check narrows when that backstop fires, it
+  // doesn't replace it.
   const updateFavoriteName = async (id, name) => {
+    if ((favorites || []).some(f => f.id !== id && f.recipeName === name)) {
+      const err = new Error(`You already have a recipe named "${name}" in Favorites.`)
+      err.code = 'duplicate_name'
+      throw err
+    }
     if (user) {
       const { error } = await supabase.from('favorites').update({ recipe_name: name, name_user_supplied: true }).eq('id', id)
-      if (error) throw new Error(error.message || 'Could not save name.')
+      if (error) throw friendlySaveError(error, name, 'Favorites')
     }
     setFavorites(prev => prev.map(f => f.id === id ? { ...f, recipeName: name, nameUserSupplied: true } : f))
   }
@@ -7780,12 +7891,9 @@ export default function App() {
         parent_recipe: parentRecipe, replacements, name_user_supplied: nameUserSupplied,
       }).select().single()
       // Same failure as 3d, avoided the same way: a write that didn't
-      // happen must never be reported as one that did.
-      if (error) {
-        const err = new Error(error.message || 'Could not save this recipe. Please try again.')
-        err.code = 'db_write_failed'
-        throw err
-      }
+      // happen must never be reported as one that did. Session 18, Change 4:
+      // same friendly 23505 translation as saveFavorite above.
+      if (error) throw friendlySaveError(error, res.recipe_name, 'On Deck')
       if (data) setToMake(prev => [dbToMakeToLocal(data), ...prev])
       return data?.id ?? null
     } else {
@@ -7806,10 +7914,17 @@ export default function App() {
   // Session 15, Change 4: to_make's own updateFavoriteName analog — see that
   // function's comment for why this throws and why name_user_supplied is
   // unconditional.
+  // Session 18, Change 4: same pre-check-plus-backstop shape as
+  // updateFavoriteName above, against the loaded to_make list.
   const updateToMakeName = async (id, name) => {
+    if ((toMake || []).some(f => f.id !== id && f.recipeName === name)) {
+      const err = new Error(`You already have a recipe named "${name}" on On Deck.`)
+      err.code = 'duplicate_name'
+      throw err
+    }
     if (user) {
       const { error } = await supabase.from('to_make').update({ recipe_name: name, name_user_supplied: true }).eq('id', id)
-      if (error) throw new Error(error.message || 'Could not save name.')
+      if (error) throw friendlySaveError(error, name, 'On Deck')
     }
     setToMake(prev => prev.map(f => f.id === id ? { ...f, recipeName: name, nameUserSupplied: true } : f))
   }
@@ -8326,11 +8441,13 @@ export default function App() {
         <SavedScreen
           savedSubTab={savedSubTab} setSavedSubTab={setSavedSubTab}
           toMake={toMake} favorites={favorites}
-          onRemoveToMake={removeFromToMake} onRemoveFavorite={removeFavorite}
+          onRemoveToMake={removeFromToMake} onRemoveFavorite={removeFavoriteWithUndo}
           onViewToMake={viewToMake} onViewFavorite={viewFavorite}
           onUpdateNote={updateFavoriteNote}
           onUpdateToMakeName={updateToMakeName}
           onUpdateFavoriteName={updateFavoriteName}
+          pendingFavoriteRemoval={pendingFavoriteRemoval}
+          onUndoFavoriteRemoval={undoFavoriteRemoval}
         />
       )}
 
@@ -8454,6 +8571,31 @@ export default function App() {
             onSaveFavorite={async res => {
               const newId = await saveFavorite(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty, creator: res.creator, bar: res.bar, year: res.year, attributionSource: res.attributionSource, attributionUserSupplied: res.attributionUserSupplied, parentRecipe: res.parentRecipe, replacements: res.replacements, nameUserSupplied: res.nameUserSupplied })
               setResult(prev => prev ? { ...prev, favoriteId: newId } : prev)
+              // Session 18, Change 1: On Deck and Favorites are mutually
+              // exclusive — promoting a recipe to Favorites retires it from
+              // the shortlist, in the same action, not as a separate step
+              // the user has to remember. Only attempted once the favorite
+              // write has actually succeeded. If the removal fails, this
+              // throws rather than swallowing (same as every other write in
+              // this file) — the favorite really was saved, the on-deck row
+              // just didn't clear, and pretending it did would be exactly
+              // the "half-completed move looks like a clean one" outcome
+              // this change exists to avoid. toMake state is only updated
+              // once the removal is confirmed, so isToMake stays accurate
+              // (and the saved-elsewhere error banner below stays truthful)
+              // if it fails.
+              if (res.toMakeId) {
+                if (user) {
+                  const { error: removeError } = await supabase.from('to_make').delete().eq('id', res.toMakeId)
+                  if (removeError) {
+                    const err = new Error('Saved to Favorites, but this recipe is still on On Deck too — remove it from On Deck manually.')
+                    err.code = 'partial_move_failed'
+                    throw err
+                  }
+                }
+                setToMake(prev => prev.filter(t => t.id !== res.toMakeId))
+                setResult(prev => prev ? { ...prev, toMakeId: null } : prev)
+              }
             }}
             toMake={toMake}
             onSaveToMake={async res => {
