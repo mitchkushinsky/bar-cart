@@ -504,6 +504,112 @@ function normalizeForMatch(str) {
   return (str || '').trim().toLowerCase().normalize('NFD').replace(DIACRITIC_MARKS_RE, '')
 }
 
+// Session 17: true if `a` contains `b` as whole word(s), or vice versa \u2014
+// substring matching alone was rejected ("ginger syrup" contains "gin"),
+// which would have made the seed-ingredient check below over-permissive in
+// exactly the direction Test 4/5 warn against (a false drop is worse than
+// the bug, but a false MATCH silently reopens the same hole). Both directions
+// are checked so a short featured name ("Gin") matches inside a longer
+// recipe line ("London Dry Gin") and a longer featured name matches a
+// shortened recipe mention, without matching inside an unrelated longer word.
+function containsAsWords(a, b) {
+  if (!a || !b) return false
+  const escaped = b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(^|\\s)${escaped}(\\s|$)`).test(a)
+}
+function phraseMatch(a, b) {
+  const na = normalizeForMatch(a)
+  const nb = normalizeForMatch(b)
+  if (!na || !nb) return false
+  return containsAsWords(na, nb) || containsAsWords(nb, na)
+}
+
+// Session 17, Change 1: resolves free text — a recipe's own ingredient line,
+// or a featured ingredient's own name — to the inventory_tags row it refers
+// to. Two steps, reusing the same reasoning Session 13 built for spirit chips
+// (getOwnedBottlesForCategory) rather than re-deriving it: first check
+// whether the text names a specific bottle directly (a recipe line reading
+// "Amaro Montenegro" against an inventory row named "Montenegro"), then
+// whether the text already says a generic_type or alias outright (a recipe
+// line reading "Bourbon whiskey" against generic_type "bourbon", "Rye"
+// against "rye whiskey", or a typed featured ingredient "coconut liqueur"
+// against Clément Mahina's own alias of that same name — this second step is
+// why the alias list is checked here, not just in the generic_type branch:
+// an early draft only matched featured text against item NAMES, which meant
+// typing the category name a bottle is aliased under (exactly what "Category
+// and brand are equivalent" in the prompt itself invites) failed to resolve
+// at all and silently fell back to name-only matching).
+function resolveIngredientTag(text, inventoryTags) {
+  if (!text || !inventoryTags) return null
+  for (const [itemName, tag] of Object.entries(inventoryTags)) {
+    if (tag?.generic_type && phraseMatch(text, itemName)) return tag
+  }
+  for (const tag of Object.values(inventoryTags)) {
+    if (!tag?.generic_type) continue
+    if (phraseMatch(text, tag.generic_type)) return tag
+    if ((tag.aliases || []).some(a => phraseMatch(text, a))) return tag
+  }
+  return null
+}
+function resolveIngredientGenericType(text, inventoryTags) {
+  return resolveIngredientTag(text, inventoryTags)?.generic_type ?? null
+}
+
+// Session 17, Change 1: does this one recipe ingredient line satisfy this one
+// featured ingredient \u2014 by name, by alias, or by shared generic_type (the
+// boundary Change 2 narrows in the prompt itself: Campari is bitter aperitivo,
+// not amaro, so it fails here regardless of what a prior draft of the prompt
+// invited the model to believe; Amaro Montenegro shares generic_type "amaro"
+// with a monofloral amaro seed, so it passes \u2014 a genuine category match, not
+// a flavor-adjacent guess). featuredTag is null when the featured ingredient
+// isn't itself a tagged inventory item (an invented or unowned ingredient);
+// in that case only name/alias matching applies \u2014 see
+// filterSuggestionsBySeedIngredients for why that's a deliberate fallback,
+// not an oversight.
+function ingredientSatisfiesFeature(recipeIngredientName, featuredName, featuredTag, inventoryTags) {
+  if (!recipeIngredientName) return false
+  if (phraseMatch(recipeIngredientName, featuredName)) return true
+  if (featuredTag?.aliases?.some(a => phraseMatch(recipeIngredientName, a))) return true
+  if (featuredTag?.generic_type) {
+    const ingType = resolveIngredientGenericType(recipeIngredientName, inventoryTags)
+    if (ingType && normalizeForMatch(ingType) === normalizeForMatch(featuredTag.generic_type)) return true
+  }
+  return false
+}
+
+// Session 17, Change 1: the code-side backstop for tier-1's own inclusion
+// requirement (see analyzeExplorationsRecipes's CRITICAL line) \u2014 prose-only
+// enforcement lost to a familiar, available canonical drink when nothing
+// forced the model to check its own work twice. Exploring Forthave Astor
+// Batch Monofloral Amaro + Gin under Bittersweet returned Negroni (Campari,
+// a different generic_type entirely), MonteNegroni (Amaro Montenegro, the
+// SAME generic_type \u2014 a genuine match, kept), and Bijou (no amaro-family
+// ingredient at all) \u2014 none of which the prompt's own CRITICAL line should
+// have allowed through. Re-running the identical exploration with those
+// three excluded produced the correct answer on its own (no_recipes_found),
+// proving the rule works when nothing outcompetes it \u2014 this filter is what
+// makes it hold every time, not just when convenient.
+// Drops a suggestion missing ANY featured ingredient; keeps everything else,
+// including partial batches \u2014 the caller falls through to the existing
+// honest empty state if nothing survives, exactly as an unaided search
+// already does when it finds nothing. A featured ingredient with no
+// inventory tag (an invented or unowned ingredient) is never grounds to drop
+// a suggestion on its own \u2014 untagged means "unknown," not "absent."
+function filterSuggestionsBySeedIngredients(suggestions, featuredIngredients, inventoryTags, diagLabel = null) {
+  if (!Array.isArray(suggestions) || suggestions.length === 0) return suggestions
+  const tags = inventoryTags || {}
+  const featuredTags = (featuredIngredients || []).map(name => ({ name, tag: resolveIngredientTag(name, tags) }))
+  return suggestions.filter(s => {
+    const recipeNames = (s.recipe || []).map(r => r?.ingredient).filter(Boolean)
+    const missing = featuredTags.find(({ name, tag }) => !recipeNames.some(ing => ingredientSatisfiesFeature(ing, name, tag, tags)))
+    if (missing) {
+      if (diagLabel) console.warn(`[DIAG:${diagLabel}] seed-ingredient check dropped "${s.recipe_name}" \u2014 missing "${missing.name}"`, JSON.stringify({ recipeIngredients: recipeNames }))
+      return false
+    }
+    return true
+  })
+}
+
 // Shared with the affinity chip labels (Session 6) and the "Add an
 // Ingredient" generic-category row (Session 13, Change 2) — one title-casing
 // convention so the same category reads identically everywhere it appears.
@@ -1226,7 +1332,7 @@ CRITICAL: Every featured ingredient (${searchIngredients.join(', ')}) must appea
 
 ${SEED_INGREDIENT_EXEMPT}
 
-Category and brand are equivalent within the same product kind: a recipe calling for a specific product satisfies a generic category request, and a recipe calling for the generic category — or a different well-known product in that category — satisfies a specific-product request. A distinctive product remains a member of its category regardless of how distinctive it is (e.g. an agricole-based coconut liqueur is still a coconut liqueur); its distinctiveness belongs in the summary as a flavor note, not as grounds to reject other category members as non-matches. This equivalence covers different brands of the SAME product — not every product that merely shares a flavor origin or a source fruit. Maraschino liqueur is not cherry liqueur: despite both being cherry-derived, they are distinct, non-interchangeable products with different production methods and flavor profiles (maraschino is dry and almond-like from crushed cherry pits; cherry liqueur is sweet and fruity) — a recipe calling for one does not satisfy a request for the other.
+Category and brand are equivalent within the same product: a recipe calling for a specific product satisfies a generic category request, and a recipe calling for the generic category — or a different well-known BRAND OF THAT SAME PRODUCT — satisfies a specific-product request (Malibu and Kalani are both coconut liqueur; either satisfies a request for Clément Mahina). A distinctive product remains a member of its category regardless of how distinctive it is (e.g. an agricole-based coconut liqueur is still a coconut liqueur); its distinctiveness belongs in the summary as a flavor note, not as grounds to reject other category members as non-matches. This equivalence covers different BRANDS of the SAME PRODUCT — not every product that merely shares a broader spirits category, a flavor origin, or a source fruit. Maraschino liqueur is not cherry liqueur: despite both being cherry-derived, they are distinct, non-interchangeable products with different production methods and flavor profiles (maraschino is dry and almond-like from crushed cherry pits; cherry liqueur is sweet and fruity) — a recipe calling for one does not satisfy a request for the other. The same boundary holds within a broad style like amaro: amaro is a category, not a single product, so a different amaro does not automatically satisfy a request for a specific one just because both are labeled amaro — any more than a different whiskey would satisfy a request for a specific whiskey just because both are whiskey.
 
 This equivalence is bound by product kind, not by flavor alone — but "kind" means alcoholic vs. non-alcoholic, not the specific spirit category a product's label files it under. Any alcoholic product built around the featured flavor as its defining character satisfies the requirement, regardless of whether its own label calls it a liqueur, a flavored rum, or something else — Malibu is legally a flavored rum, not a liqueur, but it is still a coconut liqueur for matching purposes here, exactly like Kalani or Clément Mahina. Do not disqualify a product on that technicality. What disqualifies a product is the absence of alcohol: a non-alcoholic product of the same flavor (juice, purée, water, cream, syrup, or milk) never satisfies the requirement, no matter how central it is to the recipe. This is a general rule, not specific to any one flavor: cherry liqueur is not satisfied by cherry juice, coffee liqueur is not satisfied by cold brew, peach liqueur is not satisfied by peach purée, and coconut liqueur is not satisfied by coconut water, coconut purée, cream of coconut, or coconut milk — but coconut liqueur IS satisfied by any alcoholic coconut product, including ones labeled "rum" rather than "liqueur." Do NOT suggest recipes that omit any featured ingredient under this standard — even if fewer results are available as a result.
 
@@ -5334,6 +5440,15 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         }
       } else {
         data = stripCiteTags(await analyzeExplorationsRecipes(selected, activeTemplate, modifiers, inventoryText, [], DIAG_ON ? 'tier1-build' : null))
+        // Session 17, Change 1: the code-side backstop — see
+        // filterSuggestionsBySeedIngredients. Not applied to the redirect
+        // branch above (opts.redirectDrinkName): that's a single targeted
+        // lookup for one drink already named by the model's own honest
+        // cross-template suggestion, a narrower and lower-risk path this
+        // session leaves alone.
+        if (data?.suggestions) {
+          data.suggestions = filterSuggestionsBySeedIngredients(data.suggestions, selected, inventoryTags, DIAG_ON ? 'tier1-build' : null)
+        }
       }
       setResult(data)
       setMorePublishedExist(data?.more_published_exist === true)
@@ -5561,7 +5676,11 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           console.log(`[DIAG:tier1-see-more-published-tap${tapN}] draining buffer ${JSON.stringify({ batchSize: drainBatch.length, remainingBefore: currentBuffer.length, names: drainBatch.map(c => c.name) })}`)
         }
         const drained = await analyzeBufferedDrinkSkeletons(drainBatch, selected, template, modifiers, inventoryText, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null)
-        newSuggestions = drained?.suggestions || []
+        // Session 17, Change 1: this is the buffer's own "written up" moment
+        // — a candidate only gains an actual ingredient list here, so this is
+        // where the seed-ingredient check first has something to check. A
+        // drink that fails does not return through See More Published.
+        newSuggestions = filterSuggestionsBySeedIngredients(drained?.suggestions || [], selected, inventoryTags, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null)
         // Remove exactly the attempted batch, whether or not each one produced a
         // suggestion — a candidate the model couldn't confidently write up this
         // time isn't worth holding onto for a retry that asks the same question
@@ -5579,7 +5698,8 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           console.log(`[DIAG:tier1-see-more-published-tap${tapN}] exclusion list ${JSON.stringify({ count: excludeNames.length, chars: joined.length, approxWords: joined.split(/\s+/).filter(Boolean).length })}`)
         }
         freshData = stripCiteTags(await analyzeExplorationsRecipes(selected, template, modifiers, inventoryText, excludeNames, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null))
-        newSuggestions = freshData?.suggestions || []
+        // Session 17, Change 1: same backstop as the initial Build call.
+        newSuggestions = filterSuggestionsBySeedIngredients(freshData?.suggestions || [], selected, inventoryTags, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null)
         setMorePublishedExist(freshData?.more_published_exist === true)
         // A fresh search's own raw candidates (Change 1: names/tier-guesses,
         // never searched by this call) get appended to the buffer as-is —
