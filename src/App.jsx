@@ -3122,7 +3122,7 @@ function DifficultyBadge({ difficulty }) {
 // ─── Results ──────────────────────────────────────────────────────────────────
 
 // TODO: unify with shared RecipeCard once the Analyze/Name/Menu flow is in scope (Session 1.5)
-function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onSaveFavorite, toMake, onSaveToMake, onFeedback, feedbackLoading, inventory, feedbackError, onOpenAttributionEdit, onRename, pendingReplace, onReplaceDecision }) {
+function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onSaveFavorite, onRemoveFromFavorites, toMake, onSaveToMake, onRemoveFromToMake, onFeedback, feedbackLoading, inventory, feedbackError, onOpenAttributionEdit, onRename, pendingReplace, onReplaceDecision }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
   const adjustmentNoteRef = useRef(null)
@@ -3189,6 +3189,16 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
     setSaveError(null)
     try { await onSaveFavorite(result) } catch (err) { setSaveError(err.message || 'Could not save this recipe. Please try again.') }
   }
+  // Session 19, Change 2: the detail view's own remove actions — Session 16
+  // left removal exclusively on the list card's × control, which meant this
+  // screen had no way to remove a recipe at all, and "🍹 Saved to On Deck"
+  // looked tappable enough that it got tapped expecting exactly this.
+  // Reuses Session 18's undo pattern (removeFavoriteWithUndo) and its
+  // Session 19 On Deck counterpart (removeToMakeWithUndo) via the same
+  // onRemoveFromToMake/onRemoveFromFavorites props the top-level wiring
+  // passes down — those also navigate back to the source list afterward.
+  const handleRemoveFromToMake = () => { if (isToMake) onRemoveFromToMake(result.toMakeId) }
+  const handleRemoveFromFavorites = () => { if (isFav) onRemoveFromFavorites(result.favoriteId) }
 
   return (
     <div style={{ marginTop: 36, opacity: feedbackLoading ? 0.5 : 1, transition: 'opacity 0.3s', pointerEvents: feedbackLoading ? 'none' : 'auto' }}>
@@ -3218,20 +3228,18 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
           <button onClick={() => onReplaceDecision(false)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.textMuted, fontSize: 13, padding: '7px 14px', cursor: 'pointer' }}>No, keep both</button>
         </div>
       )}
-      {/* Action buttons — Session 16, Change 2: once saved, this is a static
-          indicator, not a button. There is no tap that turns "Saved" back
-          into "not saved" here; that only ever happens through the explicit
-          × control on ToMakeCard/FavoriteCard. Session 18: On Deck and
-          Favorites are now mutually exclusive (see Change 1) — once this
-          recipe is a Favorite, On Deck has nothing to offer or claim, so
-          neither the button nor the indicator renders at all. This is what
-          actually fixes the mislabelled-control bug from the Session 18
-          investigation (viewing a Favorite showed "🍹 On Deck" as a live
-          offer to save): there's no longer a control there to mislabel. */}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
-        {isToMake && (
-          <div style={{ fontSize: 13, color: C.blue, padding: '6px 14px' }}>🍹 Saved to On Deck</div>
-        )}
+      {/* Action buttons — Session 16, Change 2: there is no tap here that
+          turns a save back into "not saved"; that's a distinct, labelled
+          remove action (below), never the save control itself. Session 18:
+          On Deck and Favorites are mutually exclusive (Change 1) — once this
+          recipe is a Favorite, On Deck has nothing to offer, so no On Deck
+          control of any kind renders here. Session 19, Change 2: dropped
+          the old "🍹 Saved to On Deck"/"♥ Saved" static status text — the
+          screen's own "← Back to On Deck"/"← Back to Favorites" link above
+          already says the same thing, and the status looked tappable enough
+          that it got tapped expecting a remove action that didn't exist.
+          That gap is what the quiet Remove buttons below are for. */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap', alignItems: 'center' }}>
         {!isToMake && !isFav && (
           <button
             onClick={handleToggleToMake}
@@ -3240,14 +3248,32 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
             🍹 On Deck
           </button>
         )}
-        {isFav ? (
-          <div style={{ fontSize: 13, color: C.gold, padding: '6px 14px' }}>♥ Saved</div>
-        ) : (
+        {!isFav && (
           <button
             onClick={handleToggleFavorite}
             style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 13, padding: '6px 14px', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.15s, border-color 0.15s' }}
           >
             ♡ Save to Favorites
+          </button>
+        )}
+        {/* Reachable, not equally inviting — plain underlined text, no pill,
+            no border, distinctly quieter than the save actions above. One
+            promotes, one discards; identical treatment is what made the
+            original misclick easy. */}
+        {isToMake && (
+          <button
+            onClick={handleRemoveFromToMake}
+            style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, padding: '6px 4px', cursor: 'pointer', textDecoration: 'underline', textUnderlineOffset: 2 }}
+          >
+            Remove from On Deck
+          </button>
+        )}
+        {isFav && (
+          <button
+            onClick={handleRemoveFromFavorites}
+            style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, padding: '6px 4px', cursor: 'pointer', textDecoration: 'underline', textUnderlineOffset: 2 }}
+          >
+            Remove from Favorites
           </button>
         )}
       </div>
@@ -3784,7 +3810,7 @@ function ToMakeCard({ item, onRemove, onView, onUpdateName }) {
 
 const SOURCE_OPTIONS = ['All', 'Recipe Screenshot', 'Bar Menu', 'Cocktail Name', 'Exploration']
 
-function SavedScreen({ savedSubTab, setSavedSubTab, toMake, favorites, onRemoveToMake, onRemoveFavorite, onViewToMake, onViewFavorite, onUpdateNote, onUpdateToMakeName, onUpdateFavoriteName, pendingFavoriteRemoval, onUndoFavoriteRemoval }) {
+function SavedScreen({ savedSubTab, setSavedSubTab, toMake, favorites, onRemoveToMake, onRemoveFavorite, onViewToMake, onViewFavorite, onUpdateNote, onUpdateToMakeName, onUpdateFavoriteName, pendingFavoriteRemoval, onUndoFavoriteRemoval, pendingToMakeRemoval, onUndoToMakeRemoval }) {
   const [sourceFilter, setSourceFilter] = useState('All')
   const [ingredientFilter, setIngredientFilter] = useState(null)
 
@@ -3824,11 +3850,21 @@ function SavedScreen({ savedSubTab, setSavedSubTab, toMake, favorites, onRemoveT
 
   return (
     <div>
-      {/* Session 18, Change 2: covers the misclick, the real risk in an
-          instant, unconfirmed delete — not a third list state, so it's a
-          dismissible banner, not a row anywhere. Shown regardless of which
-          sub-tab is active since the removal that triggered it may have
-          just switched the list out from under the user. */}
+      {/* Session 18, Change 2 (Favorites); Session 19, Change 2 (On Deck):
+          covers the misclick, the real risk in an instant, unconfirmed
+          delete — not a third list state, so it's a dismissible banner, not
+          a row anywhere. Shown regardless of which sub-tab is active since
+          the removal that triggered it may have just switched the list out
+          from under the user (or, since Session 19, happened from the
+          detail view, which navigates back here). Both can be pending at
+          once (one removal per list within the same undo window) — shown
+          stacked rather than picking one to drop. */}
+      {pendingToMakeRemoval && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 14px', marginBottom: 10, fontSize: 13 }}>
+          <span style={{ color: C.textMuted }}>Removed "{pendingToMakeRemoval.item.recipeName}" from On Deck</span>
+          <button onClick={onUndoToMakeRemoval} style={{ background: 'none', border: 'none', color: C.gold, fontSize: 13, fontWeight: 700, cursor: 'pointer', padding: 0, whiteSpace: 'nowrap' }}>Undo</button>
+        </div>
+      )}
       {pendingFavoriteRemoval && (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 14px', marginBottom: 14, fontSize: 13 }}>
           <span style={{ color: C.textMuted }}>Removed "{pendingFavoriteRemoval.fav.recipeName}" from Favorites</span>
@@ -7338,13 +7374,16 @@ export default function App() {
   useEffect(() => { if (!user) localStorage.setItem('bar-cart-favorites', JSON.stringify(favorites)) }, [favorites, user])
   useEffect(() => { if (!user) localStorage.setItem('bar-cart-to-make', JSON.stringify(toMake)) }, [toMake, user])
 
-  // Session 18, Change 2: a removed Favorite is held here, out of local
-  // state but not yet deleted from the database, for a short undo window —
-  // see removeFavoriteWithUndo below. The ref (not state) holds the pending
-  // row + its timeout id so the flush-on-unmount effect can always reach the
+  // Session 18, Change 2 (Favorites); Session 19, Change 2 (On Deck): a
+  // removed row is held here, out of local state but not yet deleted from
+  // the database, for a short undo window — see removeFavoriteWithUndo/
+  // removeToMakeWithUndo below. The ref (not state) holds the pending row +
+  // its timeout id so the flush-on-unmount effect can always reach the
   // latest pending removal without stale-closure trouble.
   const [pendingFavoriteRemoval, setPendingFavoriteRemoval] = useState(null)
   const pendingFavoriteRemovalRef = useRef(null)
+  const [pendingToMakeRemoval, setPendingToMakeRemoval] = useState(null)
+  const pendingToMakeRemovalRef = useRef(null)
 
   // A pending removal that never gets flushed (tab closed before the timer
   // fires) would leave the row alive in the database forever while the UI
@@ -7355,12 +7394,20 @@ export default function App() {
   // the one chance to commit it before it's lost; nothing else to do if that
   // fails, so it's logged, not thrown, into the void of an unmounting page.
   useEffect(() => () => {
-    const pending = pendingFavoriteRemovalRef.current
-    if (pending) {
-      clearTimeout(pending.timer)
-      if (pending.needsDbDelete) {
-        supabase.from('favorites').delete().eq('id', pending.id)
+    const pendingFav = pendingFavoriteRemovalRef.current
+    if (pendingFav) {
+      clearTimeout(pendingFav.timer)
+      if (pendingFav.needsDbDelete) {
+        supabase.from('favorites').delete().eq('id', pendingFav.id)
           .then(({ error }) => { if (error) console.error('[favorites] flush-on-unmount remove failed:', error.message) })
+      }
+    }
+    const pendingToMake = pendingToMakeRemovalRef.current
+    if (pendingToMake) {
+      clearTimeout(pendingToMake.timer)
+      if (pendingToMake.needsDbDelete) {
+        supabase.from('to_make').delete().eq('id', pendingToMake.id)
+          .then(({ error }) => { if (error) console.error('[on deck] flush-on-unmount remove failed:', error.message) })
       }
     }
   }, [])
@@ -7446,9 +7493,26 @@ export default function App() {
           migrateAndLoadData(newUser)
         }
       } else if (event === 'SIGNED_OUT' || (!newUser && event === 'TOKEN_REFRESHED')) {
+        // Session 19, Change 1: this branch used to also call
+        // supabase.auth.signOut() here, re-entering the SDK's own locked
+        // sign-out flow from inside the SIGNED_OUT callback that a prior
+        // signOut() call's own dispatch triggered — the auth-js source
+        // confirms signOut() takes a lock for the duration of the call, and
+        // SIGNED_OUT already means the session is gone (client-side always;
+        // server-side too, when this event was reached via a real signOut()
+        // call). There was nothing left for the re-entrant call to
+        // accomplish; it only corrupted the SDK's internal state, throwing
+        // RangeError: Invalid array length and leaving Sign Out looking like
+        // it had silently failed. Supabase's own onAuthStateChange docs are
+        // explicit that SIGNED_OUT's only job is local cleanup ("clean up
+        // any local storage your application has associated with the
+        // user") — which is exactly what the rest of this branch already
+        // does: reset the cloud-data-loaded guard so a future sign-in
+        // reloads fresh, and swap the app's state back to whatever
+        // signed-out/local data exists, same as before a user ever signed
+        // in.
         dataLoadedForRef.current = null
         setUser(null)
-        supabase.auth.signOut().catch(() => {})
         try { setFavorites(JSON.parse(localStorage.getItem('bar-cart-favorites')) || []) } catch { setFavorites([]) }
         try { setShoppingList(JSON.parse(localStorage.getItem('bar-cart-shopping')) || []) } catch { setShoppingList([]) }
         try { setToMake(JSON.parse(localStorage.getItem('bar-cart-to-make')) || []) } catch { setToMake([]) }
@@ -7873,7 +7937,8 @@ export default function App() {
   // under its old name toggleToMake, is what deleted "Astor Blanc" 94 seconds
   // after saving it: the toggle's existing-by-name branch fired on a second
   // call, and there was no confirmation and no distinct update path. Removal
-  // stays exclusively on removeFromToMake (the × control), unchanged.
+  // stays exclusively on the × control (removeToMakeWithUndo, Session 19)
+  // and the detail view's own Remove action, added in Session 19.
   const saveToMake = async (res, extras = {}) => {
     const {
       source = 'manual', origin = null, originFlag = null, difficulty = null, primaryIngredients = [],
@@ -7903,12 +7968,46 @@ export default function App() {
     }
   }
 
-  const removeFromToMake = async (id) => {
-    if (user) {
-      const { error } = await supabase.from('to_make').delete().eq('id', id)
-      if (error) { console.error('[on deck] remove failed:', error.message); return }
+  const TOMAKE_UNDO_WINDOW_MS = 5000
+
+  // Session 19, Change 2: to_make's own removeFavoriteWithUndo analog — same
+  // shape, same reasoning (the misclick is the real risk in an instant,
+  // unconfirmed delete, not the eventual removal), now shared by both the ×
+  // control on ToMakeCard and the new "Remove from On Deck" action in the
+  // detail view, so the two never have different removal semantics for the
+  // same table.
+  const removeToMakeWithUndo = (id) => {
+    const item = toMake.find(f => f.id === id)
+    if (!item) return
+    const prior = pendingToMakeRemovalRef.current
+    if (prior) {
+      clearTimeout(prior.timer)
+      if (prior.needsDbDelete) {
+        supabase.from('to_make').delete().eq('id', prior.id)
+          .then(({ error }) => { if (error) console.error('[on deck] remove failed:', error.message) })
+      }
     }
     setToMake(prev => prev.filter(f => f.id !== id))
+    const timer = setTimeout(() => {
+      if (user) {
+        supabase.from('to_make').delete().eq('id', id)
+          .then(({ error }) => { if (error) console.error('[on deck] remove failed:', error.message) })
+      }
+      pendingToMakeRemovalRef.current = null
+      setPendingToMakeRemoval(null)
+    }, TOMAKE_UNDO_WINDOW_MS)
+    const pending = { id, item, timer, needsDbDelete: !!user }
+    pendingToMakeRemovalRef.current = pending
+    setPendingToMakeRemoval(pending)
+  }
+
+  const undoToMakeRemoval = () => {
+    const pending = pendingToMakeRemovalRef.current
+    if (!pending) return
+    clearTimeout(pending.timer)
+    pendingToMakeRemovalRef.current = null
+    setPendingToMakeRemoval(null)
+    setToMake(prev => [pending.item, ...prev])
   }
 
   // Session 15, Change 4: to_make's own updateFavoriteName analog — see that
@@ -8441,13 +8540,15 @@ export default function App() {
         <SavedScreen
           savedSubTab={savedSubTab} setSavedSubTab={setSavedSubTab}
           toMake={toMake} favorites={favorites}
-          onRemoveToMake={removeFromToMake} onRemoveFavorite={removeFavoriteWithUndo}
+          onRemoveToMake={removeToMakeWithUndo} onRemoveFavorite={removeFavoriteWithUndo}
           onViewToMake={viewToMake} onViewFavorite={viewFavorite}
           onUpdateNote={updateFavoriteNote}
           onUpdateToMakeName={updateToMakeName}
           onUpdateFavoriteName={updateFavoriteName}
           pendingFavoriteRemoval={pendingFavoriteRemoval}
           onUndoFavoriteRemoval={undoFavoriteRemoval}
+          pendingToMakeRemoval={pendingToMakeRemoval}
+          onUndoToMakeRemoval={undoToMakeRemoval}
         />
       )}
 
@@ -8597,10 +8698,28 @@ export default function App() {
                 setResult(prev => prev ? { ...prev, toMakeId: null } : prev)
               }
             }}
+            // Session 19, Change 2: reuses removeFavoriteWithUndo (Session
+            // 18) — the row leaves local state immediately and the real
+            // delete is deferred, same as the × control on FavoriteCard —
+            // then returns to the Favorites list, per the session brief,
+            // rather than leaving the user on a detail view for a recipe
+            // that's no longer saved anywhere.
+            onRemoveFromFavorites={id => {
+              removeFavoriteWithUndo(id)
+              setResultSource(null); setResult(null); setAdjustmentNote(null); setError(null)
+              setSavedSubTab('favorites'); setScreen('saved')
+            }}
             toMake={toMake}
             onSaveToMake={async res => {
               const newId = await saveToMake(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty, creator: res.creator, bar: res.bar, year: res.year, attributionSource: res.attributionSource, attributionUserSupplied: res.attributionUserSupplied, parentRecipe: res.parentRecipe, replacements: res.replacements, nameUserSupplied: res.nameUserSupplied })
               setResult(prev => prev ? { ...prev, toMakeId: newId } : prev)
+            }}
+            // Session 19, Change 2: to_make's own version of the Favorites
+            // remove-and-return above, via removeToMakeWithUndo.
+            onRemoveFromToMake={id => {
+              removeToMakeWithUndo(id)
+              setResultSource(null); setResult(null); setAdjustmentNote(null); setError(null)
+              setSavedSubTab('ondeck'); setScreen('saved')
             }}
             onFeedback={handleFeedback}
             feedbackLoading={feedbackLoading}
