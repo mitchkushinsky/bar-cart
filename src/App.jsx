@@ -385,6 +385,24 @@ The found/substitute boundary is PRODUCT CATEGORY, not flavor similarity. Differ
 
 const CAN_MAKE_NOW_RULE = `Set can_make_now: true when every required ingredient OTHER than the featured ingredient(s) is "found" or "substitute" — the user can make a recognizable version of this drink tonight without buying anything. Set it false only when at least one non-featured ingredient is "missing." Judge this honestly for each suggestion on its own; do not aim for a particular mix of true/false results across a batch — if everything is genuinely makeable, every suggestion should say so.`
 
+// Session 20: only analyzeSuggestionDetail uses this today, but it's its own
+// constant like every other prompt fragment in this section rather than
+// inlined into that one call site. Same "say something only when there's
+// something to say" discipline as WATCH_OUTS_INSTRUCTION above — most
+// ingredients get null, and a bottle_note on nearly every bottled ingredient
+// means the model is being too permissive, not too helpful. Reads the same
+// Generic Type column OWNERSHIP_STATUS_RULES already relies on for found/
+// substitute matching — no separate inventory pass, no second inventory
+// block, just a different question asked of the one already provided.
+const BOTTLE_JUSTIFICATION_INSTRUCTION = `BOTTLE CHOICE — first, a gate: does the ingredient's text in the fixed list above actually name a specific product or brand ("Rittenhouse Rye", "Carpano Antica", "Forthave Astor Batch Monofloral Amaro")? If it's a bare category with no producer or brand in it — "rye whiskey", "sweet vermouth", "gin", "amaro" — the skeleton never chose a specific bottle in the first place, so there is nothing to justify: set "bottle_note" to null and move on, regardless of how many bottles are owned in that category. This gate comes first, before anything below, and it is not optional — "Sweet Vermouth" is exactly the kind of bare category this must return null for, every time, even in a drink where vermouth choice would otherwise matter.
+
+Only once an ingredient clears that gate: use the Generic Type column in the BAR INVENTORY above to check how many bottles the user owns in that same Generic Type.
+- Only one bottle owned in that Generic Type, or the ingredient has no Generic Type at all: nothing was actually chosen between alternatives either. Set "bottle_note" to null.
+- More than one bottle owned in that Generic Type: decide whether picking this one over the others is load-bearing or preference, before writing anything.
+  - PREFERENCE: the category itself does the work, and any owned bottle in it would make substantially the same drink — which rye goes into a Manhattan is a bartender's choice, not a decision the drink depends on. Set "bottle_note" to null; stating a preference as if it mattered is noise, not signal.
+  - LOAD-BEARING: this specific bottle supplies something the drink depends on for its character — which amaro goes into a drink built around amaro's bitterness genuinely changes what the drink is. Write one line: why this bottle earns the spot, then which other owned bottles in the same Generic Type would also work and roughly how the drink would differ with them. Name only bottles that actually appear in the BAR INVENTORY above — never one the user doesn't own.
+Voice: terse, direct, expert — a bartender telling you which bottle to reach for and why, not a tasting note. Most ingredients should get null here — either the gate stops them or the preference case does — and if you're writing one for nearly every bottled ingredient, you're being too permissive.`
+
 // Session 8 (skeleton-first): appended wherever a first-pass listing still
 // needs can_make_now without paying for the per-ingredient breakdown that
 // normally justifies it. Without this, the reasoning tends to come back
@@ -1781,6 +1799,8 @@ Check every non-garnish, non-pantry-staple ingredient in the fixed list above ag
 
 ${isPublished ? '' : WATCH_OUTS_INSTRUCTION}
 
+${BOTTLE_JUSTIFICATION_INSTRUCTION}
+
 Return ONLY valid JSON with no markdown fences:
 {
   "difficulty": "easy | medium | hard",
@@ -1790,10 +1810,11 @@ Return ONLY valid JSON with no markdown fences:
   "technique_notes": "string or null",${isPublished ? '' : `
   "watch_outs": "string or null",`}
   "ingredients": [
-    { "ingredient": "string", "status": "found | substitute | missing", "location": "string or null", "substitute": "string or null", "substitute_location": "string or null", "flavor_impact": "string or null" }
+    { "ingredient": "string", "status": "found | substitute | missing", "location": "string or null", "substitute": "string or null", "substitute_location": "string or null", "flavor_impact": "string or null", "bottle_note": "string or null" }
   ]
 }
-${isPublished ? '' : 'watch_outs must be null (not omitted) when there is nothing worth flagging.'}`,
+${isPublished ? '' : 'watch_outs must be null (not omitted) when there is nothing worth flagging.'}
+bottle_note must be null (not omitted) for every ingredient where nothing genuinely needed to be said.`,
     }],
   }
   const text = diagLabel ? (await callClaudeStreamDiag(body, diagLabel)).text : await callClaudeText(body)
@@ -1833,6 +1854,11 @@ function mergeSuggestionDetail(skeleton, detail) {
       substitute: d?.substitute ?? null,
       substitute_location: d?.substitute_location ?? null,
       flavor_impact: d?.flavor_impact ?? null,
+      // Session 20: carried through exactly like every other detail-only
+      // ownership field above — matched to the skeleton's own ingredient
+      // name, same drift guard, same "skeleton wins" rule. This can only
+      // ever annotate the bottle the skeleton already named, never change it.
+      bottle_note: d?.bottle_note ?? null,
     }
   })
   return {
@@ -2918,6 +2944,18 @@ function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer }) {
                 <>Sub: <span style={{ color: C.gold }}>{item.substitute}</span>{item.substitute_location && <span style={{ color: C.textFaint }}> ({item.substitute_location})</span>}{item.flavor_impact && ' — '}</>
               )}
               {item.flavor_impact && <span>{item.flavor_impact}</span>}
+            </div>
+          )}
+          {/* Session 20: only ever set when this ingredient named a specific
+              bottle AND the user owns more than one in its Generic Type AND
+              the choice is load-bearing — see BOTTLE_JUSTIFICATION_INSTRUCTION.
+              Rendered right under the ingredient it explains, where the
+              decision actually gets acted on, distinct from the substitute/
+              flavor_impact block above (that's about an ownership gap; this
+              is about a choice already made among bottles the user owns). */}
+          {item.bottle_note && (
+            <div style={{ fontSize: 13, color: C.textMuted, marginTop: 8, fontStyle: 'italic' }}>
+              🥃 {item.bottle_note}
             </div>
           )}
           {item.notes && <div style={{ fontSize: 13, color: C.textFaint, marginTop: 6 }}>{item.notes}</div>}
@@ -4779,6 +4817,11 @@ function RecipeCard({
                       <span style={{ color: C.text }}>{ing.ingredient}</span>
                       {ing.location && <span style={{ color: C.textMuted }}> · 📍 {ing.location}</span>}
                       {ing.substitute && <div style={{ color: C.textFaint, fontStyle: 'italic', marginTop: 2 }}>Sub: {ing.substitute}{ing.flavor_impact ? ` — ${ing.flavor_impact}` : ''}</div>}
+                      {/* Session 20: same field, same rendering rule as IngredientCard
+                          (the Analyze/On Deck/Favorites detail view) — this is the
+                          Explorations path's own separate ingredient list, see the
+                          "unify with shared RecipeCard" TODO on Results. */}
+                      {ing.bottle_note && <div style={{ color: C.textFaint, fontStyle: 'italic', marginTop: 2 }}>🥃 {ing.bottle_note}</div>}
                     </div>
                   </div>
                 )
