@@ -573,6 +573,25 @@ function resolveIngredientGenericType(text, inventoryTags) {
   return resolveIngredientTag(text, inventoryTags)?.generic_type ?? null
 }
 
+// Session 13, Change 2 — shared by IngredientSearch and the "+ Add an
+// Ingredient" adder (Session 21 ported it into IngredientSearch, which is the
+// component both the primary seed input and "add a second ingredient"
+// actually use; see that component for why one copy now covers both). Exact
+// match (after accent/case folding) against a generic_type or one of its
+// aliases, deliberately not phraseMatch's whole-word containment above —
+// typing "gin" should offer "Gin (unspecified)", typing "ginger" should not.
+function matchGenericType(text, inventoryTags) {
+  const normQ = normalizeForMatch(text)
+  if (!normQ || !inventoryTags) return null
+  for (const tag of Object.values(inventoryTags)) {
+    if (!tag?.generic_type) continue
+    if (normalizeForMatch(tag.generic_type) === normQ || (tag.aliases || []).some(a => normalizeForMatch(a) === normQ)) {
+      return tag.generic_type
+    }
+  }
+  return null
+}
+
 // Session 17, Change 1: does this one recipe ingredient line satisfy this one
 // featured ingredient \u2014 by name, by alias, or by shared generic_type (the
 // boundary Change 2 narrows in the prompt itself: Campari is bitter aperitivo,
@@ -3969,7 +3988,7 @@ function SavedScreen({ savedSubTab, setSavedSubTab, toMake, favorites, onRemoveT
 
 // ─── Explorations ─────────────────────────────────────────────────────────────
 
-function IngredientSearch({ inventory, selected, onSelect, onRemove }) {
+function IngredientSearch({ inventory, inventoryTags, selected, onSelect, onRemove }) {
   const [query, setQuery] = useState('')
   const [suggestions, setSuggestions] = useState([])
   const [showSecondInput, setShowSecondInput] = useState(false)
@@ -3987,6 +4006,22 @@ function IngredientSearch({ inventory, selected, onSelect, onRemove }) {
 
   const showDropdown = query.trim().length > 0 && (suggestions.length > 0 || true)
   const exactMatch = suggestions.some(s => s.spirit.toLowerCase() === query.toLowerCase())
+
+  // Session 21: this is the component the primary seed input and "add a
+  // second ingredient" both actually render (see the two usages below) —
+  // Session 13's generic row landed only on the separate third-plus-ingredient
+  // adder, never here, which is why typing "gin" or "vodka" on either of these
+  // two inputs returned only inventory matches and free text. Same rule
+  // (matchGenericType), same wording, so it's consistent wherever ingredients
+  // are entered rather than a third copy of this logic.
+  const matchedGeneric = matchGenericType(query, inventoryTags)
+  const genericLabel = matchedGeneric ? titleCase(matchedGeneric) : null
+  const genericAlreadySelected = genericLabel && selected.map(s => s.trim().toLowerCase()).includes(genericLabel.trim().toLowerCase())
+  const showGeneric = genericLabel && !genericAlreadySelected
+  // Redundant with the generic row when the typed text IS the generic_type
+  // itself (typing "Gin" when "gin" is the generic_type) — suppress free text
+  // there so there aren't two rows doing the same thing.
+  const freeTextRedundant = showGeneric && normalizeForMatch(genericLabel) === normalizeForMatch(query)
 
   return (
     <div style={{ position: 'relative' }}>
@@ -4027,9 +4062,17 @@ function IngredientSearch({ inventory, selected, onSelect, onRemove }) {
                   {item.category && <span style={{ fontSize: 11, color: C.textFaint }}>{item.category}</span>}
                 </div>
               ))}
-              {!exactMatch && query.trim() && (
+              {showGeneric && (
+                <div onClick={() => pick(genericLabel)}
+                  style={{ padding: '10px 14px', cursor: 'pointer', fontSize: 14, borderTop: suggestions.length ? `1px solid ${C.border}` : 'none' }}
+                  onMouseEnter={e => e.currentTarget.style.background = C.border}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                  {genericLabel} (unspecified)
+                </div>
+              )}
+              {!exactMatch && !freeTextRedundant && query.trim() && (
                 <div onClick={() => pick(query.trim())}
-                  style={{ padding: '10px 14px', cursor: 'pointer', fontSize: 14, color: C.textMuted, borderTop: suggestions.length ? `1px solid ${C.border}` : 'none' }}
+                  style={{ padding: '10px 14px', cursor: 'pointer', fontSize: 14, color: C.textMuted, borderTop: (suggestions.length || showGeneric) ? `1px solid ${C.border}` : 'none' }}
                   onMouseEnter={e => e.currentTarget.style.background = C.border}
                   onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
                   Use "{query.trim()}" →
@@ -4980,6 +5023,11 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const [originalsFetched, setOriginalsFetched] = useState(false)
   const [seeMoreLoading, setSeeMoreLoading] = useState(false)
   const [seeMoreError, setSeeMoreError] = useState(null)
+  // Session 21: true when a see-more-ideas batch came back non-empty but the
+  // seed-ingredient filter (below) dropped every suggestion for not actually
+  // using a listed ingredient — distinct from the model itself returning
+  // nothing, which isn't a flag-worthy case.
+  const [seeMoreSeedWarning, setSeeMoreSeedWarning] = useState(false)
   const [moreIdeasExist, setMoreIdeasExist] = useState(false)
   const [morePublishedExist, setMorePublishedExist] = useState(false)
   const [seeMorePublishedLoading, setSeeMorePublishedLoading] = useState(false)
@@ -5522,6 +5570,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     setStep('loading')
     setOriginalsFetched(false)
     setSeeMoreError(null)
+    setSeeMoreSeedWarning(false)
     setMoreIdeasExist(false)
     setMorePublishedExist(false)
     setSeeMorePublishedError(null)
@@ -5690,6 +5739,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     const baseSuggestions = opts.baseSuggestions ?? result?.suggestions ?? []
     setSeeMoreLoading(true)
     setSeeMoreError(null)
+    setSeeMoreSeedWarning(false)
     try {
       const modifiers = { frozen, lowABV, na }
       // Prior riffs/originals only — tier-1 names aren't relevant to tier-2/3 distinctness.
@@ -5702,7 +5752,23 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         .filter(s => s.origin === 'riff' || s.origin === 'original')
         .map(s => `${s.recipe_name} (${(s.recipe || []).map(r => r.ingredient).join(', ')})`)
       const freshData = stripCiteTags(await analyzeExplorationsOriginals(selected, activeTemplate, modifiers, inventoryText, excludeNames, DIAG_ON ? 'tier2-3-see-more-ideas' : null))
-      const newSuggestions = freshData?.suggestions || []
+      const rawSuggestions = freshData?.suggestions || []
+      // Session 21, Change 2: tier-2/3 has no search tool and, until now, no
+      // code backstop for the prompt's own "every featured ingredient" rule
+      // (analyzeExplorationsOriginals's CRITICAL line) — unlike tier-1
+      // (filterSuggestionsBySeedIngredients, Session 17), it happily
+      // fabricated a full cocktail around a seed that doesn't resolve to
+      // anything real (e.g. "asdfgh"). Same filter, same reasoning: a shared
+      // name/alias/generic_type match keeps a suggestion, and an untagged
+      // seed still falls back to literal matching rather than being rejected
+      // for being untagged alone.
+      const newSuggestions = filterSuggestionsBySeedIngredients(rawSuggestions, selected, inventoryTags, DIAG_ON ? 'tier2-3-see-more-ideas' : null)
+      // Everything the model proposed failed to actually use a listed
+      // ingredient — the likely cause is a seed that isn't a real/recognized
+      // ingredient (typo or invented), not that no ideas exist. Left false
+      // when the model itself returned nothing; that's a genuine miss, not
+      // something to flag.
+      setSeeMoreSeedWarning(rawSuggestions.length > 0 && newSuggestions.length === 0)
       // Session 11, Change 2: existing cards must not reorder or shift — only
       // sort the NEW batch among itself, then append it after what's already
       // there, rather than re-sorting the whole merged list (which used to
@@ -5880,7 +5946,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     }
   }
 
-  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -6233,7 +6299,7 @@ Rules:
     <div>
       <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 4 }}>Explorations</div>
       <div style={{ fontSize: 14, color: C.textMuted, marginBottom: 24, lineHeight: 1.55 }}>Pick up to 2 ingredients and we'll suggest cocktails you can make — or inspire you to try something new.</div>
-      <IngredientSearch inventory={inventory} selected={selected}
+      <IngredientSearch inventory={inventory} inventoryTags={inventoryTags} selected={selected}
         onSelect={ing => { setSelected(p => [...p, ing]); setTemplate(null); setFrozen(false); setNa(false) }}
         onRemove={ing => { setSelected(p => p.filter(i => i !== ing)); setTemplate(null); setFrozen(false); setNa(false) }} />
       {selected.length > 0 && (
@@ -6453,22 +6519,12 @@ Rules:
               // Session 13, Change 2: offer the generic category too, same
               // "<Category> (unspecified)" wording as CategoryBottlesDrawer —
               // only when the typed text actually matches a generic_type or
-              // one of its aliases (normalizeForMatch, so "curacao" still
-              // finds "triple sec"'s bottles the same way the affinity chip
-              // dot does). Arbitrary text that matches neither a bottle nor a
-              // known category still falls through to free text below,
-              // unchanged.
+              // one of its aliases (matchGenericType, shared with
+              // IngredientSearch — Session 21). Arbitrary text that matches
+              // neither a bottle nor a known category still falls through to
+              // free text below, unchanged.
               const normQ = normalizeForMatch(adderQuery)
-              let matchedGeneric = null
-              if (inventoryTags) {
-                for (const tag of Object.values(inventoryTags)) {
-                  if (!tag?.generic_type) continue
-                  if (normalizeForMatch(tag.generic_type) === normQ || (tag.aliases || []).some(a => normalizeForMatch(a) === normQ)) {
-                    matchedGeneric = tag.generic_type
-                    break
-                  }
-                }
-              }
+              const matchedGeneric = matchGenericType(adderQuery, inventoryTags)
               const genericLabel = matchedGeneric ? titleCase(matchedGeneric) : null
               const genericAlreadySelected = genericLabel && selectedNorm.includes(genericLabel.trim().toLowerCase())
               const showGeneric = genericLabel && !genericAlreadySelected
@@ -6767,6 +6823,15 @@ Rules:
               {seeMoreLoading ? SEE_MORE_IDEAS_MSGS[seeMoreIdeasMsgIdx] : 'See more ideas →'}
             </button>
             {seeMoreError && <div style={{ fontSize: 13, color: C.red, marginTop: 8 }}>{seeMoreError}</div>}
+            {/* Session 21, Change 2: distinct from seeMoreError (a request failure) —
+                the request succeeded but nothing it proposed actually used a listed
+                ingredient, which is the signature of a seed that doesn't resolve to
+                anything real rather than a genuine lack of ideas. */}
+            {seeMoreSeedWarning && (
+              <div style={{ fontSize: 13, color: C.amber, marginTop: 8, lineHeight: 1.5 }}>
+                Nothing came back that actually used every ingredient listed above — double-check the spelling, or it may not be a recognized ingredient.
+              </div>
+            )}
           </div>
         )}
         <div ref={feedbackBannerRef}>
