@@ -573,6 +573,59 @@ function resolveIngredientGenericType(text, inventoryTags) {
   return resolveIngredientTag(text, inventoryTags)?.generic_type ?? null
 }
 
+// Session 22, Change 1 — render-time ownership, not generation-time. Session 4's
+// plan called for availability computed live rather than frozen into stored
+// fields; Session 5 defined the found/substitute/missing rule correctly but kept
+// it model-generated, so a recipe's ownership froze the moment it was generated
+// and went stale the instant inventory changed — a bottle bought later, or a
+// misspelling fixed and retagged, never updated an already-generated or
+// already-saved recipe. resolveIngredientTag already encodes exactly the
+// "found" boundary OWNERSHIP_STATUS_RULES defines — owned outright, or as a
+// different producer's bottle of the SAME product type, via shared generic_type
+// or alias (which is also how a recipe calling for Lillet Blanc can resolve
+// found against only Cocchi Americano on the shelf, when tagging has given the
+// two a shared generic_type or a crossing alias) — so recomputing it fresh at
+// read time needs no new matching logic, only calling the Session 17 helper
+// here instead of solely at generation time.
+function isLiveFound(ingredientName, inventoryTags) {
+  return !!resolveIngredientTag(ingredientName, inventoryTags)
+}
+
+// A live match is always "found" — no purchase needed regardless of what was
+// stored, even a judged "substitute": the exact-or-equivalent product being
+// owned now makes the substitute moot. No live match falls back to the STORED
+// status unchanged, never downgraded — "substitute" and "missing" both require
+// judgment (is this genuinely a working substitute, and what changes?) a
+// lookup can't replace, so this deliberately leaves both exactly as generated.
+// The stored `status` field itself is untouched by this — it stays the source
+// of truth for what was saved, just not for what's displayed.
+function liveIngredientStatus(storedStatus, ingredientName, inventoryTags) {
+  return isLiveFound(ingredientName, inventoryTags) ? 'found' : storedStatus
+}
+
+// The Can Make Now / Shopping Required split has to track the same live
+// ownership the ingredient list itself now shows, or a recipe whose
+// ingredients all render found could still sit under Shopping Required —
+// worse than the staleness this change fixes. Computed from the suggestion's
+// own recipe (ingredient names), present on a skeleton as much as a detailed
+// suggestion, so this needs no detail fetch to stay current. Same
+// CAN_MAKE_NOW_RULE boundary (every non-featured ingredient found or
+// substitute) and the same featured-ingredient exemption SEED_INGREDIENT_EXEMPT
+// already applies at generation time, evaluated live instead of trusted from
+// generation time. Before any detail has ever been fetched — no per-ingredient
+// breakdown yet to recheck — this falls back to the suggestion's own
+// generation-time can_make_now rather than guessing, the same "nothing to
+// improve on yet" reasoning ensureDetail's hasDetail check already uses.
+function liveCanMakeNow(suggestion, primaryIngredients, inventoryTags) {
+  if (!suggestion?.ingredients || suggestion.ingredients.length === 0) return suggestion?.can_make_now ?? false
+  const featured = new Set((primaryIngredients || []).map(p => p.trim().toLowerCase()))
+  return suggestion.ingredients.every(ing => {
+    if (!ing?.ingredient) return true
+    if (featured.has(ing.ingredient.trim().toLowerCase())) return true
+    return liveIngredientStatus(ing.status, ing.ingredient, inventoryTags) !== 'missing'
+  })
+}
+
 // Session 13, Change 2 — shared by IngredientSearch and the "+ Add an
 // Ingredient" adder (Session 21 ported it into IngredientSearch, which is the
 // component both the primary seed input and "add a second ingredient"
@@ -2121,7 +2174,12 @@ ${OWNERSHIP_STATUS_RULES}
 
 ${CAN_MAKE_NOW_RULE}
 
-Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes. The summary field should include a short characterization of the drink's flavor profile. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, technique_notes, glass_type).
+${WATCH_OUTS_INSTRUCTION}
+This batch mixes origin_flag "from_recipe" and "original" suggestions — apply the above only to a suggestion whose origin_flag is "original." Set watch_outs to null for any suggestion whose origin_flag is "from_recipe," the same exemption published recipes get everywhere else.
+
+${BOTTLE_JUSTIFICATION_INSTRUCTION}
+
+Each suggestion MUST include ALL of these fields with non-empty values: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact, bottle_note}), technique_notes, watch_outs. The summary field should include a short characterization of the drink's flavor profile. Do not omit or leave any of these fields empty or null except where the schema explicitly allows null (location, substitute, substitute_location, flavor_impact, bottle_note, technique_notes, glass_type, watch_outs).
 
 Return ONLY valid JSON with no markdown fences:
 {
@@ -2147,13 +2205,16 @@ Return ONLY valid JSON with no markdown fences:
           "location": "string or null",
           "substitute": "string or null",
           "substitute_location": "string or null",
-          "flavor_impact": "string or null"
+          "flavor_impact": "string or null",
+          "bottle_note": "string or null"
         }
       ],
-      "technique_notes": "string or null"
+      "technique_notes": "string or null",
+      "watch_outs": "string or null"
     }
   ]
-}`,
+}
+watch_outs must be null (not omitted) when there is nothing worth flagging, and for every suggestion whose origin_flag is "from_recipe." bottle_note must be null (not omitted) for every ingredient where nothing genuinely needed to be said.`,
     }],
   }
   const firstText = await callClaudeText(body)
@@ -2340,6 +2401,12 @@ async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, ta
   const demotionNamingNote = (suggestion?.origin === 'published' || suggestion?.origin === 'published_variation')
     ? `\n\nThis is currently a documented, published recipe (${suggestion.recipe_name}). If your adjustment changes it into your own variation rather than the documented build, give it a new name that reflects the change — never return the original published name for a build that's no longer that published recipe.`
     : ''
+  // Session 22, Change 2: same isPublished boundary analyzeSuggestionDetail
+  // already uses for this gate, via resolveOrigin so a suggestion carrying
+  // only the legacy origin_flag (a prior refine/tweak result being tweaked
+  // again) resolves the same way a first-class origin would.
+  const resolvedOrigin = resolveOrigin(suggestion?.origin, suggestion?.origin_flag)
+  const isPublished = resolvedOrigin === 'published' || resolvedOrigin === 'published_variation'
   const body = {
     model: MODEL,
     max_tokens: 1500,
@@ -2357,7 +2424,11 @@ ${inventoryText}
 
 ${OWNERSHIP_STATUS_RULES}
 
-Return a revised version of just this one suggestion in the same JSON structure as a single suggestion object, re-checking every ingredient in the "ingredients" array (location, substitute, substitute_location, flavor_impact) against the bar inventory above per the ownership rule — do not leave stale or guessed status values from the original. Set can_make_now: true when every ingredient is "found" or "substitute", false only when at least one is "missing". Also include a "tweak_label" field: a short 3-6 word label summarizing what changed (e.g. "Sparkling rosé swap, soda removed"). Return ONLY valid JSON with no markdown fences — a single object, not an array.`,
+${isPublished ? '' : WATCH_OUTS_INSTRUCTION}
+
+${BOTTLE_JUSTIFICATION_INSTRUCTION}
+
+Return a revised version of just this one suggestion in the same JSON structure as a single suggestion object, re-checking every ingredient in the "ingredients" array (location, substitute, substitute_location, flavor_impact, bottle_note) against the bar inventory above per the ownership rule and the bottle-choice gates above — do not leave stale or guessed status values from the original. Set can_make_now: true when every ingredient is "found" or "substitute", false only when at least one is "missing". ${isPublished ? 'This is a published recipe — leave "watch_outs" null (even if the current suggestion object already carries a non-null value from before); watch_outs is never used for a published recipe. ' : 'Include a "watch_outs" field (string or null) per the guidance above — null when there is nothing worth flagging. '}Also include a "tweak_label" field: a short 3-6 word label summarizing what changed (e.g. "Sparkling rosé swap, soda removed"). Return ONLY valid JSON with no markdown fences — a single object, not an array.`,
     }],
   }
   const firstText = await callClaudeText(body)
@@ -2392,11 +2463,15 @@ Maintain your diagnostic position across exchanges. If you identify a problem in
 ${recipeSummary}${tastingContext ? `\n\n${tastingContext}` : ''}${tweakHistory.length > 0 ? `\n\nPrior tweaks on this recipe's lineage:\n${tweakHistory.map(p => `- "${p}"`).join('\n')}` : ''}${affinityContext ? `\n\nAffinity reference:\n${affinityContext}` : ''}`
 
   if (isFinal) {
+    // Session 22, Change 2: same isPublished boundary tweakSingleSuggestion
+    // and analyzeSuggestionDetail use for this gate.
+    const resolvedOrigin = resolveOrigin(suggestion?.origin, suggestion?.origin_flag)
+    const isPublished = resolvedOrigin === 'published' || resolvedOrigin === 'published_variation'
     const finalMessages = [
       ...messages,
       {
         role: 'user',
-        content: `Synthesize this into a concrete tweak. Write one sentence starting with "Based on what you're describing, here's what I'd try: " Then write "---JSON---" on a new line followed by the complete revised recipe as valid JSON — same structure as the original with all fields: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact}), technique_notes, tweak_label (a short 3-6 word label summarizing what changed, e.g. "Sparkling rosé swap, soda removed"). Re-check every ingredient's status/location/substitute against this bar inventory instead of leaving stale values from the original:\n\n${inventoryText}\n\n${OWNERSHIP_STATUS_RULES}\n\nSet can_make_now: true when every ingredient is "found" or "substitute", false only when at least one is "missing".`,
+        content: `Synthesize this into a concrete tweak. Write one sentence starting with "Based on what you're describing, here's what I'd try: " Then write "---JSON---" on a new line followed by the complete revised recipe as valid JSON — same structure as the original with all fields: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact, bottle_note}), technique_notes${isPublished ? '' : ', watch_outs'}, tweak_label (a short 3-6 word label summarizing what changed, e.g. "Sparkling rosé swap, soda removed"). Re-check every ingredient's status/location/substitute against this bar inventory instead of leaving stale values from the original:\n\n${inventoryText}\n\n${OWNERSHIP_STATUS_RULES}\n\n${isPublished ? '' : WATCH_OUTS_INSTRUCTION}\n\n${BOTTLE_JUSTIFICATION_INSTRUCTION}\n\nSet can_make_now: true when every ingredient is "found" or "substitute", false only when at least one is "missing".${isPublished ? ' This is a published recipe — leave "watch_outs" null (even if the current suggestion object already carries a non-null value from before); watch_outs is never used for a published recipe.' : ' watch_outs must be null (not omitted) when there is nothing worth flagging.'} bottle_note must be null (not omitted) for every ingredient where nothing genuinely needed to be said.`,
       },
     ]
     const body = { model: MODEL, max_tokens: 1500, system, messages: finalMessages }
@@ -2905,7 +2980,7 @@ function AttributionDrawer({ recipe, onSave, onClose, saving, error }) {
 
 // ─── Ingredient Card ──────────────────────────────────────────────────────────
 
-function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer }) {
+function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer, inventoryTags }) {
   const isExpired = (() => {
     if (!item.shelf_warning) return false
     const match = item.shelf_warning.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/)
@@ -2914,8 +2989,11 @@ function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer }) {
     return new Date(+match[3], +match[1] - 1, +match[2]) < now
   })()
   const inList = shoppingList.some(s => s.name.toLowerCase() === item.ingredient.toLowerCase())
-  const isMissing = item.status === 'missing'
-  const dotColor = item.status === 'found' ? C.green : item.status === 'substitute' ? C.amber : C.missing
+  // Session 22, Change 1: live ownership, not whatever status this item was
+  // generated or saved with — see liveIngredientStatus.
+  const liveStatus = liveIngredientStatus(item.status, item.ingredient, inventoryTags)
+  const isMissing = liveStatus === 'missing'
+  const dotColor = liveStatus === 'found' ? C.green : liveStatus === 'substitute' ? C.amber : C.missing
 
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
@@ -2925,13 +3003,13 @@ function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 2 }}>
             <span onClick={() => onOpenDrawer(item)} style={{ fontWeight: 600, fontSize: 15, cursor: 'pointer', textDecoration: 'underline', textDecorationStyle: 'dotted', textUnderlineOffset: 3 }}>{item.ingredient}</span>
             {isMissing && <Chip color={C.missing}>missing</Chip>}
-            {item.status === 'substitute' && <Chip color={C.amber}>substitute</Chip>}
-            {(item.status === 'missing' || item.status === 'substitute') && !inList && (
+            {liveStatus === 'substitute' && <Chip color={C.amber}>substitute</Chip>}
+            {(liveStatus === 'missing' || liveStatus === 'substitute') && !inList && (
               <button onClick={() => onAddToList(item.ingredient)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 4, color: C.textMuted, fontSize: 11, padding: '2px 7px', cursor: 'pointer' }}>
                 + Add to List
               </button>
             )}
-            {(item.status === 'missing' || item.status === 'substitute') && inList && (
+            {(liveStatus === 'missing' || liveStatus === 'substitute') && inList && (
               <span style={{ fontSize: 11, color: C.textFaint }}>✓ On list</span>
             )}
           </div>
@@ -2957,7 +3035,11 @@ function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer }) {
               ❄️ {item.refrigerate_tip}
             </div>
           )}
-          {(item.substitute || item.flavor_impact) && (
+          {/* Session 22, Change 1: gated on liveStatus, not the stored status —
+              a live match upgrades this ingredient to "found," at which point a
+              stored substitute suggestion is moot and showing it alongside a
+              found dot would read as self-contradictory. */}
+          {liveStatus === 'substitute' && (item.substitute || item.flavor_impact) && (
             <div style={{ fontSize: 13, color: C.textMuted, marginTop: 8, fontStyle: 'italic' }}>
               {item.substitute && (
                 <>Sub: <span style={{ color: C.gold }}>{item.substitute}</span>{item.substitute_location && <span style={{ color: C.textFaint }}> ({item.substitute_location})</span>}{item.flavor_impact && ' — '}</>
@@ -3179,7 +3261,7 @@ function DifficultyBadge({ difficulty }) {
 // ─── Results ──────────────────────────────────────────────────────────────────
 
 // TODO: unify with shared RecipeCard once the Analyze/Name/Menu flow is in scope (Session 1.5)
-function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onSaveFavorite, onRemoveFromFavorites, toMake, onSaveToMake, onRemoveFromToMake, onFeedback, feedbackLoading, inventory, feedbackError, onOpenAttributionEdit, onRename, pendingReplace, onReplaceDecision }) {
+function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onSaveFavorite, onRemoveFromFavorites, toMake, onSaveToMake, onRemoveFromToMake, onFeedback, feedbackLoading, inventory, inventoryTags, feedbackError, onOpenAttributionEdit, onRename, pendingReplace, onReplaceDecision }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
   const adjustmentNoteRef = useRef(null)
@@ -3391,7 +3473,7 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
       {tab === 'ingredients' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {(result.ingredients || []).map((item, i) => (
-            <IngredientCard key={i} item={item} shoppingList={shoppingList} onAddToList={onAddToList} onOpenDrawer={openDrawer} />
+            <IngredientCard key={i} item={item} shoppingList={shoppingList} onAddToList={onAddToList} onOpenDrawer={openDrawer} inventoryTags={inventoryTags} />
           ))}
         </div>
       )}
@@ -4384,6 +4466,7 @@ function RecipeCard({
   onTriedToggle = null,
   onNotesSave = null,
   inventoryText = '',
+  inventoryTags = null,
   template = null,
   modifiers = null,
   onDetailFetched = null,
@@ -4851,15 +4934,22 @@ function RecipeCard({
           {showSaveButtons && displayed.ingredients && displayed.ingredients.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
               {displayed.ingredients.filter(ing => ing.ingredient).map((ing, i) => {
-                const ingMissing = ing.status === 'missing'
-                const dotColor = ing.status === 'found' ? C.green : ing.status === 'substitute' ? C.amber : ing.status === 'missing' ? C.missing : C.textFaint
+                // Session 22, Change 1: live ownership here too — same
+                // liveIngredientStatus IngredientCard now uses, so the two
+                // ingredient-list renderers can't drift apart on this again.
+                const liveStatus = liveIngredientStatus(ing.status, ing.ingredient, inventoryTags)
+                const ingMissing = liveStatus === 'missing'
+                const dotColor = liveStatus === 'found' ? C.green : liveStatus === 'substitute' ? C.amber : liveStatus === 'missing' ? C.missing : C.textFaint
                 return (
                   <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13 }}>
                     <span style={{ display: 'inline-block', width: ingMissing ? 8 : 7, height: ingMissing ? 8 : 7, borderRadius: '50%', background: dotColor, boxShadow: ingMissing ? `0 0 0 3px ${C.missing}33` : 'none', flexShrink: 0, marginTop: 4 }} />
                     <div>
                       <span style={{ color: C.text }}>{ing.ingredient}</span>
                       {ing.location && <span style={{ color: C.textMuted }}> · 📍 {ing.location}</span>}
-                      {ing.substitute && <div style={{ color: C.textFaint, fontStyle: 'italic', marginTop: 2 }}>Sub: {ing.substitute}{ing.flavor_impact ? ` — ${ing.flavor_impact}` : ''}</div>}
+                      {/* Gated on liveStatus, not the stored status — a live match
+                          upgrades this ingredient to "found," at which point a
+                          stored substitute suggestion is moot. */}
+                      {liveStatus === 'substitute' && ing.substitute && <div style={{ color: C.textFaint, fontStyle: 'italic', marginTop: 2 }}>Sub: {ing.substitute}{ing.flavor_impact ? ` — ${ing.flavor_impact}` : ''}</div>}
                       {/* Session 20: same field, same rendering rule as IngredientCard
                           (the Analyze/On Deck/Favorites detail view) — this is the
                           Explorations path's own separate ingredient list, see the
@@ -6724,8 +6814,10 @@ Rules:
       </div>
     )
 
-    const canMake = (result.suggestions || []).filter(s => s.can_make_now)
-    const worthBuying = (result.suggestions || []).filter(s => !s.can_make_now)
+    // Session 22, Change 1: live, not the stored can_make_now — see
+    // liveCanMakeNow for why this can't just trust generation time.
+    const canMake = (result.suggestions || []).filter(s => liveCanMakeNow(s, selected, inventoryTags))
+    const worthBuying = (result.suggestions || []).filter(s => !liveCanMakeNow(s, selected, inventoryTags))
 
     return (
       <div>
@@ -6756,7 +6848,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} toMake={toMake} onSaved={(name, id) => handleRecipeSaved(name, id)} /></div> })}
+                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} toMake={toMake} onSaved={(name, id) => handleRecipeSaved(name, id)} /></div> })}
               </div>
             </div>
           )}
@@ -6764,7 +6856,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Shopping Required ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} toMake={toMake} onSaved={(name, id) => handleRecipeSaved(name, id)} /></div> })}
+                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} toMake={toMake} onSaved={(name, id) => handleRecipeSaved(name, id)} /></div> })}
               </div>
             </div>
           )}
@@ -6939,7 +7031,7 @@ function WhiteboardsTab({ user, onOpen }) {
   )
 }
 
-function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
+function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventoryTags }) {
   const [nodes, setNodes] = useState([])
   const [whiteboard, setWhiteboard] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -7195,6 +7287,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode }) {
           showSaveButtons={false}
           showRefineCTA={false}
           restoreRecipeNodeId={node.id}
+          inventoryTags={inventoryTags}
           onTriedToggle={async (next, triedAt) => {
             // Session 9, Change 2: was fire-and-forget with no rollback —
             // inconsistent with the (correct) tried-toggle for tweak nodes
@@ -8684,6 +8777,7 @@ export default function App() {
           whiteboardId={currentOpenWhiteboardId}
           onBack={() => { setScreen('create'); setCreateSubTab('in_progress') }}
           onContinueFromNode={restore => { setPendingExplorationRestore(restore); setCreateSubTab('new'); setScreen('create') }}
+          inventoryTags={inventoryTags}
         />
       )}
 
@@ -8777,6 +8871,7 @@ export default function App() {
             shoppingList={shoppingList}
             onAddToList={addToShopping}
             favorites={favorites}
+            inventoryTags={inventoryTags}
             onSaveFavorite={async res => {
               const newId = await saveFavorite(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty, creator: res.creator, bar: res.bar, year: res.year, attributionSource: res.attributionSource, attributionUserSupplied: res.attributionUserSupplied, parentRecipe: res.parentRecipe, replacements: res.replacements, nameUserSupplied: res.nameUserSupplied })
               setResult(prev => prev ? { ...prev, favoriteId: newId } : prev)
