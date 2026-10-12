@@ -573,6 +573,28 @@ function resolveIngredientGenericType(text, inventoryTags) {
   return resolveIngredientTag(text, inventoryTags)?.generic_type ?? null
 }
 
+// Session 23, Change 1: tags describe what a bottle IS; only CURRENT inventory
+// says whether you HAVE it. inventory_tags is append-only (the sweep in
+// api/tag-inventory.js only ever adds rows, never removes one for a bottle
+// that's left the sheet), so resolveIngredientTag — called directly against
+// the raw tag store — treated an orphaned tag as proof of ownership forever.
+// getOwnedBottlesForCategory never had this hole: Session 13 built it by
+// walking `inventory` and looking up each item's tag, which can only ever
+// surface a bottle that's actually still there. This restricts
+// resolveIngredientTag-based matching to that same shape — only tags a
+// CURRENT inventory row still carries — without touching
+// resolveIngredientTag itself: its existing two-step resolution (direct
+// name, then shared generic_type/alias) just gets a narrower map to search.
+function ownedInventoryTags(inventory, inventoryTags) {
+  if (!inventoryTags) return inventoryTags
+  const live = {}
+  for (const item of (inventory || [])) {
+    const key = item.spirit.trim().toLowerCase()
+    if (inventoryTags[key]) live[key] = inventoryTags[key]
+  }
+  return live
+}
+
 // Session 22, Change 1 — render-time ownership, not generation-time. Session 4's
 // plan called for availability computed live rather than frozen into stored
 // fields; Session 5 defined the found/substitute/missing rule correctly but kept
@@ -587,8 +609,18 @@ function resolveIngredientGenericType(text, inventoryTags) {
 // two a shared generic_type or a crossing alias) — so recomputing it fresh at
 // read time needs no new matching logic, only calling the Session 17 helper
 // here instead of solely at generation time.
-function isLiveFound(ingredientName, inventoryTags) {
-  return !!resolveIngredientTag(ingredientName, inventoryTags)
+// Session 23: two paths, not one. An inventory item's own name always counts
+// first, checked directly against CURRENT inventory regardless of whether it
+// has a tag at all — the same name-matching fallback OWNERSHIP_STATUS_RULES
+// has always relied on for an untagged bottle (a real bottle with no tag is
+// still owned), applied here the same way. Only once that fails does this
+// fall through to tag-based generic_type/alias matching, and only against
+// ownedInventoryTags — a tag a bottle no longer carries can't resolve
+// anything this way either.
+function isLiveFound(ingredientName, inventory, inventoryTags) {
+  if (!ingredientName) return false
+  if ((inventory || []).some(item => phraseMatch(ingredientName, item.spirit))) return true
+  return !!resolveIngredientTag(ingredientName, ownedInventoryTags(inventory, inventoryTags))
 }
 
 // A live match is always "found" — no purchase needed regardless of what was
@@ -599,8 +631,8 @@ function isLiveFound(ingredientName, inventoryTags) {
 // lookup can't replace, so this deliberately leaves both exactly as generated.
 // The stored `status` field itself is untouched by this — it stays the source
 // of truth for what was saved, just not for what's displayed.
-function liveIngredientStatus(storedStatus, ingredientName, inventoryTags) {
-  return isLiveFound(ingredientName, inventoryTags) ? 'found' : storedStatus
+function liveIngredientStatus(storedStatus, ingredientName, inventory, inventoryTags) {
+  return isLiveFound(ingredientName, inventory, inventoryTags) ? 'found' : storedStatus
 }
 
 // The Can Make Now / Shopping Required split has to track the same live
@@ -616,13 +648,13 @@ function liveIngredientStatus(storedStatus, ingredientName, inventoryTags) {
 // breakdown yet to recheck — this falls back to the suggestion's own
 // generation-time can_make_now rather than guessing, the same "nothing to
 // improve on yet" reasoning ensureDetail's hasDetail check already uses.
-function liveCanMakeNow(suggestion, primaryIngredients, inventoryTags) {
+function liveCanMakeNow(suggestion, primaryIngredients, inventory, inventoryTags) {
   if (!suggestion?.ingredients || suggestion.ingredients.length === 0) return suggestion?.can_make_now ?? false
   const featured = new Set((primaryIngredients || []).map(p => p.trim().toLowerCase()))
   return suggestion.ingredients.every(ing => {
     if (!ing?.ingredient) return true
     if (featured.has(ing.ingredient.trim().toLowerCase())) return true
-    return liveIngredientStatus(ing.status, ing.ingredient, inventoryTags) !== 'missing'
+    return liveIngredientStatus(ing.status, ing.ingredient, inventory, inventoryTags) !== 'missing'
   })
 }
 
@@ -2980,7 +3012,7 @@ function AttributionDrawer({ recipe, onSave, onClose, saving, error }) {
 
 // ─── Ingredient Card ──────────────────────────────────────────────────────────
 
-function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer, inventoryTags }) {
+function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer, inventory, inventoryTags }) {
   const isExpired = (() => {
     if (!item.shelf_warning) return false
     const match = item.shelf_warning.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/)
@@ -2991,7 +3023,7 @@ function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer, invento
   const inList = shoppingList.some(s => s.name.toLowerCase() === item.ingredient.toLowerCase())
   // Session 22, Change 1: live ownership, not whatever status this item was
   // generated or saved with — see liveIngredientStatus.
-  const liveStatus = liveIngredientStatus(item.status, item.ingredient, inventoryTags)
+  const liveStatus = liveIngredientStatus(item.status, item.ingredient, inventory, inventoryTags)
   const isMissing = liveStatus === 'missing'
   const dotColor = liveStatus === 'found' ? C.green : liveStatus === 'substitute' ? C.amber : C.missing
 
@@ -3473,7 +3505,7 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
       {tab === 'ingredients' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {(result.ingredients || []).map((item, i) => (
-            <IngredientCard key={i} item={item} shoppingList={shoppingList} onAddToList={onAddToList} onOpenDrawer={openDrawer} inventoryTags={inventoryTags} />
+            <IngredientCard key={i} item={item} shoppingList={shoppingList} onAddToList={onAddToList} onOpenDrawer={openDrawer} inventory={inventory} inventoryTags={inventoryTags} />
           ))}
         </div>
       )}
@@ -4466,6 +4498,7 @@ function RecipeCard({
   onTriedToggle = null,
   onNotesSave = null,
   inventoryText = '',
+  inventory = null,
   inventoryTags = null,
   template = null,
   modifiers = null,
@@ -4937,7 +4970,7 @@ function RecipeCard({
                 // Session 22, Change 1: live ownership here too — same
                 // liveIngredientStatus IngredientCard now uses, so the two
                 // ingredient-list renderers can't drift apart on this again.
-                const liveStatus = liveIngredientStatus(ing.status, ing.ingredient, inventoryTags)
+                const liveStatus = liveIngredientStatus(ing.status, ing.ingredient, inventory, inventoryTags)
                 const ingMissing = liveStatus === 'missing'
                 const dotColor = liveStatus === 'found' ? C.green : liveStatus === 'substitute' ? C.amber : liveStatus === 'missing' ? C.missing : C.textFaint
                 return (
@@ -6434,12 +6467,18 @@ Rules:
     // rather than a bug fixed here — the alternative would mean constraining
     // the model's chip vocabulary to known generic_types, which touches the
     // generation prompt this session is barred from changing.
+    // Session 23: this already had the shape Session 22's live-status paths
+    // needed — walking `inventory`, looking up each item's own tag, never the
+    // reverse — so it was never exposed to an orphaned tag. Routed through
+    // ownedInventoryTags now too, not because this needed fixing, but so both
+    // paths share the one join instead of each carrying its own copy of it.
     const getOwnedBottlesForCategory = (category) => {
       const normCat = normalizeForMatch(category)
       if (!inventory || !inventoryTags) return []
-      const owned = inventory
-        .filter(item => !item.oos)
-        .map(item => ({ item, tag: inventoryTags[item.spirit.trim().toLowerCase()] }))
+      const inStock = inventory.filter(item => !item.oos)
+      const liveTags = ownedInventoryTags(inStock, inventoryTags)
+      const owned = inStock
+        .map(item => ({ item, tag: liveTags[item.spirit.trim().toLowerCase()] }))
         .filter(({ tag }) => tag)
       const resolvedType = owned.find(({ tag }) =>
         normalizeForMatch(tag.generic_type) === normCat || (tag.aliases || []).some(a => normalizeForMatch(a) === normCat)
@@ -6816,8 +6855,8 @@ Rules:
 
     // Session 22, Change 1: live, not the stored can_make_now — see
     // liveCanMakeNow for why this can't just trust generation time.
-    const canMake = (result.suggestions || []).filter(s => liveCanMakeNow(s, selected, inventoryTags))
-    const worthBuying = (result.suggestions || []).filter(s => !liveCanMakeNow(s, selected, inventoryTags))
+    const canMake = (result.suggestions || []).filter(s => liveCanMakeNow(s, selected, inventory, inventoryTags))
+    const worthBuying = (result.suggestions || []).filter(s => !liveCanMakeNow(s, selected, inventory, inventoryTags))
 
     return (
       <div>
@@ -6848,7 +6887,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} toMake={toMake} onSaved={(name, id) => handleRecipeSaved(name, id)} /></div> })}
+                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventory={inventory} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} toMake={toMake} onSaved={(name, id) => handleRecipeSaved(name, id)} /></div> })}
               </div>
             </div>
           )}
@@ -6856,7 +6895,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Shopping Required ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} toMake={toMake} onSaved={(name, id) => handleRecipeSaved(name, id)} /></div> })}
+                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventory={inventory} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} toMake={toMake} onSaved={(name, id) => handleRecipeSaved(name, id)} /></div> })}
               </div>
             </div>
           )}
@@ -7031,7 +7070,7 @@ function WhiteboardsTab({ user, onOpen }) {
   )
 }
 
-function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventoryTags }) {
+function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory, inventoryTags }) {
   const [nodes, setNodes] = useState([])
   const [whiteboard, setWhiteboard] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -7287,6 +7326,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventoryT
           showSaveButtons={false}
           showRefineCTA={false}
           restoreRecipeNodeId={node.id}
+          inventory={inventory}
           inventoryTags={inventoryTags}
           onTriedToggle={async (next, triedAt) => {
             // Session 9, Change 2: was fire-and-forget with no rollback —
@@ -8777,6 +8817,7 @@ export default function App() {
           whiteboardId={currentOpenWhiteboardId}
           onBack={() => { setScreen('create'); setCreateSubTab('in_progress') }}
           onContinueFromNode={restore => { setPendingExplorationRestore(restore); setCreateSubTab('new'); setScreen('create') }}
+          inventory={inventory}
           inventoryTags={inventoryTags}
         />
       )}
@@ -8871,6 +8912,7 @@ export default function App() {
             shoppingList={shoppingList}
             onAddToList={addToShopping}
             favorites={favorites}
+            inventory={inventory}
             inventoryTags={inventoryTags}
             onSaveFavorite={async res => {
               const newId = await saveFavorite(res, { source: res.source || analysisModeSource, origin: res.origin, originFlag: res.origin_flag, difficulty: res.difficulty, creator: res.creator, bar: res.bar, year: res.year, attributionSource: res.attributionSource, attributionUserSupplied: res.attributionUserSupplied, parentRecipe: res.parentRecipe, replacements: res.replacements, nameUserSupplied: res.nameUserSupplied })
