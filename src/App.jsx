@@ -770,6 +770,143 @@ function isGenericTypeRedundant(name, category, genericType) {
   return descriptor.every(t => nameTokens.has(t))
 }
 
+// Session 24, Change 2: a free-typed generic_type is checked against the
+// existing vocabulary for a near-duplicate before it's saved. A genuinely
+// new singleton is harmless (bitters are full of them, and Session 4's
+// dropdown-only editor made minting one impossible from the UI at all --
+// hit live creating "quinquina/americano," which needed a direct Supabase
+// edit). A near-duplicate is dangerous: bottles that should match silently
+// stop matching ("citrus vodka" beside an existing "flavored vodka", "vino
+// amaro" beside "amaro - vino"). Two independent signals, either is enough
+// to warn: short edit distance (typo, pluralization, reordering, a
+// punctuation difference) or sharing a compound's other word while
+// differing by one modifier -- a plain Levenshtein check alone misses that
+// second case, since "citrus vodka" and "flavored vodka" are far apart
+// letter-for-letter despite naming the same risk.
+function levenshteinDistance(a, b) {
+  const m = a.length, n = b.length
+  if (m === 0) return n
+  if (n === 0) return m
+  const prev = Array.from({ length: n + 1 }, (_, j) => j)
+  for (let i = 1; i <= m; i++) {
+    let prevDiag = prev[0]
+    prev[0] = i
+    for (let j = 1; j <= n; j++) {
+      const tmp = prev[j]
+      prev[j] = a[i - 1] === b[j - 1] ? prevDiag : 1 + Math.min(prev[j], prev[j - 1], prevDiag)
+      prevDiag = tmp
+    }
+  }
+  return prev[n]
+}
+function normalizeTypeText(s) {
+  return normalizeForMatch(s).replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim()
+}
+function typeTokenSet(s) {
+  const stem = w => (w.endsWith('s') && w.length > 3) ? w.slice(0, -1) : w
+  return new Set(normalizeTypeText(s).split(' ').filter(t => t.length > 1).map(stem))
+}
+// Returns null (nothing close), { kind: 'exact', match } when the typed text
+// already names an existing type verbatim (modulo case/punctuation -- reuse
+// it, no warning needed), or { kind: 'near', match } for the closest
+// existing type worth warning about.
+function nearMatchGenericType(typed, existingTypes) {
+  const nTyped = normalizeTypeText(typed)
+  if (!nTyped) return null
+  const exact = (existingTypes || []).find(t => normalizeTypeText(t) === nTyped)
+  if (exact) return { kind: 'exact', match: exact }
+  const tTyped = typeTokenSet(typed)
+  let best = null
+  for (const existing of existingTypes || []) {
+    const nExisting = normalizeTypeText(existing)
+    const dist = levenshteinDistance(nTyped, nExisting)
+    const lenThreshold = Math.max(2, Math.round(0.3 * Math.max(nTyped.length, nExisting.length)))
+    const tExisting = typeTokenSet(existing)
+    const intersection = [...tTyped].filter(t => tExisting.has(t)).length
+    const symDiff = tTyped.size + tExisting.size - 2 * intersection
+    const isClose = dist <= lenThreshold || (intersection >= 1 && symDiff > 0 && symDiff <= 2)
+    if (isClose && (!best || dist < best.dist)) best = { kind: 'near', match: existing, dist }
+  }
+  return best
+}
+
+// Session 24, Change 1/2: the dropdown-only generic_type editor from Session
+// 4, replaced with free text plus the near-match warning above. Shared by
+// IngredientDrawer (the retag control) and the post-sweep summary (Change 1)
+// so a fix made from either place goes through the same save path and the
+// same warning. onSave is the raw write (setGenericTypeManually) -- this
+// component owns only the free-text/warning UI in front of it.
+function GenericTypeEditor({ spiritName, currentType, distinctGenericTypes, onSave }) {
+  const [value, setValue] = useState(currentType || '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState(null)
+  const [warning, setWarning] = useState(null) // { typed, suggestion }
+  const listId = `generic-types-${normalizeForMatch(spiritName).replace(/\s+/g, '-')}`
+
+  useEffect(() => { setValue(currentType || ''); setWarning(null); setError(null) }, [currentType])
+
+  const commit = async (finalValueRaw) => {
+    const cleaned = finalValueRaw.trim().toLowerCase().replace(/\s+/g, ' ')
+    setWarning(null)
+    if (!cleaned || cleaned === (currentType || '').toLowerCase()) { setValue(currentType || ''); return }
+    setSaving(true)
+    setError(null)
+    try {
+      await onSave(spiritName, cleaned)
+    } catch (err) {
+      setError(err?.message || 'Could not save.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleSubmit = () => {
+    const cleaned = value.trim()
+    if (!cleaned || cleaned.toLowerCase() === (currentType || '').toLowerCase()) { setValue(currentType || ''); return }
+    const near = nearMatchGenericType(cleaned, distinctGenericTypes || [])
+    if (near?.kind === 'near') { setWarning({ typed: cleaned, suggestion: near.match }); return }
+    commit(near?.kind === 'exact' ? near.match : cleaned)
+  }
+
+  return (
+    <div>
+      <div style={{ position: 'relative' }}>
+        <input
+          type="text"
+          value={value}
+          onChange={e => { setValue(e.target.value); setWarning(null) }}
+          onBlur={handleSubmit}
+          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); e.target.blur() } }}
+          list={listId}
+          placeholder="— untagged —"
+          disabled={saving}
+          style={{ width: '100%', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: '8px 10px', fontSize: 14, opacity: saving ? 0.6 : 1, boxSizing: 'border-box' }}
+        />
+        {saving && (
+          <span style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', display: 'inline-block', width: 12, height: 12, border: `2px solid ${C.border}`, borderTopColor: C.gold, borderRadius: '50%', animation: 'bcspini 0.6s linear infinite' }} />
+        )}
+      </div>
+      <datalist id={listId}>
+        {distinctGenericTypes?.map(t => <option key={t} value={t} />)}
+      </datalist>
+      {warning && (
+        <div style={{ fontSize: 12, color: C.amber, background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 7, padding: '8px 10px', marginTop: 8 }}>
+          Close to the existing type "{warning.suggestion}" — two names for the same thing stop bottles from matching.
+          <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+            <button onClick={() => commit(warning.suggestion)} style={{ background: 'none', border: `1px solid ${C.amber}55`, borderRadius: 6, color: C.amber, fontSize: 11, fontWeight: 600, padding: '3px 8px', cursor: 'pointer' }}>
+              Use "{warning.suggestion}"
+            </button>
+            <button onClick={() => commit(warning.typed)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 6, color: C.textMuted, fontSize: 11, padding: '3px 8px', cursor: 'pointer' }}>
+              Keep "{warning.typed}"
+            </button>
+          </div>
+        </div>
+      )}
+      {error && <div style={{ fontSize: 12, color: C.red, marginTop: 6 }}>{error}</div>}
+    </div>
+  )
+}
+
 // Session 14, Change 4: collapses duplicate bottle rows — the same product
 // kept in two spots, e.g. a backup on an overflow shelf — into one, for
 // display contexts where the bottle is a pick-one option (CategoryBottlesDrawer),
@@ -2714,19 +2851,6 @@ function IngredientDrawer({
     inv.spirit.toLowerCase().includes(item.ingredient.toLowerCase())
   )
   const tag = tags && invMatch ? tags[invMatch.spirit.trim().toLowerCase()] : null
-  const [genericTypeSaving, setGenericTypeSaving] = useState(false)
-  const [genericTypeError, setGenericTypeError] = useState(null)
-  const handleSetGenericType = async (spiritName, newType) => {
-    setGenericTypeSaving(true)
-    setGenericTypeError(null)
-    try {
-      await onSetGenericType(spiritName, newType)
-    } catch (err) {
-      setGenericTypeError(err?.message || 'Could not save.')
-    } finally {
-      setGenericTypeSaving(false)
-    }
-  }
 
   return (
     <>
@@ -2769,23 +2893,12 @@ function IngredientDrawer({
                 </button>
               )}
             </div>
-            <div style={{ position: 'relative' }}>
-              <select
-                value={tag?.generic_type || ''}
-                onChange={e => e.target.value && handleSetGenericType(invMatch.spirit, e.target.value)}
-                disabled={genericTypeSaving}
-                style={{ width: '100%', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: '8px 10px', fontSize: 14, opacity: genericTypeSaving ? 0.6 : 1 }}
-              >
-                <option value="" disabled>{tag ? tag.generic_type : '— untagged —'}</option>
-                {distinctGenericTypes?.map(t => <option key={t} value={t}>{t}</option>)}
-              </select>
-              {genericTypeSaving && (
-                <span style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', display: 'inline-block', width: 12, height: 12, border: `2px solid ${C.border}`, borderTopColor: C.gold, borderRadius: '50%', animation: 'bcspini 0.6s linear infinite' }} />
-              )}
-            </div>
-            {genericTypeError && (
-              <div style={{ fontSize: 12, color: C.red, marginTop: 6 }}>{genericTypeError}</div>
-            )}
+            <GenericTypeEditor
+              spiritName={invMatch.spirit}
+              currentType={tag?.generic_type || ''}
+              distinctGenericTypes={distinctGenericTypes}
+              onSave={onSetGenericType}
+            />
             {tag?.aliases?.length > 0 && (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
                 {tag.aliases.map(a => (
@@ -3621,7 +3734,7 @@ function calcExpiry(item) {
 function InventoryScreen({
   inventory, inStockCount, oosCount,
   inventoryTags, inventoryTagsError, untaggedBottles, distinctGenericTypes,
-  tagSweepInProgress, tagSweepProgress, tagSweepError,
+  tagSweepInProgress, tagSweepProgress, tagSweepError, lastSweepSummary,
   onTagSweep, onSetGenericType,
 }) {
   const [selectedCats, setSelectedCats] = useState(new Set())
@@ -3726,6 +3839,44 @@ function InventoryScreen({
       {tagSweepError && (
         <div style={{ fontSize: 13, color: C.red, background: C.red + '12', border: `1px solid ${C.red}33`, borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
           Tagging failed: {tagSweepError}
+        </div>
+      )}
+
+      {/* Session 24, Change 1: only the bottles from the most recent sweep or
+          retag call, not a standing report of all 193 -- gone on next load
+          since lastSweepSummary is plain state. Reads current inventoryTags
+          at render time (not the raw API response) so an inline fix via
+          GenericTypeEditor below shows up immediately, no re-sweep needed. */}
+      {!tagSweepInProgress && lastSweepSummary?.length > 0 && (
+        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 14px', marginBottom: 14 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>
+            Just tagged ({lastSweepSummary.length})
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {lastSweepSummary.map(name => {
+              const invItem = inventory.find(i => i.spirit.trim().toLowerCase() === name)
+              const tag = inventoryTags?.[name]
+              if (!invItem || !tag) return null
+              return (
+                <div key={name} style={{ borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
+                  <div style={{ fontSize: 14, color: C.text, fontWeight: 600, marginBottom: 6 }}>{invItem.spirit}</div>
+                  <GenericTypeEditor
+                    spiritName={invItem.spirit}
+                    currentType={tag.generic_type || ''}
+                    distinctGenericTypes={distinctGenericTypes}
+                    onSave={onSetGenericType}
+                  />
+                  {tag.aliases?.length > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                      {tag.aliases.map(a => (
+                        <span key={a} style={{ fontSize: 11, color: C.textFaint, background: C.border, borderRadius: 4, padding: '2px 6px' }}>{a}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
         </div>
       )}
 
@@ -7585,6 +7736,10 @@ export default function App() {
   const [tagSweepInProgress, setTagSweepInProgress] = useState(false)
   const [tagSweepProgress, setTagSweepProgress] = useState(null)
   const [tagSweepError, setTagSweepError] = useState(null)
+  // Session 24, Change 1: item_names tagged by the most recent sweep/retag
+  // call, nothing more -- plain state, not persisted, so it vanishes on the
+  // next page load rather than becoming a standing report.
+  const [lastSweepSummary, setLastSweepSummary] = useState(null)
 
   // Navigation
   const [screen, setScreen] = useState('create')
@@ -7959,10 +8114,15 @@ export default function App() {
     setTagSweepError(null)
     setTagSweepInProgress(true)
     setTagSweepProgress({ done: 0, total: deduped.length })
+    // Session 24, Change 1: cleared up front, not just on success -- a new
+    // sweep's in-progress bottles shouldn't sit next to the previous run's
+    // stale summary while they tag.
+    setLastSweepSummary(null)
     const CHUNK_SIZE = 20
     const chunks = []
     for (let i = 0; i < deduped.length; i += CHUNK_SIZE) chunks.push(deduped.slice(i, i + CHUNK_SIZE))
     let done = 0
+    const taggedThisRun = []
     try {
       for (const chunk of chunks) {
         const response = await fetch('/api/tag-inventory', {
@@ -7980,6 +8140,7 @@ export default function App() {
           for (const row of result.tags || []) next[row.item_name] = row
           return next
         })
+        for (const row of result.tags || []) taggedThisRun.push(row.item_name)
         done += chunk.length
         setTagSweepProgress({ done, total: deduped.length })
       }
@@ -7988,6 +8149,9 @@ export default function App() {
       setTagSweepError(err.message)
     } finally {
       setTagSweepInProgress(false)
+      // Report whatever actually got tagged, even if a later chunk failed --
+      // this run's bottles only, and only the ones that really went through.
+      if (taggedThisRun.length > 0) setLastSweepSummary(taggedThisRun)
     }
   }, [])
 
@@ -8766,6 +8930,7 @@ export default function App() {
           tagSweepInProgress={tagSweepInProgress}
           tagSweepProgress={tagSweepProgress}
           tagSweepError={tagSweepError}
+          lastSweepSummary={lastSweepSummary}
           onTagSweep={runTagSweep}
           onSetGenericType={setGenericTypeManually}
         />
