@@ -770,6 +770,95 @@ function titleCase(s) {
   return (s || '').replace(/(^|\s)(\p{L})/gu, (_, sep, c) => sep + c.toUpperCase())
 }
 
+// Session 26, Change 1: resolves a seed ingredient BEFORE it ever reaches a
+// prompt, rather than trusting the raw typed/picked string and only checking
+// it after generation (S17's filterSuggestionsBySeedIngredients). Only an
+// EXACT match (bottle name, or generic_type/alias via the same strict check
+// the S21 generic row itself requires) auto-resolves; anything else falls
+// through to the near-match suggestion below rather than being silently
+// resolved by phraseMatch's looser whole-word containment. That looser path
+// was tried first and reverted: it fixes "gin" (an exact generic_type word
+// inside "Fort Hamilton Gin") but reintroduces the identical bug one level
+// down — "Rittenhouse Rie" phraseMatches Rittenhouse Rye's own "rittenhouse"
+// alias as a whole word, silently resolving to generic "rye whiskey" and
+// never reaching the near-match check at all, the opposite of what typing a
+// near-miss of a specific bottle should do. Dropping loose matching in favor
+// of "suggest, never silently resolve" for anything short of exact removes
+// that whole class of bug rather than chasing each instance of it. A clicked
+// typeahead suggestion or the S21 generic row both already pass in an exact
+// name, so they resolve on the first or second try, unaffected.
+function resolveSeedIngredient(typedRaw, inventory, inventoryTags) {
+  const typed = (typedRaw || '').trim()
+  if (!typed) return { typed, resolved: typed, kind: 'unresolved', nearMatch: null }
+  const norm = normalizeForMatch(typed)
+
+  const exactBottle = (inventory || []).find(item => normalizeForMatch(item.spirit) === norm)
+  if (exactBottle) return { typed, resolved: exactBottle.spirit, kind: 'bottle', nearMatch: null }
+
+  const exactGeneric = matchGenericType(typed, inventoryTags)
+  if (exactGeneric) return { typed, resolved: titleCase(exactGeneric), kind: 'generic', nearMatch: null }
+
+  return { typed, resolved: typed, kind: 'unresolved', nearMatch: findNearMatchSeed(typed, inventory, inventoryTags) }
+}
+
+// Session 26, Change 2: deterministic, free (no API call) near-match at
+// entry. A WHOLE-STRING distance catches a typo across a full name
+// ("Rittenhouse Rie" -> "Rittenhouse Rye"); a WORD-level distance catches a
+// short typed fragment that's close to just one word of a longer candidate
+// ("Cochi" -> the "Cocchi" in "Cocchi Americano"), which whole-string
+// distance alone would miss (the lengths are too different). Threshold is an
+// absolute 1-2 characters, not a percentage of length (S24's
+// nearMatchGenericType threshold) -- a seed ingredient is usually a single
+// short phrase, where a percentage allows too much drift at this length to
+// "stay silent on genuinely novel input," which this is explicitly required
+// to do.
+function findNearMatchSeed(typed, inventory, inventoryTags) {
+  const norm = normalizeForMatch(typed)
+  if (!norm) return null
+  const typedWords = norm.split(/\s+/).filter(Boolean)
+  const candidates = new Set()
+  for (const item of (inventory || [])) if (item.spirit) candidates.add(item.spirit)
+  for (const tag of Object.values(inventoryTags || {})) {
+    if (tag?.generic_type) candidates.add(tag.generic_type)
+    for (const a of (tag?.aliases || [])) candidates.add(a)
+  }
+  let best = null
+  for (const candidate of candidates) {
+    const nc = normalizeForMatch(candidate)
+    if (!nc || nc === norm) continue
+    const wholeThreshold = Math.max(norm.length, nc.length) <= 6 ? 1 : 2
+    let dist = levenshteinDistance(norm, nc)
+    let within = dist <= wholeThreshold
+    // Word-level only for a single typed word ("Cochi" matching just the
+    // "Cocchi" word inside "Cocchi Americano") — at two-or-more typed words,
+    // this degenerates into exactly the bug above: "Rittenhouse Rie"'s first
+    // word alone would distance-0 match a short candidate like "rittenhouse"
+    // while silently ignoring "Rie", when the whole-string check two lines up
+    // already finds the actually-relevant candidate ("Rittenhouse Rye").
+    if (!within && typedWords.length === 1) {
+      const tw = typedWords[0]
+      if (tw.length >= 3) {
+        for (const cw of nc.split(/\s+/).filter(Boolean)) {
+          const wd = levenshteinDistance(tw, cw)
+          const wordThreshold = (tw.length <= 4 || cw.length <= 4) ? 1 : 2
+          if (wd <= wordThreshold && wd < dist) { dist = wd; within = true }
+        }
+      }
+    }
+    if (within && (!best || dist < best.dist)) best = { candidate, dist }
+  }
+  return best?.candidate || null
+}
+
+// Session 26, Change 3: tier-1 reports fictional ingredients in
+// data.ingredient_reality -- true when ANY seed is confirmed not a real
+// product, regardless of how many seeds there are. Shared by the results
+// screen's early-return block and the Quick Build/Surprise Me auto-fire gate
+// so both read the same boolean the same way.
+function hasFictionalSeedIngredient(data) {
+  return (data?.ingredient_reality || []).some(r => r?.status === 'fictional')
+}
+
 // Session 14, Change 3: hides an Inventory row's generic_type chip when it
 // says nothing the bottle's own name doesn't already say. A single-word
 // generic_type ("amaro", "gin") is never hidden — it's already the most
@@ -1577,7 +1666,7 @@ function stripPrepWordsForSearch(name) {
   return result || name
 }
 
-async function analyzeExplorationsRecipes(ingredients, template, modifiers, inventoryText, excludeNames = [], diagLabel = null) {
+async function analyzeExplorationsRecipes(ingredients, template, modifiers, inventoryText, excludeNames = [], diagLabel = null, unresolvedIngredients = []) {
   const t = TEMPLATE_MAP[template]
   const searchIngredients = ingredients.map(stripPrepWordsForSearch)
   const ingredientPhrase = searchIngredients.join(' and ')
@@ -1607,7 +1696,15 @@ ${inventoryText}
 
 SHELF LIFE GUIDANCE: Vermouth — 1 month unrefrigerated / 3 months refrigerated. Simple syrup — 2–4 weeks room temp. Amaro — 6–12 months. Commercial liqueurs — 6+ months.
 
-First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
+${unresolvedIngredients.length > 0 ? `UNRESOLVED INGREDIENT CHECK — this app already checked ${unresolvedIngredients.map(i => `"${i}"`).join(' and ')} against the bar inventory by name, alias, and generic type and found no match, which only means it isn't owned (or isn't spelled the way the inventory or your own search would spell it) — it says nothing about whether it's real. Before anything else, determine for each: is it a genuine cocktail ingredient or spirit, just one the user doesn't currently own? That is the common, expected case — someone exploring whether to buy a bottle types its name before owning it, and verjus, rooibos, a shrub, a tincture, an obscure amaro, or any other real-but-unusual ingredient must all pass through this exactly as a known, owned one would.
+
+The test is specifically whether the PRODUCT ITSELF exists — a bottle from an actual producer you could point to — not whether a recipe or article merely uses the name. A web search returning a cocktail recipe "starring" this name is not evidence by itself: recipe blogs, listicles, and AI-generated content invent or garble product names constantly, and a recipe can reference a name without the thing it names ever having existed. Weigh search results about the PRODUCT (a producer's own page, a retailer listing, a spirits database entry, critical or trade coverage of the bottle itself) far more than search results merely USING the name in a recipe context. Be especially skeptical of a name combining a real, recognizable category or style word (fernet, amaro, curaçao, vermouth...) with an unfamiliar modifier that reads like a place name or invented flourish — recognizing the real word is not the same as confirming the whole name, and this is exactly the pattern a plausible-sounding fabrication takes.
+
+Before writing "real," name to yourself the specific producer and the specific evidence (a producer page, a retailer listing, a spirits database entry) that convinced you — evidence about the bottle itself, not a recipe that merely calls for it. If you can't name that evidence, you don't have it, regardless of how plausible the name sounds or how many recipes your search surfaced for it — treat it as "near_miss" (if something real and specific is the obvious explanation for the name) or "fictional" (if nothing is), never "real" on the strength of search fluency alone.
+
+Only flag it otherwise if you're genuinely confident: a probable near-miss of something real (a misspelling or a variant way of writing a real product's name — say what it most likely is), or not a real product at all (fabricated, or not a recognized spirit, liqueur, or ingredient). Report your finding for each in "ingredient_reality" below. If — and only if — one is confirmed not real, do not search further or invent a recipe that treats it as real: set "incompatible": false, "no_recipes_found": true, empty "suggestions" and "buffer", and let "ingredient_reality" carry the finding instead.
+
+` : ''}First check if the featured ingredients fundamentally clash in cocktail contexts. If so, set "incompatible": true and explain briefly in a friendly tone.
 
 Otherwise, scope your web search itself to this template's family — search for terms like "published ${t.name} cocktail recipes with ${ingredientPhrase}" or "${ingredientPhrase} ${t.name} variation," not just "${ingredientPhrase} cocktail" — to find 2–3 published recipes that genuinely belong to this template.
 
@@ -1680,9 +1777,12 @@ Return ONLY valid JSON with no markdown fences:
   ],
   "buffer": [
     { "name": "string", "tier": "canon | variation | low" }
-  ]
+  ]${unresolvedIngredients.length > 0 ? `,
+  "ingredient_reality": [
+    { "ingredient": "string — exactly one of the unresolved ingredients above", "status": "real | near_miss | fictional", "likely_match": "string or null — the real product this is most likely a near-miss of, else null", "note": "string or null — one sentence, only for near_miss or fictional" }
+  ]` : ''}
 }
-cross_template_suggestion must be null (not omitted) when there is no genuine match. more_published_exist must be present (not omitted) on every response. Set "origin" to "published" for every suggestion here regardless of tier — the app derives the user-facing published/published_variation split from "tier" itself, so origin only needs to say "this came from a real published source," which is true of canon, variation, and low alike. buffer must be present (an empty array, not omitted) even when there is nothing left to buffer.`,
+cross_template_suggestion must be null (not omitted) when there is no genuine match. more_published_exist must be present (not omitted) on every response. Set "origin" to "published" for every suggestion here regardless of tier — the app derives the user-facing published/published_variation split from "tier" itself, so origin only needs to say "this came from a real published source," which is true of canon, variation, and low alike. buffer must be present (an empty array, not omitted) even when there is nothing left to buffer.${unresolvedIngredients.length > 0 ? ' ingredient_reality must contain exactly one entry per unresolved ingredient listed above, in the same order — never omitted, never one per featured ingredient in general.' : ''}`,
     }],
   }
   // TEMP DIAGNOSTIC: diagLabel opts into the streaming/instrumented path;
@@ -1730,6 +1830,21 @@ cross_template_suggestion must be null (not omitted) when there is no genuine ma
   // anything short of an explicit true is treated as false, so a malformed or omitted
   // field never accidentally shows a CTA the canon can't back up.
   if (data) data.more_published_exist = data.more_published_exist === true
+  // Session 26, Change 3: same defensive normalization as every other
+  // model-reported field here — a malformed or omitted status is dropped
+  // rather than trusted, so garbage never silently reads as "real" (the
+  // permissive default) OR silently blocks generation as "fictional" (the
+  // destructive one). Only present when this call actually asked.
+  if (data) {
+    data.ingredient_reality = (Array.isArray(data.ingredient_reality) ? data.ingredient_reality : [])
+      .filter(r => r?.ingredient && ['real', 'near_miss', 'fictional'].includes(r?.status))
+      .map(r => ({
+        ingredient: String(r.ingredient).trim(),
+        status: r.status,
+        likely_match: typeof r.likely_match === 'string' && r.likely_match.trim() ? r.likely_match.trim() : null,
+        note: typeof r.note === 'string' && r.note.trim() ? r.note.trim() : null,
+      }))
+  }
   // Session 11, Change 1: this is now a RAW candidate list — names and tier
   // guesses noticed in the search results above, never searched or verified
   // by this call (that's what caused the Session 10 regression). It is not
@@ -4318,7 +4433,7 @@ function SavedScreen({ savedSubTab, setSavedSubTab, toMake, favorites, onRemoveT
 
 // ─── Explorations ─────────────────────────────────────────────────────────────
 
-function IngredientSearch({ inventory, inventoryTags, selected, onSelect, onRemove }) {
+function IngredientSearch({ inventory, inventoryTags, selected, labels, onSelect, onRemove }) {
   const [query, setQuery] = useState('')
   const [suggestions, setSuggestions] = useState([])
   const [showSecondInput, setShowSecondInput] = useState(false)
@@ -4357,9 +4472,9 @@ function IngredientSearch({ inventory, inventoryTags, selected, onSelect, onRemo
     <div style={{ position: 'relative' }}>
       {selected.length > 0 && (
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
-          {selected.map(ing => (
+          {selected.map((ing, i) => (
             <span key={ing} style={{ display: 'flex', alignItems: 'center', gap: 5, background: C.gold + '22', border: `1px solid ${C.gold}55`, borderRadius: 20, color: C.gold, fontSize: 13, padding: '4px 10px 4px 12px', fontWeight: 500 }}>
-              {ing}
+              {labels?.[i] ?? ing}
               <button onClick={() => onRemove(ing)} style={{ background: 'none', border: 'none', color: C.gold, cursor: 'pointer', fontSize: 15, lineHeight: 1, padding: '0 0 0 2px' }}>×</button>
             </span>
           ))}
@@ -5344,6 +5459,23 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const [step, setStep] = useState('ingredients')
   const [navStack, setNavStack] = useState([])
   const [selected, setSelected] = useState([])
+  // Session 26, Change 1: two arrays parallel to `selected`, kept in lockstep
+  // at every mutation site below -- `selected` itself now holds the RESOLVED
+  // form (canonical bottle name, canonical generic_type, or the typed text
+  // unchanged when unresolved), since that's what every downstream consumer
+  // (generation prompts, the seed filter, affinity lookups, Supabase storage)
+  // already uses `selected` for, and resolving before any of that is the
+  // whole point of this session. selectedLabels holds what the user actually
+  // typed, for the handful of places that display it instead of the
+  // resolved form. selectedMeta holds each entry's resolution kind and any
+  // pending near-match suggestion (Change 2) -- 'adder' marks an ingredient
+  // added via the affinities-screen adder (3rd+), which this session does
+  // not resolve (see the task's four listed call sites, none of which are
+  // the combination/adder path); 'restored' marks one that came back from
+  // saved history/whiteboard data, where no typed/resolved distinction was
+  // ever persisted.
+  const [selectedLabels, setSelectedLabels] = useState([])
+  const [selectedMeta, setSelectedMeta] = useState([])
   const [template, setTemplate] = useState(null)
   const [frozen, setFrozen] = useState(false)
   const [na, setNa] = useState(false)
@@ -5718,6 +5850,8 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   useEffect(() => {
     if (!pendingRestore) return
     setSelected(pendingRestore.primary_ingredients || [])
+    setSelectedLabels(pendingRestore.primary_ingredients || [])
+    setSelectedMeta((pendingRestore.primary_ingredients || []).map(() => ({ kind: 'restored', nearMatch: null })))
     setTemplate(pendingRestore.template || null)
     setFrozen(pendingRestore.frozen || false)
     setNa(pendingRestore.na || false)
@@ -5828,6 +5962,8 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
 
   const restoreFromHistory = (entry) => {
     setSelected(entry.primary_ingredients)
+    setSelectedLabels(entry.primary_ingredients)
+    setSelectedMeta((entry.primary_ingredients || []).map(() => ({ kind: 'restored', nearMatch: null })))
     setTemplate(entry.template)
     setFrozen(entry.frozen)
     setLowABV(entry.low_abv)
@@ -5943,7 +6079,12 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           buffer: [],
         }
       } else {
-        data = stripCiteTags(await analyzeExplorationsRecipes(selected, activeTemplate, modifiers, inventoryText, [], DIAG_ON ? 'tier1-build' : null))
+        // Session 26, Change 3: only ingredients Change 1 couldn't resolve
+        // locally get asked about — a resolved bottle or generic_type is
+        // already confirmed real by virtue of being in the inventory it
+        // resolved against, so there's nothing for the model to verify.
+        const unresolvedSeeds = selected.filter((_, i) => selectedMeta[i]?.kind === 'unresolved')
+        data = stripCiteTags(await analyzeExplorationsRecipes(selected, activeTemplate, modifiers, inventoryText, [], DIAG_ON ? 'tier1-build' : null, unresolvedSeeds))
         // Session 17, Change 1: the code-side backstop — see
         // filterSuggestionsBySeedIngredients. Not applied to the redirect
         // branch above (opts.redirectDrinkName): that's a single targeted
@@ -5995,7 +6136,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       let wbId = null
       let recipeListNodeId = null
       let ingredientsNodeId = null
-      if (!data.incompatible) {
+      if (!data.incompatible && !hasFictionalSeedIngredient(data)) {
         upsertHistory(selected, activeTemplate, frozen, lowABV, na, data)
         if (user) {
           try {
@@ -6285,7 +6426,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     }
   }
 
-  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -6432,7 +6573,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       const resolved = await resolveTemplate(selected, affinityMap)
       setTemplate(resolved)
       const tier1 = await handleExplore({ template: resolved, fromStep })
-      if (tier1 && !tier1.data.incompatible) {
+      if (tier1 && !tier1.data.incompatible && !hasFictionalSeedIngredient(tier1.data)) {
         await handleSeeMore({ template: resolved, whiteboardId: tier1.wbId, recipeListNodeId: tier1.recipeListNodeId, baseSuggestions: tier1.data.suggestions || [] })
       }
     } finally {
@@ -6453,7 +6594,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       const resolved = await resolveTemplate(selected, affinityMap)
       setTemplate(resolved)
       const tier1 = await handleExplore({ template: resolved, fromStep, viaSurpriseMe: true })
-      if (tier1 && !tier1.data.incompatible) {
+      if (tier1 && !tier1.data.incompatible && !hasFictionalSeedIngredient(tier1.data)) {
         await handleSeeMore({ template: resolved, whiteboardId: tier1.wbId, recipeListNodeId: tier1.recipeListNodeId, baseSuggestions: tier1.data.suggestions || [] })
       }
     } finally {
@@ -6574,6 +6715,8 @@ Rules:
     if (!trimmed || selected.map(s => s.trim().toLowerCase()).includes(trimmed.toLowerCase())) return
     const newSelected = [...selected, trimmed]
     setSelected(newSelected)
+    setSelectedLabels(p => [...p, trimmed])
+    setSelectedMeta(p => [...p, { kind: 'adder', nearMatch: null }])
     setShowIngredientAdder(false)
     setAdderQuery('')
 
@@ -6629,18 +6772,69 @@ Rules:
     const idx = selected.findIndex(s => s === ingName)
     if (idx === -1) return
     setSelected(prev => prev.filter((_, i) => i !== idx))
+    setSelectedLabels(prev => prev.filter((_, i) => i !== idx))
+    setSelectedMeta(prev => prev.filter((_, i) => i !== idx))
     setContextualAffinityData(prev => prev.filter((_, i) => i !== idx))
     setCombinationData(null)
     setCombinationError(null)
+  }
+
+  // Session 26, Change 1: resolution happens here, wrapping IngredientSearch
+  // rather than changing it -- it still hands back whatever the user
+  // committed (a clicked bottle, the S21 generic row's label, or free text)
+  // exactly as before; this is the one place that string gets resolved
+  // before landing in `selected`. Guards against a duplicate the pre-resolution
+  // dedup inside IngredientSearch can't see: typing "fort hamilton gin" when
+  // the generic "Gin" row is already selected wouldn't collide on the typed
+  // text, only on what it resolves to.
+  const handleSeedSelect = (ing) => {
+    const r = resolveSeedIngredient(ing, inventory, inventoryTags)
+    if (selected.length >= 2) return
+    if (selected.some(s => normalizeForMatch(s) === normalizeForMatch(r.resolved))) return
+    setSelected(p => [...p, r.resolved])
+    setSelectedLabels(p => [...p, r.typed])
+    setSelectedMeta(p => [...p, { kind: r.kind, nearMatch: r.nearMatch }])
+    setTemplate(null); setFrozen(false); setNa(false)
+  }
+  const handleSeedRemove = (ing) => {
+    const idx = selected.indexOf(ing)
+    setSelected(p => p.filter((_, i) => i !== idx))
+    setSelectedLabels(p => p.filter((_, i) => i !== idx))
+    setSelectedMeta(p => p.filter((_, i) => i !== idx))
+    setTemplate(null); setFrozen(false); setNa(false)
+  }
+  // Session 26, Change 2: "suggest, never rewrite" -- this is the only path
+  // that changes an already-selected ingredient's resolved form, and it only
+  // runs on an explicit click. Re-resolves the suggestion itself rather than
+  // assuming it's a bottle name, since a near-match candidate can be a
+  // generic_type or alias too.
+  const applyNearMatch = (i) => {
+    const suggestion = selectedMeta[i]?.nearMatch
+    if (!suggestion) return
+    const r = resolveSeedIngredient(suggestion, inventory, inventoryTags)
+    setSelected(prev => prev.map((v, idx) => idx === i ? r.resolved : v))
+    setSelectedLabels(prev => prev.map((v, idx) => idx === i ? r.typed : v))
+    setSelectedMeta(prev => prev.map((v, idx) => idx === i ? { kind: r.kind, nearMatch: null } : v))
+  }
+  const dismissNearMatch = (i) => {
+    setSelectedMeta(prev => prev.map((v, idx) => idx === i ? { ...v, nearMatch: null } : v))
   }
 
   if (step === 'ingredients') return (
     <div>
       <div style={{ fontSize: 22, fontWeight: 800, color: C.text, letterSpacing: '-0.02em', marginBottom: 4 }}>Explorations</div>
       <div style={{ fontSize: 14, color: C.textMuted, marginBottom: 24, lineHeight: 1.55 }}>Pick up to 2 ingredients and we'll suggest cocktails you can make — or inspire you to try something new.</div>
-      <IngredientSearch inventory={inventory} inventoryTags={inventoryTags} selected={selected}
-        onSelect={ing => { setSelected(p => [...p, ing]); setTemplate(null); setFrozen(false); setNa(false) }}
-        onRemove={ing => { setSelected(p => p.filter(i => i !== ing)); setTemplate(null); setFrozen(false); setNa(false) }} />
+      <IngredientSearch inventory={inventory} inventoryTags={inventoryTags} selected={selected} labels={selectedLabels}
+        onSelect={handleSeedSelect}
+        onRemove={handleSeedRemove} />
+      {selectedMeta.map((m, i) => m.nearMatch && (
+        <div key={i} style={{ fontSize: 13, color: C.amber, marginTop: 6, lineHeight: 1.5 }}>
+          Did you mean{' '}
+          <button onClick={() => applyNearMatch(i)} style={{ background: 'none', border: 'none', color: C.amber, textDecoration: 'underline', cursor: 'pointer', padding: 0, font: 'inherit' }}>{m.nearMatch}</button>
+          {' '}instead of "{selectedLabels[i]}"?{' '}
+          <button onClick={() => dismissNearMatch(i)} style={{ background: 'none', border: 'none', color: C.textFaint, cursor: 'pointer', padding: 0, font: 'inherit' }}>No, keep it</button>
+        </div>
+      ))}
       {selected.length > 0 && (
         <>
           <button onClick={handleNextFromIngredients} disabled={affinityLoading || templatePickerLoading}
@@ -6759,9 +6953,9 @@ Rules:
         <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
         <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginBottom: 24 }}>
           <span style={{ fontSize: 13, color: C.textMuted }}>Exploring:</span>
-          {selected.map(ingName => (
+          {selected.map((ingName, i) => (
             <span key={ingName} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: C.gold + '22', border: `1px solid ${C.gold}55`, borderRadius: 20, color: C.gold, fontSize: 13, padding: '3px 8px 3px 12px', fontWeight: 500 }}>
-              {ingName}
+              {selectedLabels[i] ?? ingName}
               {selected.length > 1 && (
                 <button onClick={() => handleRemoveIngredient(ingName)} style={{ background: 'none', border: 'none', color: C.gold, cursor: 'pointer', fontSize: 15, lineHeight: 1, padding: '0 0 0 2px' }}>×</button>
               )}
@@ -6792,7 +6986,7 @@ Rules:
           return (
             <div key={normName}>
               {i > 0 && <div style={{ borderTop: `1px solid ${C.border}`, margin: '20px 0' }} />}
-              <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.gold, marginBottom: 12 }}>{ingName}</div>
+              <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.gold, marginBottom: 12 }}>{selectedLabels[i] ?? ingName}</div>
               <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 16, minHeight: 52, boxSizing: 'border-box', ...shimmerStyle }}>
                 <div style={{ fontSize: 14, color: prose ? C.textMuted : C.textFaint, lineHeight: 1.55 }}>
                   {prose}
@@ -6929,7 +7123,7 @@ Rules:
       <div>
         <button onClick={() => { setCombinationData(null); setCombinationError(null); goBack() }} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
         <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 24 }}>
-          Building: <span style={{ color: C.gold }}>{selected.join(' + ')}</span>
+          Building: <span style={{ color: C.gold }}>{selectedLabels.join(' + ')}</span>
         </div>
 
         {combinationLoading ? (
@@ -6994,7 +7188,7 @@ Rules:
       <div>
         <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
         <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Choose a Template</div>
-        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 20 }}>Exploring: <span style={{ color: C.gold }}>{selected.join(' + ')}</span></div>
+        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 20 }}>Exploring: <span style={{ color: C.gold }}>{selectedLabels.join(' + ')}</span></div>
 
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 20 }}>
           {chip(lowABV, 'Low-ABV', () => setLowABV(v => !v))}
@@ -7069,18 +7263,52 @@ Rules:
       </div>
     )
 
+    // Session 26, Change 3: same early-return shape as the incompatible
+    // block above -- a confirmed-fictional seed means nothing downstream
+    // (suggestions, the See More Ideas button, tier-2/3) is reachable, the
+    // same way an incompatible pair never reaches them either.
+    const fictionalEntries = (result.ingredient_reality || []).filter(r => r?.status === 'fictional')
+    if (fictionalEntries.length > 0) return (
+      <div>
+        <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>{backLabel}</button>
+        <div style={{ background: C.amber + '15', border: `1px solid ${C.amber}44`, borderRadius: 10, padding: '20px', marginBottom: 20 }}>
+          <div style={{ fontSize: 18, fontWeight: 700, color: C.amber, marginBottom: 8 }}>
+            {fictionalEntries.length === 1 ? `"${fictionalEntries[0].ingredient}" doesn't look like a real product` : "These don't look like real products"}
+          </div>
+          <div style={{ fontSize: 14, color: C.text, lineHeight: 1.6 }}>
+            {fictionalEntries.map(e => e.note).filter(Boolean).join(' ') || "We couldn't confirm this is an actual spirit or ingredient, so we didn't build a drink around it."}
+          </div>
+        </div>
+        <button onClick={reset} style={{ background: C.gold, border: 'none', borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 14, padding: '12px 20px', cursor: 'pointer' }}>Try different ingredients</button>
+      </div>
+    )
+
     // Session 22, Change 1: live, not the stored can_make_now — see
     // liveCanMakeNow for why this can't just trust generation time.
     const canMake = (result.suggestions || []).filter(s => liveCanMakeNow(s, selected, inventory, inventoryTags))
     const worthBuying = (result.suggestions || []).filter(s => !liveCanMakeNow(s, selected, inventory, inventoryTags))
+    // Session 26, Change 3: non-blocking -- the model's own near-miss read on
+    // an ingredient local resolution (Change 2) didn't catch. Suggests, same
+    // as Change 2's banner; suggestions below were generated using what the
+    // user actually typed, unchanged.
+    const nearMissEntries = (result.ingredient_reality || []).filter(r => r?.status === 'near_miss' && r.likely_match)
 
     return (
       <div>
         <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>{backLabel}</button>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
-          <div style={{ flex: 1, fontSize: 18, fontWeight: 700, color: C.text }}>{selected.join(' + ')}</div>
+          <div style={{ flex: 1, fontSize: 18, fontWeight: 700, color: C.text }}>{selectedLabels.join(' + ')}</div>
           <button onClick={reset} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 20, color: C.textMuted, fontSize: 12, padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap' }}>Start over</button>
         </div>
+        {nearMissEntries.length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            {nearMissEntries.map(r => (
+              <div key={r.ingredient} style={{ background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 10, padding: '10px 14px', marginBottom: 8, fontSize: 13, color: C.text, lineHeight: 1.5 }}>
+                Did you mean <strong>{r.likely_match}</strong>? We searched for "{r.ingredient}" as typed.
+              </div>
+            ))}
+          </div>
+        )}
         {result.flavor_profile_note && (
           <div style={{ background: C.gold + '12', border: `1px solid ${C.gold}33`, borderRadius: 10, padding: '12px 16px', marginBottom: result.pairs_well_with ? 8 : 24, fontSize: 14, color: C.text, lineHeight: 1.6 }}>
             ✨ {result.flavor_profile_note}
