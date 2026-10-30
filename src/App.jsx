@@ -1172,6 +1172,97 @@ async function callClaude(body, opts = {}) {
   return extractJSON(textBlock.text)
 }
 
+// Session 27: production streaming. Separate from callClaudeStreamDiag
+// (bc_diag instrumentation, removable) — this one is not temporary. Calls
+// onText(fullTextSoFar) as text arrives and resolves with the complete text
+// only if the stream genuinely finished. Three outcomes count as failure
+// even after a 200, each with its own err.code:
+//   'stream_error' — an `error` event inside the stream (Anthropic sends
+//                    these, e.g. overloaded; the proxy sends one too if the
+//                    upstream connection fails partway)
+//   'incomplete'   — the stream ended without message_stop
+//   'truncated'    — stop_reason max_tokens: the JSON stops short, and must
+//                    never be treated as a complete answer
+// Pass opts.signal to cancel; the proxy then cancels upstream too. A
+// cancelled call rejects with err.code 'aborted'.
+async function callClaudeStream(body, { onText, signal } = {}) {
+  const t0 = performance.now()
+  let res
+  try {
+    res = await fetch('/api/claude', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...body, stream: true }),
+      signal,
+    })
+  } catch {
+    const err = new Error(signal?.aborted ? 'Cancelled.' : 'Could not reach the server — check your connection and try again.')
+    err.code = signal?.aborted ? 'aborted' : 'network'
+    throw err
+  }
+  if (res.status === 429) {
+    const err = new Error('Too many requests — wait a moment and try again.')
+    err.code = 'rate_limited'
+    throw err
+  }
+  if (!res.ok || !res.body) {
+    const errBody = await res.json().catch(() => ({ error: res.statusText }))
+    const err = new Error(errBody.error || `HTTP ${res.status}`)
+    err.code = 'http_error'
+    throw err
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let text = ''
+  let stopReason = null
+  let sawMessageStop = false
+  let inputTokens = null
+  let outputTokens = null
+  let firstTextMs = null
+  const fail = (code, message) => {
+    const err = new Error(message)
+    err.code = code
+    err.partialText = text
+    err.fromStreamCheck = true
+    throw err
+  }
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let sep
+      while ((sep = buffer.indexOf('\n\n')) >= 0) {
+        const rawEvent = buffer.slice(0, sep)
+        buffer = buffer.slice(sep + 2)
+        const dataLine = rawEvent.split('\n').find(l => l.startsWith('data: '))
+        if (!dataLine) continue
+        let evt
+        try { evt = JSON.parse(dataLine.slice(6)) } catch { continue }
+        if (evt.type === 'error') fail('stream_error', `The response failed partway through (${evt.error?.type || 'error'}). Please try again.`)
+        else if (evt.type === 'message_start') inputTokens = evt.message?.usage?.input_tokens ?? null
+        else if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
+          text += evt.delta.text
+          if (firstTextMs == null) firstTextMs = Math.round(performance.now() - t0)
+          onText?.(text)
+        } else if (evt.type === 'message_delta') {
+          stopReason = evt.delta?.stop_reason ?? stopReason
+          if (evt.usage?.output_tokens != null) outputTokens = evt.usage.output_tokens
+        } else if (evt.type === 'message_stop') sawMessageStop = true
+      }
+    }
+  } catch (e) {
+    if (e.fromStreamCheck) throw e
+    if (signal?.aborted) fail('aborted', 'Cancelled.')
+    fail('incomplete', 'The connection dropped before the response finished. Please try again.')
+  }
+  if (!sawMessageStop) fail('incomplete', 'The response stopped before it finished. Please try again.')
+  if (stopReason === 'max_tokens') fail('truncated', 'That response was too long and got cut off before it finished.')
+  return { text, stopReason, inputTokens, outputTokens, firstTextMs, totalMs: Math.round(performance.now() - t0) }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // TEMP DIAGNOSTIC INSTRUMENTATION — "Where the Seconds Go" timing diagnostic.
 // Opt-in and additive, same pattern as opts.detectTruncation: only call sites
@@ -1184,15 +1275,17 @@ async function callClaude(body, opts = {}) {
 // timestamps, so search (server_tool_use / web_search_tool_result blocks)
 // and generation (the final text block) can't be separated after the fact —
 // only during. This requests `stream: true` from /api/claude (which passes
-// it straight through to Anthropic, see the matching temp block there) and
+// it straight through to Anthropic via its streaming branch) and
 // timestamps each content_block_start/stop as it arrives.
 //
-// Removable: delete this block, the DIAG_ON constant, the stream-passthrough
-// branch in api/claude.js, the timing block in api/backfill-affinities.js,
-// and the diagLabel plumbing (default-null params + call-site labels) in
+// Removable: delete this block, the DIAG_ON constant, the timing block in
+// api/backfill-affinities.js, and the diagLabel plumbing (default-null params + call-site labels) in
 // analyzeExplorationsRecipes, analyzeExplorationsOriginals,
 // analyzeContextualAffinities, handleExplore, handleSeeMore,
-// handleSeeMorePublished, and ensureAffinityData.
+// handleSeeMorePublished, and ensureAffinityData. Do NOT remove the
+// stream-passthrough branch in api/claude.js or callClaudeStream above with
+// it — since Session 27 those are production (Help Me Decide streams).
+// analyzeTemplateGuidance's diagLabel only logs a summary line and can go.
 const DIAG_ON = typeof window !== 'undefined' && window.localStorage?.getItem('bc_diag') === '1'
 
 async function callClaudeStreamDiag(body, label) {
@@ -2736,7 +2829,52 @@ Return ONLY valid JSON, no markdown fences:
 // a bottle — that's what makes a narrow bottle's reasoning specific rather
 // than category-generic. The bar summary is in-stock only (S25: an OOS row
 // is not on hand) and is a secondary signal, never the reason itself.
-async function analyzeTemplateGuidance(ingredients, modifiers, inventory, inventoryTags, diagLabel = null) {
+// Session 27: reads a streamed JSON response's "templates" array as it
+// arrives, yielding each element the moment its closing brace lands. Scans
+// incrementally (never re-reads text it has already passed) and tracks
+// string/escape state, so a brace inside a reason doesn't count. Purely a
+// progressive preview: the final, authoritative parse is still extractJSON
+// on the complete text, and only a stream callClaudeStream accepted as
+// finished ever gets that far.
+function makeArrayElementScanner(key) {
+  let pos = -1, depth = 0, inString = false, escaped = false, start = -1
+  return (text) => {
+    const found = []
+    if (pos < 0) {
+      const k = text.indexOf(`"${key}"`)
+      if (k < 0) return found
+      const bracket = text.indexOf('[', k)
+      if (bracket < 0) return found
+      pos = bracket + 1
+    }
+    for (; pos < text.length; pos++) {
+      const ch = text[pos]
+      if (inString) {
+        if (escaped) escaped = false
+        else if (ch === '\\') escaped = true
+        else if (ch === '"') inString = false
+        continue
+      }
+      if (ch === '"') inString = true
+      else if (ch === '{') { if (depth === 0) start = pos; depth++ }
+      else if (ch === '}') {
+        depth--
+        if (depth === 0 && start >= 0) {
+          try { found.push(JSON.parse(text.slice(start, pos + 1))) } catch { /* malformed element; the final parse decides */ }
+          start = -1
+        }
+      }
+    }
+    return found
+  }
+}
+
+// opts.onEntry(entry) fires per template as each one finishes streaming, in
+// the model's rank order, already validated (known id, first occurrence).
+// The returned promise resolves only for a stream that genuinely completed —
+// a truncated, errored, or dropped stream rejects (see callClaudeStream),
+// so callers can never mistake a partial set for the full ten.
+async function analyzeTemplateGuidance(ingredients, modifiers, inventory, inventoryTags, { onEntry, signal, diagLabel = null } = {}) {
   const seedContext = ingredients.map(ing => {
     const norm = ing.trim().toLowerCase()
     const item = (inventory || []).find(i => i.spirit.trim().toLowerCase() === norm && i.stockState !== 'oos')
@@ -2793,9 +2931,25 @@ Exactly ten entries, every id listed above exactly once, ranked best fit first.`
     max_tokens: 1400,
     messages: [{ role: 'user', content: prompt }],
   }
-  const raw = diagLabel
-    ? extractJSON((await callClaudeStreamDiag(body, diagLabel)).text)
-    : await callClaude(body)
+  const toEntry = e => ({ id: e.id, suggested: !!e.suggested, trait: e.trait || null, reason: e.reason || null })
+  const scan = makeArrayElementScanner('templates')
+  const streamedIds = new Set()
+  let firstEntryMs = null
+  const t0 = performance.now()
+  const result = await callClaudeStream(body, {
+    signal,
+    onText: text => {
+      for (const e of scan(text)) {
+        if (!e?.id || !TEMPLATE_MAP[e.id] || streamedIds.has(e.id)) continue
+        streamedIds.add(e.id)
+        if (firstEntryMs == null) firstEntryMs = Math.round(performance.now() - t0)
+        onEntry?.(toEntry(e))
+      }
+    },
+  })
+  // TEMP DIAGNOSTIC (bc_diag): one summary line; removable with the rest.
+  if (diagLabel) console.log(`[DIAG:${diagLabel}] SUMMARY ${JSON.stringify({ firstTextMs: result.firstTextMs, firstEntryMs, totalMs: result.totalMs, input_tokens: result.inputTokens, output_tokens: result.outputTokens, stop_reason: result.stopReason })}`)
+  const raw = extractJSON(result.text)
   // Tolerate a dropped or invented id rather than failing the screen: keep
   // valid entries in the model's order, drop duplicates/unknowns, and append
   // any template it omitted (unsuggested, no reason) so all ten still render.
@@ -2804,7 +2958,7 @@ Exactly ten entries, every id listed above exactly once, ranked best fit first.`
   for (const e of raw?.templates || []) {
     if (!e?.id || !TEMPLATE_MAP[e.id] || seen.has(e.id)) continue
     seen.add(e.id)
-    entries.push({ id: e.id, suggested: !!e.suggested, trait: e.trait || null, reason: e.reason || null })
+    entries.push(toEntry(e))
   }
   for (const t of TEMPLATES) if (!seen.has(t.id)) entries.push({ id: t.id, suggested: false, trait: null, reason: null })
   if (!entries.some(e => e.suggested)) entries.slice(0, 3).forEach(e => { e.suggested = true })
@@ -5584,6 +5738,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const [guidanceError, setGuidanceError] = useState(null)
   const [showAllGuidance, setShowAllGuidance] = useState(false)
   const guidanceRequestRef = useRef(0)
+  const guidanceAbortRef = useRef(null)
+  // Leaving Create entirely (another bottom tab) unmounts this screen; don't
+  // leave a guidance stream running for it.
+  useEffect(() => () => guidanceAbortRef.current?.abort(), [])
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [feedback, setFeedback] = useState('')
@@ -6528,7 +6686,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     }
   }
 
-  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); guidanceRequestRef.current += 1; setGuidance(null); setGuidanceLoading(false); setGuidanceError(null); setShowAllGuidance(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); guidanceRequestRef.current += 1; guidanceAbortRef.current?.abort(); guidanceAbortRef.current = null; setGuidance(null); setGuidanceLoading(false); setGuidanceError(null); setShowAllGuidance(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -6704,39 +6862,77 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     }
   }
 
-  // Session 27: navigates immediately and lets the guidance stream in, same
-  // shape as the contextual affinities layer. guidanceRequestRef discards a
-  // response that lands after the seed/modifiers changed or the user reset.
-  const handleHelpMeDecide = async () => {
+  // Session 27: navigates immediately and streams the guidance in, one pill
+  // per template as each finishes. `guidance.complete` is set only when the
+  // stream genuinely finished (callClaudeStream rejects a truncated, errored
+  // or dropped one), and only a complete set is ever reused from cache — a
+  // partial one is shown as partial, with an error, never as the full ten.
+  // guidanceRequestRef discards anything landing after the seed/modifiers
+  // changed or the user reset; guidanceAbortRef cancels the request itself,
+  // which the proxy turns into cancelling the upstream call.
+  const handleHelpMeDecide = () => {
     const modifiers = { frozen, lowABV, na }
     const key = makeExplorationKey(selected, 'guidance', frozen, lowABV, na)
     goToStep('guidance')
-    if (guidance?.key === key) {
-      setShowAllGuidance(!!template && !guidance.entries.find(e => e.id === template)?.suggested)
+    if (guidance?.key === key && (guidance.complete || guidanceLoading)) {
+      if (guidance.complete) setShowAllGuidance(!!template && !guidance.entries.find(e => e.id === template)?.suggested)
       return
     }
     fetchGuidance(key, modifiers)
   }
 
+  const cancelGuidance = () => {
+    guidanceRequestRef.current += 1
+    guidanceAbortRef.current?.abort()
+    guidanceAbortRef.current = null
+  }
+
   const fetchGuidance = async (key, modifiers) => {
-    const reqId = ++guidanceRequestRef.current
-    setGuidance(null)
+    cancelGuidance()
+    const reqId = guidanceRequestRef.current
+    const controller = new AbortController()
+    guidanceAbortRef.current = controller
+    setGuidance({ key, entries: [], complete: false })
     setGuidanceError(null)
     setShowAllGuidance(false)
     setGuidanceLoading(true)
     try {
-      const entries = await analyzeTemplateGuidance(selected, modifiers, inventory, inventoryTags, DIAG_ON ? 'template-guidance' : null)
+      const entries = await analyzeTemplateGuidance(selected, modifiers, inventory, inventoryTags, {
+        signal: controller.signal,
+        diagLabel: DIAG_ON ? 'template-guidance' : null,
+        onEntry: entry => {
+          if (reqId !== guidanceRequestRef.current) return
+          setGuidance(prev => prev?.key === key ? { ...prev, entries: [...prev.entries, entry] } : prev)
+        },
+      })
       if (reqId !== guidanceRequestRef.current) return
-      setGuidance({ key, entries })
+      // The final parse replaces the streamed preview wholesale — it is the
+      // authority (it also fills in any template the model omitted).
+      setGuidance({ key, entries, complete: true })
       // A template already picked on the previous screen stays picked; if it
       // isn't among the suggested few, open the full list so it's visible.
       if (template && !entries.find(e => e.id === template)?.suggested) setShowAllGuidance(true)
     } catch (err) {
-      if (reqId !== guidanceRequestRef.current) return
+      if (reqId !== guidanceRequestRef.current || err.code === 'aborted') return
       setGuidanceError(err.message || 'Could not load guidance.')
     } finally {
-      if (reqId === guidanceRequestRef.current) setGuidanceLoading(false)
+      if (reqId === guidanceRequestRef.current) {
+        setGuidanceLoading(false)
+        guidanceAbortRef.current = null
+      }
     }
+  }
+
+  // Backing out of the guidance screen mid-stream is the common case this
+  // cancel exists for. Going forward to affinities deliberately does NOT
+  // cancel: Back from affinities returns here, and the rest is ~10s away.
+  const handleGuidanceBack = () => {
+    if (guidanceLoading) {
+      cancelGuidance()
+      setGuidanceLoading(false)
+      setGuidance(null)
+    }
+    goBack()
   }
 
   // Session 8, Change 4: fetches the drink the CTA already named, rather than
@@ -7382,11 +7578,21 @@ Rules:
   // Session 27: the guidance screen. Single-select pills set `template`
   // directly, so the CTA's handleContinueToAffinities reads the current
   // pick, and Back to the template grid shows it highlighted there too.
+  // Session 27: the guidance screen. Single-select pills set `template`
+  // directly, so the CTA's handleContinueToAffinities reads the current
+  // pick, and Back to the template grid shows it highlighted there too.
+  // Three visibly different states, so a partial set never reads as done:
+  // streaming (a live "still weighing… n of 10" line above the pills, no
+  // "see all" yet), complete (the "see all" control appears), and failed
+  // partway (a banner above the pills naming how many of the ten came back,
+  // with Try again; what arrived stays pickable, and there's no "see all").
   if (step === 'guidance') {
     const entries = guidance?.entries || []
+    const complete = !!guidance?.complete
     const suggested = entries.filter(e => e.suggested)
     const rest = entries.filter(e => !e.suggested)
     const activeModifierLabels = [lowABV && 'Low-ABV', na && 'NA', frozen && 'Frozen'].filter(Boolean)
+    const failedPartway = !!guidanceError && !guidanceLoading && entries.length > 0
     const pill = (e) => {
       const t = TEMPLATE_MAP[e.id]
       const active = template === e.id
@@ -7409,19 +7615,21 @@ Rules:
         </button>
       )
     }
-    const canProceed = !!template && !guidanceLoading && !affinityLoading
+    const canProceed = !!template && !affinityLoading
+    const sectionLabel = text => <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>{text}</div>
+    const retry = () => fetchGuidance(makeExplorationKey(selected, 'guidance', frozen, lowABV, na), { frozen, lowABV, na })
     return (
       <div>
-        <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+        <style>{`@keyframes bcpulse { 0%,100% { opacity: 0.45 } 50% { opacity: 0.9 } }`}</style>
+        <button onClick={handleGuidanceBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
         <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Which kind of drink?</div>
         <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 20 }}>
           Exploring: <span style={{ color: C.gold }}>{selectedLabels.join(' + ')}</span>
           {activeModifierLabels.length > 0 && <span> · {activeModifierLabels.join(', ')}</span>}
         </div>
 
-        {guidanceLoading && (
+        {guidanceLoading && entries.length === 0 && (
           <div>
-            <style>{`@keyframes bcpulse { 0%,100% { opacity: 0.45 } 50% { opacity: 0.9 } }`}</style>
             <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 12 }}>Thinking through all ten templates for {selectedLabels.join(' + ')}…</div>
             {[0, 1, 2].map(i => (
               <div key={i} style={{ height: 78, borderRadius: 14, background: C.surface, border: `1px solid ${C.border}`, marginBottom: 10, animation: `bcpulse 1.4s ease-in-out ${i * 0.15}s infinite` }} />
@@ -7429,31 +7637,50 @@ Rules:
           </div>
         )}
 
-        {guidanceError && !guidanceLoading && (
-          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
-            <div style={{ fontSize: 14, color: C.text, marginBottom: 8 }}>Couldn't load the guidance.</div>
-            <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 12 }}>{guidanceError}</div>
-            <button onClick={() => fetchGuidance(makeExplorationKey(selected, 'guidance', frozen, lowABV, na), { frozen, lowABV, na })}
+        {/* Status sits ABOVE the pills, not after them: with four or five
+            pills on screen, anything below them is out of view, and a
+            partial set would read as finished. */}
+        {guidanceLoading && entries.length > 0 && (
+          <div style={{ fontSize: 13, color: C.textMuted, padding: '0 0 14px', animation: 'bcpulse 1.4s ease-in-out infinite' }}>
+            Still weighing the other templates… {entries.length} of {TEMPLATES.length}
+          </div>
+        )}
+
+        {failedPartway && (
+          <div style={{ background: C.amber + '14', border: `1px solid ${C.amber + '55'}`, borderRadius: 12, padding: 14, marginBottom: 16 }}>
+            <div style={{ fontSize: 14, color: C.amber, fontWeight: 600, marginBottom: 4 }}>This stopped partway — only {entries.length} of {TEMPLATES.length} templates came back.</div>
+            <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 10 }}>So this isn't the full picture. {guidanceError}</div>
+            <button onClick={retry}
               style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 13, padding: '8px 14px', cursor: 'pointer' }}>Try again</button>
           </div>
         )}
 
-        {guidance && !guidanceLoading && (
+        {suggested.length > 0 && (
           <>
-            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>Suits it best</div>
+            {sectionLabel('Suits it best')}
             {suggested.map(pill)}
-            {rest.length > 0 && (
+          </>
+        )}
+
+        {guidanceError && !guidanceLoading && entries.length === 0 && (
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+            <div style={{ fontSize: 14, color: C.text, marginBottom: 8 }}>Couldn't load the guidance.</div>
+            <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 12 }}>{guidanceError}</div>
+            <button onClick={retry}
+              style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 13, padding: '8px 14px', cursor: 'pointer' }}>Try again</button>
+          </div>
+        )}
+
+        {complete && rest.length > 0 && (
+          <>
+            <button onClick={() => setShowAllGuidance(v => !v)}
+              style={{ width: '100%', background: 'none', border: 'none', color: C.textMuted, fontSize: 13, fontWeight: 600, padding: '8px 0 14px', cursor: 'pointer', textAlign: 'center' }}>
+              {showAllGuidance ? 'Hide the other templates ▴' : `See all templates (${rest.length} more) ▾`}
+            </button>
+            {showAllGuidance && (
               <>
-                <button onClick={() => setShowAllGuidance(v => !v)}
-                  style={{ width: '100%', background: 'none', border: 'none', color: C.textMuted, fontSize: 13, fontWeight: 600, padding: '8px 0 14px', cursor: 'pointer', textAlign: 'center' }}>
-                  {showAllGuidance ? 'Hide the other templates ▴' : `See all templates (${rest.length} more) ▾`}
-                </button>
-                {showAllGuidance && (
-                  <>
-                    <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>Less obvious</div>
-                    {rest.map(pill)}
-                  </>
-                )}
+                {sectionLabel('Less obvious')}
+                {rest.map(pill)}
               </>
             )}
           </>

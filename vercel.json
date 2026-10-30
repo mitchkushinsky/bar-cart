@@ -1,5 +1,8 @@
 {
   "rewrites": [
     { "source": "/((?!api|src|assets|@vite|@react-refresh|node_modules|.*\\..*).*)", "destination": "/index.html" }
-  ]
+  ],
+  "functions": {
+    "api/claude.js": { "supportsCancellation": true }
+  }
 }
