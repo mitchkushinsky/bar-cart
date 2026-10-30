@@ -2719,6 +2719,98 @@ Return ONLY valid JSON, no markdown fences:
   return await callClaude(body)
 }
 
+// Session 27: Help Me Decide. Reasons about all ten templates for this seed
+// in ONE call, so "see all templates" can expand instantly with reasoning
+// already in hand — no second call, no bare pills. Modeled on
+// analyzeFlavorForms: enumerate options against a context, argue for each,
+// rank. The failure mode this prompt is built against is sameness — ten
+// restatements of "the botanicals complement the base" (the first draft did
+// exactly that for gin: nine of ten reasons were about whether the
+// botanicals survived). So the model first lists several distinct seed
+// traits, then assigns each template the trait its structure acts on, with
+// no trait reused more than twice — divergence by construction, the way
+// S12's Maple test diverged (lemon under Sour vs. Angostura under Old
+// Fashioned). Reasons are capped at one sentence: at ~40 words each the
+// call ran ~19s / ~970 output tokens.
+// Seed context comes from the inventory row when the resolved seed (S26) is
+// a bottle — that's what makes a narrow bottle's reasoning specific rather
+// than category-generic. The bar summary is in-stock only (S25: an OOS row
+// is not on hand) and is a secondary signal, never the reason itself.
+async function analyzeTemplateGuidance(ingredients, modifiers, inventory, inventoryTags, diagLabel = null) {
+  const seedContext = ingredients.map(ing => {
+    const norm = ing.trim().toLowerCase()
+    const item = (inventory || []).find(i => i.spirit.trim().toLowerCase() === norm && i.stockState !== 'oos')
+    if (!item) return `- ${ing}`
+    const tag = (inventoryTags || {})[norm]
+    const bits = [item.category, tag?.generic_type && `generic type: ${tag.generic_type}`, item.notes && `owner's notes: ${item.notes}`].filter(Boolean)
+    return `- ${ing} (${bits.join('; ')})`
+  }).join('\n')
+
+  const barTypes = [...new Set((inventory || [])
+    .filter(i => i.stockState !== 'oos')
+    .map(i => (inventoryTags || {})[i.spirit.trim().toLowerCase()]?.generic_type)
+    .filter(Boolean))].sort()
+
+  const templateList = TEMPLATES.map(t => `${t.id} — ${t.name}: ${t.formula}. ${t.mechanic} (e.g. ${t.examples.slice(0, 3).join(', ')})`).join('\n')
+
+  const modifierLines = []
+  if (modifiers?.lowABV) modifierLines.push(`LOW ABV is on: the seed's proportion gets reduced, not removed. This genuinely reshuffles the ranking — templates whose structure already carries a lot of non-spirit volume or fortified wine (Spritz, Highball, a reverse-ratio Manhattan/Martini) get easier; templates whose whole point is spirit weight (Old Fashioned, Tiki's split base) get harder. Say so in the reasons where it matters, concretely.`)
+  if (modifiers?.na) modifierLines.push(`NON-ALCOHOLIC is on: no ethanol at all. Spirit-forward templates (Old Fashioned, Manhattan/Martini, Bittersweet, Flip) are genuinely hard here — say what would have to carry the structure instead.`)
+  if (modifiers?.frozen) modifierLines.push(`FROZEN is on: only ${TEMPLATES.filter(t => t.frozenEligible).map(t => t.name).join(', ')} can be frozen; for the rest, the frozen option simply won't apply — mention it only where it changes the call.`)
+
+  const prompt = `You are an expert craft bartender helping someone who has a bottle and wants a drink but hasn't decided what kind. Reason about how EACH of the ten cocktail templates below would treat this seed — and make the ten answers genuinely different from each other.
+
+SEED INGREDIENT(S):
+${seedContext}
+${modifierLines.length > 0 ? `\nMODIFIERS:\n${modifierLines.join('\n')}\n` : ''}
+TEMPLATES:
+${templateList}
+
+${barTypes.length > 0 ? `ON THE BAR (in stock, by type — secondary context only; a reason may note that a key partner is on hand, but fit comes first): ${barTypes.join(', ')}\n\n` : ''}STEP 1 — "seed_traits": list 4-6 DIFFERENT properties of this specific seed, across different axes — aroma, flavor, sweetness or dryness, bitterness, body/texture, proof/heat, funk, acidity — whichever genuinely apply. Short labels ("resinous juniper", "lean, dry body", "high proof", "grassy funk"). If it is a particular bottle, use what distinguishes it from a generic example of its type — but only what you actually know about that bottle. If you don't know its specific tasting notes, reason from what you do know (its category, its producer's style, the owner's notes above) and stay at that level; a confident wrong tasting note is worse than a general true one. Never state a number (proof, ABV, age) you are not sure of.
+
+Also list "canon": the famous, well-established drinks built on this seed (up to 6), each with the template id it belongs to. Empty is fine for an obscure seed — never invent one.
+
+STEP 2 — for EACH of the ten templates:
+- "trait": the one seed trait (copied exactly from seed_traits) this template's structure acts on most. SPREAD THESE OUT — use as many different traits as you can, and never the same trait for more than two templates. This is the point of the exercise: ten templates that each just "amplify" or "bury" the same aroma is a useless answer.
+- "reason": ONE sentence, at most 28 words: what one concrete ingredient from the template's build (Campari, egg, tonic, orgeat…) does to that trait, and what kind of drink results. Concrete and sensory — "Campari's bitterness gives rye spice something to push against", not "complements the botanical profile". Banned filler: amplify, complement, shine, balance, harmony, showcase, elevate. Where a real, well-known drink in this template is built on this seed, name it — only one you are certain exists.
+
+STEP 3 — "suggested": true for the 3-5 templates that most naturally suit this seed${modifierLines.length > 0 ? ' under these modifiers' : ''}. Weigh the canon heavily: a template with a "canon" entry belongs here before one without (for rum, the Daiquiri makes Sour obvious and the Mai Tai makes Tiki obvious). ${modifierLines.length > 0 ? 'The modifiers should be able to move a template into or out of the suggested set, not just add a clause to its reason. ' : ''}Rank all ten, best fit first.
+
+For templates you do NOT suggest, the reason is the interesting part: name what stands in the way, then END on what you'd get if you did it anyway — "Unusual here — the egg would mute the gentian, but it'd be rich and unexpected." Never close on a put-down or a joke at the drink's expense ("you'd lose what makes it itself", "becomes a neutral base", "like cologne in champagne"), never falsely enthusiastic. If one is a genuinely interesting non-obvious choice, say so.
+
+Return ONLY valid JSON, no markdown fences:
+{
+  "seed_traits": ["string"],
+  "canon": [{ "drink": "string", "id": "template id" }],
+  "templates": [
+    { "id": "template id", "suggested": true, "trait": "one of seed_traits", "reason": "string" }
+  ]
+}
+Exactly ten entries, every id listed above exactly once, ranked best fit first.`
+
+  const body = {
+    model: 'claude-sonnet-4-5',
+    max_tokens: 1400,
+    messages: [{ role: 'user', content: prompt }],
+  }
+  const raw = diagLabel
+    ? extractJSON((await callClaudeStreamDiag(body, diagLabel)).text)
+    : await callClaude(body)
+  // Tolerate a dropped or invented id rather than failing the screen: keep
+  // valid entries in the model's order, drop duplicates/unknowns, and append
+  // any template it omitted (unsuggested, no reason) so all ten still render.
+  const seen = new Set()
+  const entries = []
+  for (const e of raw?.templates || []) {
+    if (!e?.id || !TEMPLATE_MAP[e.id] || seen.has(e.id)) continue
+    seen.add(e.id)
+    entries.push({ id: e.id, suggested: !!e.suggested, trait: e.trait || null, reason: e.reason || null })
+  }
+  for (const t of TEMPLATES) if (!seen.has(t.id)) entries.push({ id: t.id, suggested: false, trait: null, reason: null })
+  if (!entries.some(e => e.suggested)) entries.slice(0, 3).forEach(e => { e.suggested = true })
+  return entries
+}
+
 async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, tastingContext) {
   // Session 16, Change 3: only relevant when this suggestion is itself a
   // documented drink — a riff/original adjustment doesn't need this, since
@@ -5482,6 +5574,16 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const [lowABV, setLowABV] = useState(false)
   const [templatePickerLoading, setTemplatePickerLoading] = useState(false)
   const [infoSheetTemplate, setInfoSheetTemplate] = useState(null)
+  // Session 27: Help Me Decide. One call reasons about all ten templates;
+  // keyed by seed + modifiers so Back-then-Help-Me-Decide with nothing
+  // changed reuses it, and changing a modifier refetches (they change which
+  // templates suit). showAllGuidance expands the unsuggested ones from data
+  // already in hand — never a second call.
+  const [guidance, setGuidance] = useState(null) // { key, entries } | null
+  const [guidanceLoading, setGuidanceLoading] = useState(false)
+  const [guidanceError, setGuidanceError] = useState(null)
+  const [showAllGuidance, setShowAllGuidance] = useState(false)
+  const guidanceRequestRef = useRef(0)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [feedback, setFeedback] = useState('')
@@ -6426,7 +6528,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     }
   }
 
-  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); guidanceRequestRef.current += 1; setGuidance(null); setGuidanceLoading(false); setGuidanceError(null); setShowAllGuidance(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -6599,6 +6701,41 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       }
     } finally {
       setTemplatePickerLoading(false)
+    }
+  }
+
+  // Session 27: navigates immediately and lets the guidance stream in, same
+  // shape as the contextual affinities layer. guidanceRequestRef discards a
+  // response that lands after the seed/modifiers changed or the user reset.
+  const handleHelpMeDecide = async () => {
+    const modifiers = { frozen, lowABV, na }
+    const key = makeExplorationKey(selected, 'guidance', frozen, lowABV, na)
+    goToStep('guidance')
+    if (guidance?.key === key) {
+      setShowAllGuidance(!!template && !guidance.entries.find(e => e.id === template)?.suggested)
+      return
+    }
+    fetchGuidance(key, modifiers)
+  }
+
+  const fetchGuidance = async (key, modifiers) => {
+    const reqId = ++guidanceRequestRef.current
+    setGuidance(null)
+    setGuidanceError(null)
+    setShowAllGuidance(false)
+    setGuidanceLoading(true)
+    try {
+      const entries = await analyzeTemplateGuidance(selected, modifiers, inventory, inventoryTags, DIAG_ON ? 'template-guidance' : null)
+      if (reqId !== guidanceRequestRef.current) return
+      setGuidance({ key, entries })
+      // A template already picked on the previous screen stays picked; if it
+      // isn't among the suggested few, open the full list so it's visible.
+      if (template && !entries.find(e => e.id === template)?.suggested) setShowAllGuidance(true)
+    } catch (err) {
+      if (reqId !== guidanceRequestRef.current) return
+      setGuidanceError(err.message || 'Could not load guidance.')
+    } finally {
+      if (reqId === guidanceRequestRef.current) setGuidanceLoading(false)
     }
   }
 
@@ -7196,6 +7333,19 @@ Rules:
           {showFrozenChip && chip(frozen, 'Frozen', () => setFrozen(v => !v))}
         </div>
 
+        {/* Session 27: secondary exit — below the modifiers, since they're
+            passed to the guidance call, and above the grid, so someone who
+            doesn't know which to pick doesn't have to scan ten cards first. */}
+        <button onClick={handleHelpMeDecide}
+          style={{ width: '100%', background: C.gold + '10', border: `1px solid ${C.gold + '66'}`, borderRadius: 10, color: C.gold, padding: '12px 14px', cursor: 'pointer', marginBottom: 20, textAlign: 'left', display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{ fontSize: 20 }}>🧭</span>
+          <span style={{ flex: 1 }}>
+            <span style={{ display: 'block', fontSize: 14, fontWeight: 700 }}>Help Me Decide</span>
+            <span style={{ display: 'block', fontSize: 12, color: C.textMuted, marginTop: 2 }}>See which templates suit {selectedLabels.join(' + ')}, and why</span>
+          </span>
+          <span style={{ fontSize: 16 }}>→</span>
+        </button>
+
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 10, marginBottom: 16 }}>
           {TEMPLATES.map(t => {
             const active = template === t.id
@@ -7212,17 +7362,117 @@ Rules:
           })}
         </div>
 
-        <button onClick={handleSurpriseMe} disabled={templatePickerLoading}
-          style={{ width: '100%', background: 'none', border: `1px solid ${C.border}`, borderRadius: 10, color: C.textMuted, fontWeight: 600, fontSize: 14, padding: '12px', cursor: templatePickerLoading ? 'default' : 'pointer', marginBottom: 16, opacity: templatePickerLoading ? 0.6 : 1 }}>
-          🎲 Surprise Me
-        </button>
-
         <button onClick={handleContinueToAffinities} disabled={!template || affinityLoading}
           style={{ width: '100%', background: template ? C.gold : C.surface, border: `1px solid ${template ? C.gold : C.border}`, borderRadius: 10, color: template ? '#0f0f0f' : C.textFaint, fontWeight: 700, fontSize: 15, padding: '13px', cursor: (template && !affinityLoading) ? 'pointer' : 'default', opacity: affinityLoading ? 0.7 : 1, transition: 'background 0.15s, color 0.15s' }}>
           {affinityLoading ? 'Loading…' : 'Continue →'}
         </button>
 
+        {/* Session 27: tertiary — same quiet text-link treatment Quick Build
+            already has on the ingredients step. Behavior unchanged. */}
+        <button onClick={handleSurpriseMe} disabled={templatePickerLoading}
+          style={{ width: '100%', background: 'none', border: 'none', color: C.textFaint, fontWeight: 600, fontSize: 13, padding: '12px 0 0', cursor: templatePickerLoading ? 'default' : 'pointer', display: 'block', textAlign: 'center', opacity: templatePickerLoading ? 0.6 : 1 }}>
+          🎲 Surprise Me
+        </button>
+
         {infoSheetTemplate && <TemplateInfoSheet template={infoSheetTemplate} onClose={() => setInfoSheetTemplate(null)} />}
+      </div>
+    )
+  }
+
+  // Session 27: the guidance screen. Single-select pills set `template`
+  // directly, so the CTA's handleContinueToAffinities reads the current
+  // pick, and Back to the template grid shows it highlighted there too.
+  if (step === 'guidance') {
+    const entries = guidance?.entries || []
+    const suggested = entries.filter(e => e.suggested)
+    const rest = entries.filter(e => !e.suggested)
+    const activeModifierLabels = [lowABV && 'Low-ABV', na && 'NA', frozen && 'Frozen'].filter(Boolean)
+    const pill = (e) => {
+      const t = TEMPLATE_MAP[e.id]
+      const active = template === e.id
+      return (
+        <button key={e.id} onClick={() => setTemplate(e.id)} aria-pressed={active}
+          style={{ width: '100%', background: active ? C.gold + '22' : C.surface, border: `1px solid ${active ? C.gold + '88' : C.border}`, borderRadius: 14, color: C.text, padding: '14px 16px', cursor: 'pointer', textAlign: 'left', display: 'flex', gap: 14, alignItems: 'flex-start', marginBottom: 10, transition: 'background 0.15s, border-color 0.15s' }}>
+          <span style={{ fontSize: 26, lineHeight: 1 }}>{t.emoji}</span>
+          <span style={{ flex: 1, minWidth: 0 }}>
+            <span style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 16, fontWeight: 700, color: active ? C.gold : C.text }}>{t.name}</span>
+              <span style={{ fontSize: 12, color: C.textFaint }}>{t.subtitle}</span>
+            </span>
+            {e.reason
+              ? <span style={{ display: 'block', fontSize: 13, color: C.textMuted, lineHeight: 1.5, marginTop: 6 }}>{e.reason}</span>
+              : <span style={{ display: 'block', fontSize: 13, color: C.textFaint, fontStyle: 'italic', marginTop: 6 }}>No reasoning came back for this one.</span>}
+          </span>
+          <span style={{ width: 20, height: 20, borderRadius: '50%', border: `2px solid ${active ? C.gold : C.border}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: 2 }}>
+            {active && <span style={{ width: 10, height: 10, borderRadius: '50%', background: C.gold }} />}
+          </span>
+        </button>
+      )
+    }
+    const canProceed = !!template && !guidanceLoading && !affinityLoading
+    return (
+      <div>
+        <button onClick={goBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+        <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Which kind of drink?</div>
+        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 20 }}>
+          Exploring: <span style={{ color: C.gold }}>{selectedLabels.join(' + ')}</span>
+          {activeModifierLabels.length > 0 && <span> · {activeModifierLabels.join(', ')}</span>}
+        </div>
+
+        {guidanceLoading && (
+          <div>
+            <style>{`@keyframes bcpulse { 0%,100% { opacity: 0.45 } 50% { opacity: 0.9 } }`}</style>
+            <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 12 }}>Thinking through all ten templates for {selectedLabels.join(' + ')}…</div>
+            {[0, 1, 2].map(i => (
+              <div key={i} style={{ height: 78, borderRadius: 14, background: C.surface, border: `1px solid ${C.border}`, marginBottom: 10, animation: `bcpulse 1.4s ease-in-out ${i * 0.15}s infinite` }} />
+            ))}
+          </div>
+        )}
+
+        {guidanceError && !guidanceLoading && (
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+            <div style={{ fontSize: 14, color: C.text, marginBottom: 8 }}>Couldn't load the guidance.</div>
+            <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 12 }}>{guidanceError}</div>
+            <button onClick={() => fetchGuidance(makeExplorationKey(selected, 'guidance', frozen, lowABV, na), { frozen, lowABV, na })}
+              style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 13, padding: '8px 14px', cursor: 'pointer' }}>Try again</button>
+          </div>
+        )}
+
+        {guidance && !guidanceLoading && (
+          <>
+            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>Suits it best</div>
+            {suggested.map(pill)}
+            {rest.length > 0 && (
+              <>
+                <button onClick={() => setShowAllGuidance(v => !v)}
+                  style={{ width: '100%', background: 'none', border: 'none', color: C.textMuted, fontSize: 13, fontWeight: 600, padding: '8px 0 14px', cursor: 'pointer', textAlign: 'center' }}>
+                  {showAllGuidance ? 'Hide the other templates ▴' : `See all templates (${rest.length} more) ▾`}
+                </button>
+                {showAllGuidance && (
+                  <>
+                    <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 10 }}>Less obvious</div>
+                    {rest.map(pill)}
+                  </>
+                )}
+              </>
+            )}
+          </>
+        )}
+
+        <div style={{ marginTop: 12 }}>
+          <button onClick={handleContinueToAffinities} disabled={!canProceed}
+            style={{ width: '100%', background: canProceed ? C.gold : C.surface, border: `1px solid ${canProceed ? C.gold : C.border}`, borderRadius: 10, color: canProceed ? '#0f0f0f' : C.textFaint, fontWeight: 700, fontSize: 15, padding: '13px', cursor: canProceed ? 'pointer' : 'default', opacity: affinityLoading ? 0.7 : 1, transition: 'background 0.15s, color 0.15s' }}>
+            {affinityLoading ? 'Loading…' : template ? `Published and Riffs →` : 'Pick one to see Published and Riffs'}
+          </button>
+          {/* Not yet built (the creation walk). Dashed outline + an explicit
+              "Coming soon" tag so it reads as "not yet", not "broken" (S19).
+              No handler on purpose — tapping does nothing. */}
+          <div role="button" aria-disabled="true" title="Coming soon"
+            style={{ width: '100%', boxSizing: 'border-box', marginTop: 10, border: `1px dashed ${C.textFaint}`, borderRadius: 10, padding: '12px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, cursor: 'default', userSelect: 'none' }}>
+            <span style={{ color: C.textFaint, fontWeight: 600, fontSize: 14 }}>✏️ Create Something New</span>
+            <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.gold, background: C.gold + '18', border: `1px solid ${C.gold + '44'}`, borderRadius: 20, padding: '2px 8px' }}>Coming soon</span>
+          </div>
+        </div>
       </div>
     )
   }
