@@ -5864,10 +5864,11 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const [viaSurpriseMe, setViaSurpriseMe] = useState(false)
   // Session 28, Change 2: tier-1 came back non-empty but the seed filter
   // dropped every suggestion. handleExplore then advances to tier-2/3 on its
-  // own, silently, and this suppresses the two things that used to appear
-  // instead — the "no published recipes" note and the See More Published
-  // CTA (more_published_exist stays true here because the model DID find
-  // drinks; they just didn't feature the seed as the filter reads it).
+  // own, silently, and this suppresses the "no published recipes" note that
+  // used to appear instead. See More Published is deliberately NOT
+  // suppressed: more_published_exist stays true because the model did find
+  // drinks, and tapping it is how canon the filter missed (Batavia Arrack)
+  // stays reachable — the empty state was the problem, not the CTA.
   const [tier1SeedDropped, setTier1SeedDropped] = useState(false)
   const [loadingMsgIdx, setLoadingMsgIdx] = useState(0)
   const [seeMorePublishedMsgIdx, setSeeMorePublishedMsgIdx] = useState(0)
@@ -7860,13 +7861,13 @@ Rules:
     // while the affinities screen two steps earlier — the contextual layer,
     // built to know template and modifiers — said fino, manzanilla, blanc
     // vermouth. When that layer exists for exactly this build, show it, so
-    // the two screens can't disagree. Otherwise the model's sentence is the
-    // only source, and under Low-ABV/NA it's untrustworthy: scoping its prompt
-    // to the template and modifiers was tried and the model still wrote "rye
-    // or bourbon" — tier-1 returns real published recipes as-is, which are
-    // full-proof, and the sentence describes those. So with a modifier active
-    // and no contextual layer (Surprise Me, a restored whiteboard), show
-    // nothing rather than a pairing that contradicts the modifier.
+    // the two screens can't disagree. Without that layer (Quick Build,
+    // Surprise Me, a restored whiteboard) the box is hidden: the model's own
+    // sentence is template- and modifier-blind — scoping its prompt was tried
+    // and it still wrote "rye or bourbon" under Low-ABV, since tier-1 returns
+    // real published recipes as-is and the sentence describes those. No
+    // background call to fetch the layer on those paths: skipping affinities
+    // is what makes them fast, and the box is supplementary.
     const contextualPairs = (() => {
       if (contextualAffinityKey !== makeExplorationKey(selected, template, frozen, lowABV, na)) return null
       const spirits = [], flavors = []
@@ -7876,7 +7877,7 @@ Rules:
       }
       return spirits.length || flavors.length ? [spirits.join(', '), flavors.join(', ')].filter(Boolean).join(' · ') : null
     })()
-    const pairsText = contextualPairs || ((lowABV || na) ? null : result.pairs_well_with)
+    const pairsText = contextualPairs
     const worthBuying = (result.suggestions || []).filter(s => !liveCanMakeNow(s, selected, inventory, inventoryTags))
     // Session 26, Change 3: non-blocking -- the model's own near-miss read on
     // an ingredient local resolution (Change 2) didn't catch. Suggests, same
@@ -7966,7 +7967,7 @@ Rules:
             that half of the condition is factual, not a model claim, since the buffer's
             contents are already known. Persists across several taps and disappears once
             both the buffer is empty and more_published_exist has gone false. */}
-        {!tier1SeedDropped && (morePublishedExist || publishedBuffer.length > 0) && (
+        {(morePublishedExist || publishedBuffer.length > 0) && (
           <div style={{ marginBottom: 12 }}>
             <button onClick={() => handleSeeMorePublished()} disabled={seeMorePublishedLoading}
               style={{ width: '100%', background: 'none', border: `1px dashed ${C.border}`, borderRadius: 10, color: C.gold, fontSize: 13, fontWeight: 600, padding: '12px 16px', cursor: seeMorePublishedLoading ? 'default' : 'pointer', opacity: seeMorePublishedLoading ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
