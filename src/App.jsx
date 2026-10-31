@@ -662,6 +662,51 @@ function isLiveFound(ingredientName, inventory, inventoryTags) {
 // lookup can't replace, so this deliberately leaves both exactly as generated.
 // The stored `status` field itself is untouched by this — it stays the source
 // of truth for what was saved, just not for what's displayed.
+// Session 28, Change 3: when isLiveFound succeeds only through the shared
+// generic_type/alias path — the named bottle itself isn't on hand, but a
+// same-type bottle is — this returns the in-stock bottles that actually
+// satisfied it, so the card can say which one to reach for. (Retagging
+// Yellow Chartreuse, Strega and Faccia Brutto Centerbe Giallo all to
+// "yellow herbal liqueur" makes a Naked and Famous show Chartreuse green
+// with the Chartreuse marked OOS — correct, but useless at the shelf
+// without knowing it meant Strega.) Returns null when the ingredient
+// matched a bottle by its own name, or wasn't found at all: nothing to add.
+//
+// The type comes from the NAMED product's own tag first, searched across
+// the full tag store — a tag says what a bottle IS even when it isn't on
+// hand (S23) — and only then from the owned-only lookup isLiveFound uses.
+// That order matters: Green Chartreuse carries the alias "chartreuse", so
+// the owned-only lookup resolves an OOS "Yellow Chartreuse" to GREEN
+// Chartreuse (first alias hit), and naming that bottle would send you to
+// the wrong one. Strega and the Centerbe are only reachable through Yellow
+// Chartreuse's own tag. If nothing of the named product's type is owned,
+// this falls back to whatever bottle the green dot actually rested on, so
+// the basis for "found" is never hidden — even when that basis is a loose
+// alias.
+function liveFoundVia(ingredientName, inventory, inventoryTags) {
+  if (!ingredientName) return null
+  const inStock = (inventory || []).filter(item => item.stockState !== 'oos')
+  if (inStock.some(item => phraseMatch(ingredientName, item.spirit))) return null
+  const bottlesOfType = tag => {
+    if (!tag?.generic_type) return []
+    const type = normalizeForMatch(tag.generic_type)
+    return inStock.filter(item => normalizeForMatch(inventoryTags?.[item.spirit.trim().toLowerCase()]?.generic_type) === type)
+  }
+  const ownType = bottlesOfType(resolveIngredientTag(ingredientName, inventoryTags))
+  if (ownType.length > 0) return ownType
+  const ownedBasis = bottlesOfType(resolveIngredientTag(ingredientName, ownedInventoryTags(inventory, inventoryTags)))
+  return ownedBasis.length > 0 ? ownedBasis : null
+}
+function foundViaText(bottles) {
+  const bySpirit = new Map()
+  for (const b of bottles) {
+    if (!bySpirit.has(b.spirit)) bySpirit.set(b.spirit, [])
+    if (b.location && !bySpirit.get(b.spirit).includes(b.location)) bySpirit.get(b.spirit).push(b.location)
+  }
+  const named = [...bySpirit].map(([spirit, locs]) => `${spirit}${locs.length ? ` (${locs.join(', ')})` : ''}`)
+  return named.length === 1 ? named[0] : `${named.slice(0, -1).join(', ')} or ${named[named.length - 1]}`
+}
+
 function liveIngredientStatus(storedStatus, ingredientName, inventory, inventoryTags) {
   return isLiveFound(ingredientName, inventory, inventoryTags) ? 'found' : storedStatus
 }
@@ -3542,6 +3587,7 @@ function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer, invento
   const liveStatus = liveIngredientStatus(item.status, item.ingredient, inventory, inventoryTags)
   const isMissing = liveStatus === 'missing'
   const dotColor = liveStatus === 'found' ? C.green : liveStatus === 'substitute' ? C.amber : C.missing
+  const foundVia = liveStatus === 'found' ? liveFoundVia(item.ingredient, inventory, inventoryTags) : null
 
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 16px' }}>
@@ -3561,7 +3607,15 @@ function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer, invento
               <span style={{ fontSize: 11, color: C.textFaint }}>✓ On list</span>
             )}
           </div>
-          {item.location && (
+          {/* Session 28, Change 3: found through a different bottle of the
+              same type — name it (and where it lives) in place of the stored
+              location, which was written for the named bottle and would send
+              you to the wrong spot. S22's substitute gate below is unchanged:
+              that's a stored judgment about an ownership gap; this is a live
+              fact about which owned bottle covers it. */}
+          {foundVia ? (
+            <div style={{ fontSize: 13, color: C.textMuted, marginTop: 3 }}>✓ Covered by <span style={{ color: C.green }}>{foundViaText(foundVia)}</span> — same type, not this exact bottle</div>
+          ) : item.location && (
             <div style={{ fontSize: 13, color: C.textMuted, marginTop: 3 }}>📍 {item.location}</div>
           )}
           {item.shelf_warning && (
@@ -4107,7 +4161,7 @@ function SettingsScreen({ sheetUrlInput, setSheetUrlInput, onReload, inventoryLo
       {!inventoryLoading && !inventoryError && inventory && (
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 13, background: C.green + '22', color: C.green, border: `1px solid ${C.green}44`, borderRadius: 20, padding: '3px 10px', fontWeight: 600 }}>{inStockCount} in stock</span>
-          {lowCount > 0 && <span style={{ fontSize: 13, background: C.amber + '22', color: C.amber, border: `1px solid ${C.amber}44`, borderRadius: 20, padding: '3px 10px', fontWeight: 600 }}>{lowCount} low</span>}
+          {lowCount > 0 && <span style={{ fontSize: 13, background: C.amber + '22', color: C.amber, border: `1px solid ${C.amber}44`, borderRadius: 20, padding: '3px 10px', fontWeight: 600 }}>{lowCount} Low</span>}
           {oosCount > 0 && <span style={{ fontSize: 13, background: C.red + '22', color: C.red, border: `1px solid ${C.red}44`, borderRadius: 20, padding: '3px 10px', fontWeight: 600 }}>{oosCount} OOS</span>}
         </div>
       )}
@@ -4220,7 +4274,7 @@ function InventoryScreen({
         </button>
         {lowCount > 0 && (
           <button onClick={() => toggleStock('low')} style={{ fontSize: 13, background: selectedStock.has('low') ? C.amber + '22' : C.surface, color: selectedStock.has('low') ? C.amber : C.textMuted, border: `1px solid ${selectedStock.has('low') ? C.amber + '44' : C.border}`, borderRadius: 20, padding: '3px 10px', fontWeight: selectedStock.has('low') ? 700 : 600, cursor: 'pointer', transition: 'background 0.15s, color 0.15s' }}>
-            {lowCount} low
+            {lowCount} Low
           </button>
         )}
         {oosCount > 0 && (
@@ -5550,12 +5604,16 @@ function RecipeCard({
                 const liveStatus = liveIngredientStatus(ing.status, ing.ingredient, inventory, inventoryTags)
                 const ingMissing = liveStatus === 'missing'
                 const dotColor = liveStatus === 'found' ? C.green : liveStatus === 'substitute' ? C.amber : liveStatus === 'missing' ? C.missing : C.textFaint
+                const foundVia = liveStatus === 'found' ? liveFoundVia(ing.ingredient, inventory, inventoryTags) : null
                 return (
                   <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13 }}>
                     <span style={{ display: 'inline-block', width: ingMissing ? 8 : 7, height: ingMissing ? 8 : 7, borderRadius: '50%', background: dotColor, boxShadow: ingMissing ? `0 0 0 3px ${C.missing}33` : 'none', flexShrink: 0, marginTop: 4 }} />
                     <div>
                       <span style={{ color: C.text }}>{ing.ingredient}</span>
-                      {ing.location && <span style={{ color: C.textMuted }}> · 📍 {ing.location}</span>}
+                      {/* Session 28, Change 3 — see IngredientCard. */}
+                      {foundVia
+                        ? <div style={{ color: C.textMuted, marginTop: 2 }}>✓ Covered by <span style={{ color: C.green }}>{foundViaText(foundVia)}</span> — same type, not this exact bottle</div>
+                        : ing.location && <span style={{ color: C.textMuted }}> · 📍 {ing.location}</span>}
                       {/* Gated on liveStatus, not the stored status — a live match
                           upgrades this ingredient to "found," at which point a
                           stored substitute suggestion is moot. */}
@@ -5804,6 +5862,13 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // so the first handleSeeMorePublished call is the 2nd tap.
   const diagSeeMorePublishedTapRef = useRef(2)
   const [viaSurpriseMe, setViaSurpriseMe] = useState(false)
+  // Session 28, Change 2: tier-1 came back non-empty but the seed filter
+  // dropped every suggestion. handleExplore then advances to tier-2/3 on its
+  // own, silently, and this suppresses the two things that used to appear
+  // instead — the "no published recipes" note and the See More Published
+  // CTA (more_published_exist stays true here because the model DID find
+  // drinks; they just didn't feature the seed as the filter reads it).
+  const [tier1SeedDropped, setTier1SeedDropped] = useState(false)
   const [loadingMsgIdx, setLoadingMsgIdx] = useState(0)
   const [seeMorePublishedMsgIdx, setSeeMorePublishedMsgIdx] = useState(0)
   const [seeMoreIdeasMsgIdx, setSeeMoreIdeasMsgIdx] = useState(0)
@@ -5815,6 +5880,12 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const [contextualAffinityData, setContextualAffinityData] = useState([])
   const [contextualAffinityLoading, setContextualAffinityLoading] = useState(false)
   const [contextualAffinityError, setContextualAffinityError] = useState(null)
+  // Session 28, Change 1: which exploration (seed + template + modifiers) the
+  // contextual layer above was generated for, so the results screen can use
+  // it only when it still describes the build on screen — not after a
+  // cross-template redirect, an added ingredient, or a Quick Build/Surprise
+  // Me path that never fetched it.
+  const [contextualAffinityKey, setContextualAffinityKey] = useState(null)
   const [categoryDrawer, setCategoryDrawer] = useState(null) // { category, bottles } | null
   // Session 12, Change 3 (revised): opened by any flavor chip backed by the
   // contextual layer (has a {category, role}, not just a bare base-layer
@@ -6310,6 +6381,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     setMorePublishedExist(false)
     setSeeMorePublishedError(null)
     setViaSurpriseMe(!!opts.viaSurpriseMe)
+    setTier1SeedDropped(false)
     setRestoreNodeData({})
     setAutoExpandNodeData(null)
     // Session 10, Change 1: a fresh exploration starts with an empty buffer
@@ -6327,6 +6399,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     try {
       const modifiers = { frozen, lowABV, na }
       let data
+      let seedDroppedAll = false
       if (opts.redirectDrinkName) {
         const named = stripCiteTags(await analyzeNamedDrinkSkeleton(opts.redirectDrinkName, activeTemplate, modifiers, inventoryText, DIAG_ON ? 'tier1-redirect' : null))
         data = {
@@ -6352,13 +6425,25 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         // cross-template suggestion, a narrower and lower-risk path this
         // session leaves alone.
         if (data?.suggestions) {
+          const rawCount = data.suggestions.length
           data.suggestions = filterSuggestionsBySeedIngredients(data.suggestions, selected, inventoryTags, DIAG_ON ? 'tier1-build' : null)
+          // Session 28, Change 2: non-empty in, empty out. Two causes land
+          // here — the filter over-rejecting for an untagged seed (literal
+          // matching misses "arrack" for "Batavia Arrack"), or canon genuinely
+          // lacking the seed (the Forthave Astor Negroni case) — and one rule
+          // covers both: continue to riffs, quietly. Unlike tier-2/3's S21
+          // amber message, nothing is said. The filter itself is unchanged.
+          seedDroppedAll = rawCount > 0 && data.suggestions.length === 0
+          if (seedDroppedAll) console.warn(`[seed filter] tier-1 returned ${rawCount}, all dropped for not featuring ${selected.join(' + ')}; advancing to tier-2/3`)
         }
       }
       setResult(data)
       setMorePublishedExist(data?.more_published_exist === true)
       if (DIAG_ON) console.log('[DIAG:tier1-build] tiers+candidates', JSON.stringify({ displayed: (data?.suggestions || []).map(s => ({ name: s.recipe_name, tier: s.tier, origin: s.origin })), rawCandidates: data?.buffer || [] }))
-      setStep('results')
+      setTier1SeedDropped(seedDroppedAll)
+      // Stay on the loading screen when advancing — results render once the
+      // riffs land (below), so an empty tier-1 state never flashes first.
+      if (!seedDroppedAll) setStep('results')
       // Session 11, Change 1: fill the buffer in the background, off the
       // critical path — Build itself no longer searches to verify these, it
       // only named them cheaply (data.buffer, raw candidates). This call does
@@ -6458,7 +6543,11 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           }
         }
       }
-      return { data, wbId, recipeListNodeId, ingredientsNodeId }
+      if (seedDroppedAll) {
+        await handleSeeMore({ template: activeTemplate, whiteboardId: wbId, recipeListNodeId, baseSuggestions: [] })
+        setStep('results')
+      }
+      return { data, wbId, recipeListNodeId, ingredientsNodeId, advancedToTier23: seedDroppedAll }
     } catch (err) {
       setError(err.message || 'Something went wrong. Please try again.')
       setStep('error')
@@ -6686,7 +6775,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     }
   }
 
-  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); guidanceRequestRef.current += 1; guidanceAbortRef.current?.abort(); guidanceAbortRef.current = null; setGuidance(null); setGuidanceLoading(false); setGuidanceError(null); setShowAllGuidance(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); setTier1SeedDropped(false); guidanceRequestRef.current += 1; guidanceAbortRef.current?.abort(); guidanceAbortRef.current = null; setGuidance(null); setGuidanceLoading(false); setGuidanceError(null); setShowAllGuidance(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityKey(null); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -6797,6 +6886,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   }
 
   const fetchContextualAffinities = async (baseMap) => {
+    setContextualAffinityKey(makeExplorationKey(selected, template, frozen, lowABV, na))
     try {
       const modifiers = { frozen, lowABV, na }
       const data = await analyzeContextualAffinities(selected, template, modifiers, baseMap, DIAG_ON ? 'affinities-contextual' : null)
@@ -6833,7 +6923,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       const resolved = await resolveTemplate(selected, affinityMap)
       setTemplate(resolved)
       const tier1 = await handleExplore({ template: resolved, fromStep })
-      if (tier1 && !tier1.data.incompatible && !hasFictionalSeedIngredient(tier1.data)) {
+      if (tier1 && !tier1.advancedToTier23 && !tier1.data.incompatible && !hasFictionalSeedIngredient(tier1.data)) {
         await handleSeeMore({ template: resolved, whiteboardId: tier1.wbId, recipeListNodeId: tier1.recipeListNodeId, baseSuggestions: tier1.data.suggestions || [] })
       }
     } finally {
@@ -6854,7 +6944,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       const resolved = await resolveTemplate(selected, affinityMap)
       setTemplate(resolved)
       const tier1 = await handleExplore({ template: resolved, fromStep, viaSurpriseMe: true })
-      if (tier1 && !tier1.data.incompatible && !hasFictionalSeedIngredient(tier1.data)) {
+      if (tier1 && !tier1.advancedToTier23 && !tier1.data.incompatible && !hasFictionalSeedIngredient(tier1.data)) {
         await handleSeeMore({ template: resolved, whiteboardId: tier1.wbId, recipeListNodeId: tier1.recipeListNodeId, baseSuggestions: tier1.data.suggestions || [] })
       }
     } finally {
@@ -7763,6 +7853,30 @@ Rules:
     // Session 22, Change 1: live, not the stored can_make_now — see
     // liveCanMakeNow for why this can't just trust generation time.
     const canMake = (result.suggestions || []).filter(s => liveCanMakeNow(s, selected, inventory, inventoryTags))
+    // Session 28, Change 1: "Pairs Well With" used to be only the tier-1
+    // model's own pairs_well_with — a side field it wrote right after
+    // web-searching the bottle, so it echoed the producer's general pairings
+    // (rye, bourbon, Carpano Antica for Forthave Astor) even under Low-ABV,
+    // while the affinities screen two steps earlier — the contextual layer,
+    // built to know template and modifiers — said fino, manzanilla, blanc
+    // vermouth. When that layer exists for exactly this build, show it, so
+    // the two screens can't disagree. Otherwise the model's sentence is the
+    // only source, and under Low-ABV/NA it's untrustworthy: scoping its prompt
+    // to the template and modifiers was tried and the model still wrote "rye
+    // or bourbon" — tier-1 returns real published recipes as-is, which are
+    // full-proof, and the sentence describes those. So with a modifier active
+    // and no contextual layer (Surprise Me, a restored whiteboard), show
+    // nothing rather than a pairing that contradicts the modifier.
+    const contextualPairs = (() => {
+      if (contextualAffinityKey !== makeExplorationKey(selected, template, frozen, lowABV, na)) return null
+      const spirits = [], flavors = []
+      for (const entry of contextualAffinityData || []) {
+        for (const c of entry?.spirit_categories || []) { const t = titleCase(c.category); if (!spirits.includes(t)) spirits.push(t) }
+        for (const c of entry?.flavor_categories || []) { const t = titleCase(c.category); if (!flavors.includes(t)) flavors.push(t) }
+      }
+      return spirits.length || flavors.length ? [spirits.join(', '), flavors.join(', ')].filter(Boolean).join(' · ') : null
+    })()
+    const pairsText = contextualPairs || ((lowABV || na) ? null : result.pairs_well_with)
     const worthBuying = (result.suggestions || []).filter(s => !liveCanMakeNow(s, selected, inventory, inventoryTags))
     // Session 26, Change 3: non-blocking -- the model's own near-miss read on
     // an ingredient local resolution (Change 2) didn't catch. Suggests, same
@@ -7787,14 +7901,14 @@ Rules:
           </div>
         )}
         {result.flavor_profile_note && (
-          <div style={{ background: C.gold + '12', border: `1px solid ${C.gold}33`, borderRadius: 10, padding: '12px 16px', marginBottom: result.pairs_well_with ? 8 : 24, fontSize: 14, color: C.text, lineHeight: 1.6 }}>
+          <div style={{ background: C.gold + '12', border: `1px solid ${C.gold}33`, borderRadius: 10, padding: '12px 16px', marginBottom: pairsText ? 8 : 24, fontSize: 14, color: C.text, lineHeight: 1.6 }}>
             ✨ {result.flavor_profile_note}
           </div>
         )}
-        {result.pairs_well_with && (
+        {pairsText && (
           <div style={{ background: C.amber + '12', border: `1px solid ${C.amber}33`, borderRadius: 10, padding: '12px 16px', marginBottom: 24, fontSize: 14, color: C.text, lineHeight: 1.6 }}>
             <div style={{ fontWeight: 600, color: C.amber, marginBottom: 4 }}>🔗 Pairs Well With</div>
-            {result.pairs_well_with}
+            {pairsText}
           </div>
         )}
         <div style={{ opacity: isFeedbackLoading ? 0.4 : 1, transition: 'opacity 0.3s', pointerEvents: isFeedbackLoading ? 'none' : 'auto' }}>
@@ -7841,7 +7955,7 @@ Rules:
             <span style={{ color: C.gold, fontSize: 18, flexShrink: 0 }}>→</span>
           </div>
         )}
-        {!originalsFetched && (result.suggestions || []).length === 0 && (
+        {!originalsFetched && !tier1SeedDropped && (result.suggestions || []).length === 0 && (
           <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 16px', fontSize: 13, color: C.textFaint, marginBottom: 12, lineHeight: 1.5 }}>
             No published recipes matched — a riff or an original might still work well.
           </div>
@@ -7852,7 +7966,7 @@ Rules:
             that half of the condition is factual, not a model claim, since the buffer's
             contents are already known. Persists across several taps and disappears once
             both the buffer is empty and more_published_exist has gone false. */}
-        {(morePublishedExist || publishedBuffer.length > 0) && (
+        {!tier1SeedDropped && (morePublishedExist || publishedBuffer.length > 0) && (
           <div style={{ marginBottom: 12 }}>
             <button onClick={() => handleSeeMorePublished()} disabled={seeMorePublishedLoading}
               style={{ width: '100%', background: 'none', border: `1px dashed ${C.border}`, borderRadius: 10, color: C.gold, fontSize: 13, fontWeight: 600, padding: '12px 16px', cursor: seeMorePublishedLoading ? 'default' : 'pointer', opacity: seeMorePublishedLoading ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
