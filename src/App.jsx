@@ -396,11 +396,13 @@ const CAN_MAKE_NOW_RULE = `Set can_make_now: true when every required ingredient
 // block, just a different question asked of the one already provided.
 const BOTTLE_JUSTIFICATION_INSTRUCTION = `BOTTLE CHOICE — first, a gate: does the ingredient's text in the fixed list above actually name a specific product or brand ("Rittenhouse Rye", "Carpano Antica", "Forthave Astor Batch Monofloral Amaro")? If it's a bare category with no producer or brand in it — "rye whiskey", "sweet vermouth", "gin", "amaro" — the skeleton never chose a specific bottle in the first place, so there is nothing to justify: set "bottle_note" to null and move on, regardless of how many bottles are owned in that category. This gate comes first, before anything below, and it is not optional — "Sweet Vermouth" is exactly the kind of bare category this must return null for, every time, even in a drink where vermouth choice would otherwise matter.
 
-Only once an ingredient clears that gate: use the Generic Type column in the BAR INVENTORY above to check how many bottles the user owns in that same Generic Type.
+Second, the same kind of gate: if the named bottle itself isn't in the BAR INVENTORY above, nothing was chosen from the user's shelf — whether something else can stand in for it is an ownership question, and status, substitute and flavor_impact already answer it. Set "bottle_note" to null.
+
+Only once an ingredient clears both gates: use the Generic Type column in the BAR INVENTORY above to check how many bottles the user owns in that same Generic Type.
 - Only one bottle owned in that Generic Type, or the ingredient has no Generic Type at all: nothing was actually chosen between alternatives either. Set "bottle_note" to null.
-- More than one bottle owned in that Generic Type: decide whether picking this one over the others is load-bearing or preference, before writing anything.
-  - PREFERENCE: the category itself does the work, and any owned bottle in it would make substantially the same drink — which rye goes into a Manhattan is a bartender's choice, not a decision the drink depends on. Set "bottle_note" to null; stating a preference as if it mattered is noise, not signal.
-  - LOAD-BEARING: this specific bottle supplies something the drink depends on for its character — which amaro goes into a drink built around amaro's bitterness genuinely changes what the drink is. Write one line: why this bottle earns the spot, then which other owned bottles in the same Generic Type would also work and roughly how the drink would differ with them. Name only bottles that actually appear in the BAR INVENTORY above — never one the user doesn't own.
+- More than one bottle owned in that Generic Type: decide whether picking this one over the others is load-bearing or preference, before writing anything. Decide it with a swap test, not by default: picture the drink made with each of the other owned bottles in that Generic Type in its place. Bottles share a Generic Type because they fill the same role in a drink, not because they taste alike.
+  - PREFERENCE: every swap makes substantially the same drink — the category itself does the work. Which rye goes into a Manhattan is a bartender's choice, not a decision the drink depends on. Set "bottle_note" to null; stating a preference as if it mattered is noise, not signal.
+  - LOAD-BEARING: at least one swap would make a noticeably different drink, because this bottle's own flavor is part of the drink's character — which amaro goes into a drink built around amaro's bitterness, or Yellow Chartreuse versus Strega in a Naked and Famous. This holds just as much when the recipe is a documented classic that names the bottle outright: the spec naming it is exactly why the user needs to know what changes if they reach for one of their others. Write one line: why this bottle earns the spot, then which other owned bottles in the same Generic Type would also work and roughly how the drink would differ with them. Name only bottles that actually appear in the BAR INVENTORY above — never one the user doesn't own.
 Voice: terse, direct, expert — a bartender telling you which bottle to reach for and why, not a tasting note. Most ingredients should get null here — either the gate stops them or the preference case does — and if you're writing one for nearly every bottled ingredient, you're being too permissive.`
 
 // Session 8 (skeleton-first): appended wherever a first-pass listing still
@@ -641,17 +643,79 @@ function ownedInventoryTags(inventory, inventoryTags) {
 // has a tag at all — the same name-matching fallback OWNERSHIP_STATUS_RULES
 // has always relied on for an untagged bottle (a real bottle with no tag is
 // still owned), applied here the same way. Only once that fails does this
-// fall through to tag-based generic_type/alias matching, and only against
-// ownedInventoryTags — a tag a bottle no longer carries can't resolve
-// anything this way either.
+// fall through to tag-based generic_type/alias matching, and only an
+// in-stock bottle can satisfy it — a tag a bottle no longer carries can't
+// resolve anything this way either (Session 29: see resolveIngredientTypes
+// for which terms compete and why the most specific one wins).
+// Session 29, Change 3: the tag path above resolved against owned tags only
+// and took the FIRST generic_type/alias hit, so a family-level word on one
+// bottle could claim a more specific product it doesn't cover — Green
+// Chartreuse's alias "chartreuse" made an OOS Yellow Chartreuse read green
+// with no other yellow herbal liqueur on hand. The same shape recurs across
+// the tag store ("lillet" on Lillet Blanc vs Lillet Rouge, "blanco" on a
+// tequila vs Allesio Blanco Vermouth, "scotch" on a blended scotch vs
+// Laphroaig, "port" on tawny vs ruby), so this fixes the rule rather than
+// one alias: every term competes and the most specific match wins — an
+// exact match over a containment, then more words over fewer. Which terms
+// compete: every in-stock bottle's name, generic_type and aliases (the same
+// vocabulary as before), plus the NAME of every other tagged bottle, on
+// hand or not — a tag says what a bottle IS even when it isn't on hand
+// (S23), so an OOS Yellow Chartreuse's own name outranks Green's one-word
+// alias and decides the type. An off-hand bottle's aliases and generic_type
+// stay out: an orphaned tag's loose alias ("tequila" on a long-gone blanco)
+// must not widen what in-stock bottles cover. Bare "Chartreuse" still
+// exact-matches Green's alias, as it should. Ties keep every tied type. An
+// ingredient that names no known bottle ("Amaro CioCiaro") resolves
+// through its category word exactly as before. Returns the set of
+// generic_types the ingredient means; ownership is then whether any
+// in-stock bottle carries one of them.
+const ingredientTypesCache = new WeakMap()
+function resolveIngredientTypes(text, inventory, inventoryTags) {
+  const nt = normalizeForMatch(text)
+  if (!nt || !inventoryTags) return new Set()
+  const owned = ownedInventoryTags(inventory, inventoryTags)
+  let byTags = ingredientTypesCache.get(inventory || ingredientTypesCache)
+  if (!byTags) { byTags = new WeakMap(); ingredientTypesCache.set(inventory || ingredientTypesCache, byTags) }
+  let byText = byTags.get(inventoryTags)
+  if (!byText) { byText = new Map(); byTags.set(inventoryTags, byText) }
+  if (byText.has(nt)) return byText.get(nt)
+  const words = s => s.split(/\s+/).length
+  let best = 0
+  let types = new Set()
+  for (const [itemName, tag] of Object.entries(inventoryTags)) {
+    if (!tag?.generic_type) continue
+    const terms = owned[itemName] ? [itemName, tag.generic_type, ...(tag.aliases || [])] : [itemName]
+    for (const term of terms) {
+      const nterm = normalizeForMatch(term)
+      if (!nterm || !phraseMatch(nt, nterm)) continue
+      // An off-hand bottle's one-word name only counts as an exact match:
+      // the sheet names some bitters by flavor alone ("Lemon", "Olive"),
+      // and "lemon juice" must not resolve to citrus bitters because one
+      // of them ran out. "Strega" or "Averna" as the whole ingredient
+      // still decides the type; "Averna Amaro" falls through to "amaro".
+      if (!owned[itemName] && nterm !== nt && words(nterm) < 2) continue
+      const score = nterm === nt ? 1000 : Math.min(words(nt), words(nterm))
+      if (score > best) { best = score; types = new Set() }
+      if (score === best) types.add(normalizeForMatch(tag.generic_type))
+    }
+  }
+  byText.set(nt, types)
+  return types
+}
+function inStockBottlesOfTypes(types, inventory, inventoryTags) {
+  if (types.size === 0) return []
+  return (inventory || []).filter(item => item.stockState !== 'oos'
+    && types.has(normalizeForMatch(inventoryTags?.[item.spirit.trim().toLowerCase()]?.generic_type)))
+}
+
 function isLiveFound(ingredientName, inventory, inventoryTags) {
   if (!ingredientName) return false
   // Session 25, Change 1: an OOS bottle must not satisfy the direct-name
-  // match either — ownedInventoryTags below already excludes it from the
-  // tag-based fallback; this is the same exclusion applied to the other of
-  // the two paths this function checks.
+  // match either — the tag path below only ever counts in-stock bottles;
+  // this is the same exclusion applied to the other of the two paths this
+  // function checks.
   if ((inventory || []).some(item => item.stockState !== 'oos' && phraseMatch(ingredientName, item.spirit))) return true
-  return !!resolveIngredientTag(ingredientName, ownedInventoryTags(inventory, inventoryTags))
+  return inStockBottlesOfTypes(resolveIngredientTypes(ingredientName, inventory, inventoryTags), inventory, inventoryTags).length > 0
 }
 
 // A live match is always "found" — no purchase needed regardless of what was
@@ -672,43 +736,41 @@ function isLiveFound(ingredientName, inventory, inventoryTags) {
 // without knowing it meant Strega.) Returns null when the ingredient
 // matched a bottle by its own name, or wasn't found at all: nothing to add.
 //
-// The type comes from the NAMED product's own tag first, searched across
-// the full tag store — a tag says what a bottle IS even when it isn't on
-// hand (S23) — and only then from the owned-only lookup isLiveFound uses.
-// That order matters: Green Chartreuse carries the alias "chartreuse", so
-// the owned-only lookup resolves an OOS "Yellow Chartreuse" to GREEN
-// Chartreuse (first alias hit), and naming that bottle would send you to
-// the wrong one. Strega and the Centerbe are only reachable through Yellow
-// Chartreuse's own tag. If nothing of the named product's type is owned,
-// this falls back to whatever bottle the green dot actually rested on, so
-// the basis for "found" is never hidden — even when that basis is a loose
-// alias.
+// Session 29, Change 3: the type is the one resolveIngredientTypes settles
+// on — the same set isLiveFound's green dot rests on, so this can never
+// name a bottle the dot didn't (S28 derived it separately and fell back to
+// the loose owned-only hit, which is how Green Chartreuse got named for a
+// Yellow Chartreuse). Grouped per bottle: a bottle shelved in two places
+// is one candidate with two locations, not two candidates.
 function liveFoundVia(ingredientName, inventory, inventoryTags) {
   if (!ingredientName) return null
-  const inStock = (inventory || []).filter(item => item.stockState !== 'oos')
-  if (inStock.some(item => phraseMatch(ingredientName, item.spirit))) return null
-  const bottlesOfType = tag => {
-    if (!tag?.generic_type) return []
-    const type = normalizeForMatch(tag.generic_type)
-    return inStock.filter(item => normalizeForMatch(inventoryTags?.[item.spirit.trim().toLowerCase()]?.generic_type) === type)
-  }
-  const ownType = bottlesOfType(resolveIngredientTag(ingredientName, inventoryTags))
-  if (ownType.length > 0) return ownType
-  const ownedBasis = bottlesOfType(resolveIngredientTag(ingredientName, ownedInventoryTags(inventory, inventoryTags)))
-  return ownedBasis.length > 0 ? ownedBasis : null
-}
-function foundViaText(bottles) {
+  if ((inventory || []).some(item => item.stockState !== 'oos' && phraseMatch(ingredientName, item.spirit))) return null
+  const bottles = inStockBottlesOfTypes(resolveIngredientTypes(ingredientName, inventory, inventoryTags), inventory, inventoryTags)
+  if (bottles.length === 0) return null
   const bySpirit = new Map()
   for (const b of bottles) {
-    if (!bySpirit.has(b.spirit)) bySpirit.set(b.spirit, [])
-    if (b.location && !bySpirit.get(b.spirit).includes(b.location)) bySpirit.get(b.spirit).push(b.location)
+    if (!bySpirit.has(b.spirit)) bySpirit.set(b.spirit, { spirit: b.spirit, generic_type: inventoryTags?.[b.spirit.trim().toLowerCase()]?.generic_type || null, notes: b.notes || null, locations: [] })
+    const entry = bySpirit.get(b.spirit)
+    if (b.location && !entry.locations.includes(b.location)) entry.locations.push(b.location)
   }
-  const named = [...bySpirit].map(([spirit, locs]) => `${spirit}${locs.length ? ` (${locs.join(', ')})` : ''}`)
-  return named.length === 1 ? named[0] : `${named.slice(0, -1).join(', ')} or ${named[named.length - 1]}`
+  return [...bySpirit.values()]
+}
+function bottleWithLocation(candidate) {
+  return `${candidate.spirit}${candidate.locations.length ? ` (${candidate.locations.join(', ')})` : ''}`
 }
 
+// Session 29, Change 3: the one downgrade. A stored "found" whose
+// ingredient resolves to a type (which, with isLiveFound false, can only
+// mean it named a known bottle that's off hand) while no in-stock bottle
+// carries that type is no longer true — the lookup knows exactly what the
+// ingredient is and that none of it is here. Without this, a card generated
+// while Yellow Chartreuse was in stock kept its green dot after it ran out.
+// Stored "substitute"/"missing" stay untouched (judgment, per above), and
+// an ingredient the lookup can't place still keeps whatever was stored.
 function liveIngredientStatus(storedStatus, ingredientName, inventory, inventoryTags) {
-  return isLiveFound(ingredientName, inventory, inventoryTags) ? 'found' : storedStatus
+  if (isLiveFound(ingredientName, inventory, inventoryTags)) return 'found'
+  if (storedStatus === 'found' && resolveIngredientTypes(ingredientName, inventory, inventoryTags).size > 0) return 'missing'
+  return storedStatus
 }
 
 // The Can Make Now / Shopping Required split has to track the same live
@@ -2857,6 +2919,45 @@ Return ONLY valid JSON, no markdown fences:
   return await callClaude(body)
 }
 
+// Session 29, Change 1: when a recipe's bottle isn't on hand but several
+// owned bottles share its generic_type, S28's covered-by note listed every
+// one of them — eleven amari for an Amaro CioCiaro, implying they're
+// interchangeable when Braulio or Cynar would make a different drink. This
+// asks the one question that list can't answer: which of these is closest
+// to the bottle the recipe named. Per-ingredient, not per-drink — the
+// answer depends on what's being replaced, not the build around it
+// (measured: the same pick with and without the recipe in the prompt, 8 of
+// 8 pairs across CioCiaro, Forthave Marseille, Yellow Chartreuse and an
+// Appleton rum), which is what lets one answer serve every drink that
+// calls for that bottle. S5's substitute/substitute_location/flavor_impact
+// were the obvious home but can't carry this: they're written at generation
+// time and only for "substitute" status, while a covered-by ingredient is
+// "found" and its candidate set is computed live from current stock — a
+// stored pick goes stale the moment a bottle runs out. ~110-145 output
+// tokens, ~3-4s, cached per (ingredient, candidate set).
+async function analyzeBottleChoice(ingredientName, candidates) {
+  const type = candidates[0]?.generic_type || 'the same type'
+  const two = candidates.length === 2
+  const prompt = `A recipe calls for ${ingredientName}. The user doesn't have that bottle, but owns these bottles of the same type (${type}):
+${candidates.map(c => `- ${c.spirit}${c.notes ? ` — user's note: ${c.notes}` : ''}`).join('\n')}
+
+Which owned bottle comes closest to ${ingredientName}'s own character — the one to reach for in its place? Judge on what the bottles taste like, not on how famous they are. Bottles share a type because they fill the same role, not because they taste alike, and some of these would make a noticeably different drink.
+
+Return ONLY JSON, no markdown fences:
+{"pick": "exact name from the list", "why": "one line, max 18 words: the specific trait it shares with ${ingredientName}", "alternatives": [{"name": "exact name from the list", "difference": "max 14 words: how the drink would differ with it"}]}
+${two ? '"alternatives" is the other bottle, compared against the pick.' : '"alternatives": the one or two next-closest bottles only — never more than two. Leave the rest out.'}
+Name only bottles from the list. Voice: terse, direct — a bartender telling you which bottle to reach for, not a tasting note. If you don't know a bottle's character well, say something general and true about it rather than something specific you're unsure of.`
+  const data = await callClaude({ model: MODEL, max_tokens: 300, messages: [{ role: 'user', content: prompt }] })
+  const byName = new Map(candidates.map(c => [normalizeForMatch(c.spirit), c.spirit]))
+  const pick = byName.get(normalizeForMatch(data?.pick))
+  if (!pick || !data?.why) throw new Error('bottle choice named a bottle outside the list')
+  const alternatives = (Array.isArray(data.alternatives) ? data.alternatives : [])
+    .map(a => ({ name: byName.get(normalizeForMatch(a?.name)), difference: a?.difference || null }))
+    .filter(a => a.name && a.name !== pick)
+    .slice(0, 2)
+  return { pick, why: data.why, alternatives }
+}
+
 // Session 27: Help Me Decide. Reasons about all ten templates for this seed
 // in ONE call, so "see all templates" can expand instantly with reasoning
 // already in hand — no second call, no bare pills. Modeled on
@@ -3010,7 +3111,27 @@ Exactly ten entries, every id listed above exactly once, ranked best fit first.`
   return entries
 }
 
-async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, tastingContext) {
+// Session 29, Change 4: Something Off? / Adjust assumed every message was
+// a change request, so "what's the best amaro substitute from the list?"
+// came back as a re-emitted recipe under "✓ ADJUSTED" with nothing
+// adjusted. The model sorts the message first; a question gets a small
+// answer object instead of the whole recipe again (cheaper, and nothing
+// for the caller to mistake for a revision). Only the Results screen's
+// Something Off? passes this — the Explorations tweak sheet already has
+// its own conversation path for questions (converseTweakStep).
+const FEEDBACK_QUESTION_RULE = `First decide what that message is. If it only ASKS something — which bottle to use, why an ingredient is there, what something tastes like, whether a swap would work — and doesn't ask you to change the recipe, change nothing: answer it in 1-3 terse, direct sentences, and return ONLY {"answer": "..."} as JSON, with no recipe fields at all. Name only bottles that appear in the bar inventory when recommending one. If it asks for a change (scale, swap, rebalance, add or remove something, fix an error), it's an adjustment.`
+function isFeedbackAnswer(revised) {
+  return typeof revised?.answer === 'string' && revised.answer.trim() !== '' && !Array.isArray(revised?.recipe)
+}
+// Belt and braces for the adjustment path: a "revision" whose build is
+// identical to the one on screen didn't adjust anything, whatever the
+// model chose to call it.
+function sameRecipe(a, b) {
+  const build = r => JSON.stringify({ name: r?.recipe_name ?? null, recipe: (r?.recipe || []).map(x => [x.ingredient, x.amount]), instructions: r?.instructions ?? null, glass: r?.glass_type ?? null, owned: (r?.ingredients || []).map(x => [x.ingredient, x.status, x.substitute ?? null]) })
+  return build(a) === build(b)
+}
+
+async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, tastingContext, { allowAnswer = false } = {}) {
   // Session 16, Change 3: only relevant when this suggestion is itself a
   // documented drink — a riff/original adjustment doesn't need this, since
   // adjusting an invented drink doesn't misrepresent anything. Conditional
@@ -3034,7 +3155,7 @@ async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, ta
 Current suggestion:
 ${JSON.stringify(stripInternalFields(suggestion), null, 2)}
 
-The user's feedback: "${feedbackText}"${tastingContext ? `\n\n${tastingContext}` : ''}${demotionNamingNote}
+The user's feedback: "${feedbackText}"${tastingContext ? `\n\n${tastingContext}` : ''}${demotionNamingNote}${allowAnswer ? `\n\n${FEEDBACK_QUESTION_RULE} Otherwise, adjust as below.` : ''}
 
 BAR INVENTORY:
 ${inventoryText}
@@ -3571,6 +3692,115 @@ function AttributionDrawer({ recipe, onSave, onClose, saving, error }) {
   )
 }
 
+// ─── Covered-by note ──────────────────────────────────────────────────────────
+
+// Session 29, Change 1: one shared cache for analyzeBottleChoice, keyed by
+// the ingredient plus the exact candidate set — the same CioCiaro on two
+// cards, or a reopened card, costs nothing, and a bottle running out or
+// arriving changes the set and so the key. Persisted (localStorage, capped)
+// so a reload doesn't re-ask; in-flight requests are shared, not repeated.
+const BOTTLE_CHOICE_STORE_KEY = 'bc_bottle_choice_v1'
+const BOTTLE_CHOICE_STORE_MAX = 200
+const bottleChoiceEntries = new Map()
+let bottleChoiceStored = null
+function readBottleChoiceStore() {
+  if (bottleChoiceStored) return bottleChoiceStored
+  try { bottleChoiceStored = JSON.parse(localStorage.getItem(BOTTLE_CHOICE_STORE_KEY)) || {} } catch { bottleChoiceStored = {} }
+  return bottleChoiceStored
+}
+function writeBottleChoiceStore(key, value) {
+  const store = readBottleChoiceStore()
+  delete store[key]
+  store[key] = value
+  const keys = Object.keys(store)
+  for (const k of keys.slice(0, Math.max(0, keys.length - BOTTLE_CHOICE_STORE_MAX))) delete store[k]
+  try { localStorage.setItem(BOTTLE_CHOICE_STORE_KEY, JSON.stringify(store)) } catch { /* storage full or blocked: memory cache still works */ }
+}
+function bottleChoiceKey(ingredientName, candidates) {
+  return `${normalizeForMatch(ingredientName)}|${candidates.map(c => normalizeForMatch(c.spirit)).sort().join('|')}`
+}
+function loadBottleChoice(key, ingredientName, candidates) {
+  let entry = bottleChoiceEntries.get(key)
+  if (!entry) {
+    const stored = readBottleChoiceStore()[key]
+    entry = stored ? { status: 'ready', value: stored, listeners: new Set() } : { status: 'idle', value: null, listeners: new Set() }
+    bottleChoiceEntries.set(key, entry)
+  }
+  if (entry.status === 'idle') {
+    entry.status = 'loading'
+    analyzeBottleChoice(ingredientName, candidates)
+      .then(value => { entry.status = 'ready'; entry.value = value; writeBottleChoiceStore(key, value) })
+      .catch(err => { console.warn('[bottle choice] failed:', err?.message); entry.status = 'error' })
+      .finally(() => entry.listeners.forEach(l => l()))
+  }
+  return entry
+}
+function useBottleChoice(ingredientName, candidates) {
+  const key = candidates && candidates.length >= 2 ? bottleChoiceKey(ingredientName, candidates) : null
+  const argsRef = useRef({ ingredientName, candidates })
+  argsRef.current = { ingredientName, candidates }
+  const [, rerender] = useState(0)
+  useEffect(() => {
+    if (!key) return
+    const entry = loadBottleChoice(key, argsRef.current.ingredientName, argsRef.current.candidates)
+    const listener = () => rerender(n => n + 1)
+    entry.listeners.add(listener)
+    return () => entry.listeners.delete(listener)
+  }, [key])
+  if (!key) return null
+  const entry = bottleChoiceEntries.get(key)
+  return {
+    status: entry?.status === 'idle' || !entry ? 'loading' : entry.status,
+    value: entry?.value || null,
+    retry: () => {
+      if (entry?.status !== 'error') return
+      entry.status = 'idle'
+      loadBottleChoice(key, argsRef.current.ingredientName, argsRef.current.candidates)
+      rerender(n => n + 1)
+    },
+  }
+}
+
+// Replaces S28's every-bottle list. One candidate: name it, nothing to
+// choose. Two or more: the closest bottle with a one-line why, then the
+// other one compared (exactly two) or the next one or two (more) — never
+// the full list. Locations stay on every bottle named: that's the part that
+// gets you to it.
+function CoveredByNote({ ingredient, candidates, style }) {
+  const choice = useBottleChoice(ingredient, candidates)
+  const byName = new Map(candidates.map(c => [c.spirit, c]))
+  const named = name => <span style={{ color: C.green }}>{bottleWithLocation(byName.get(name))}</span>
+  if (candidates.length === 1) {
+    return <div style={style}>✓ Covered by {named(candidates[0].spirit)} — same type, not this exact bottle</div>
+  }
+  const typeLabel = candidates[0]?.generic_type ? `${candidates[0].generic_type} bottles` : 'bottles of the same type'
+  if (!choice || choice.status === 'loading') {
+    return <div style={style}>✓ Covered — {candidates.length} {typeLabel} on hand, not this exact one · <span style={{ color: C.textFaint }}>picking the closest…</span></div>
+  }
+  if (choice.status === 'error') {
+    return (
+      <div style={style}>
+        ✓ Covered — {candidates.length} {typeLabel} on hand, not this exact one. Couldn't pick the closest.{' '}
+        <button onClick={choice.retry} style={{ background: 'none', border: 'none', color: C.gold, fontSize: 'inherit', cursor: 'pointer', padding: 0, textDecoration: 'underline' }}>Retry</button>
+      </div>
+    )
+  }
+  const { pick, why, alternatives } = choice.value
+  return (
+    <div style={style}>
+      <div>✓ Reach for {named(pick)} — {why}</div>
+      {alternatives.length > 0 && (
+        <div style={{ color: C.textFaint, marginTop: 2 }}>
+          {candidates.length === 2 ? 'Or ' : 'Also close: '}
+          {alternatives.map((a, i) => (
+            <span key={a.name}>{i > 0 && ' · '}{named(a.name)}{a.difference ? ` — ${a.difference}` : ''}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Ingredient Card ──────────────────────────────────────────────────────────
 
 function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer, inventory, inventoryTags }) {
@@ -3612,9 +3842,11 @@ function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer, invento
               location, which was written for the named bottle and would send
               you to the wrong spot. S22's substitute gate below is unchanged:
               that's a stored judgment about an ownership gap; this is a live
-              fact about which owned bottle covers it. */}
+              fact about which owned bottle covers it. Session 29, Change 1:
+              with several candidates this recommends one (CoveredByNote)
+              rather than listing them all. */}
           {foundVia ? (
-            <div style={{ fontSize: 13, color: C.textMuted, marginTop: 3 }}>✓ Covered by <span style={{ color: C.green }}>{foundViaText(foundVia)}</span> — same type, not this exact bottle</div>
+            <CoveredByNote ingredient={item.ingredient} candidates={foundVia} style={{ fontSize: 13, color: C.textMuted, marginTop: 3 }} />
           ) : item.location && (
             <div style={{ fontSize: 13, color: C.textMuted, marginTop: 3 }}>📍 {item.location}</div>
           )}
@@ -3655,13 +3887,24 @@ function IngredientCard({ item, shoppingList, onAddToList, onOpenDrawer, invento
               Rendered right under the ingredient it explains, where the
               decision actually gets acted on, distinct from the substitute/
               flavor_impact block above (that's about an ownership gap; this
-              is about a choice already made among bottles the user owns). */}
-          {item.bottle_note && (
+              is about a choice already made among bottles the user owns).
+              Session 29: hidden when the named bottle isn't on hand — a note
+              on why THIS bottle earns the spot is moot then, and the covered-
+              by recommendation above is the live answer to the same
+              question — and when it isn't found at all (a stored note
+              outliving the bottle, or the model writing one anyway). */}
+          {item.bottle_note && liveStatus === 'found' && !foundVia && (
             <div style={{ fontSize: 13, color: C.textMuted, marginTop: 8, fontStyle: 'italic' }}>
               🥃 {item.bottle_note}
             </div>
           )}
-          {item.notes && <div style={{ fontSize: 13, color: C.textFaint, marginTop: 6 }}>{item.notes}</div>}
+          {/* Session 29: the model's free-text note on a bottle that isn't on
+              hand is almost always its own substitution pick ("Amer Picon
+              would also work" on a CioCiaro, Green Chartreuse on a Yellow) —
+              a second, conflicting recommendation under the one
+              CoveredByNote makes from what's actually in stock. Hidden only
+              when that recommendation is showing (2+ candidates). */}
+          {item.notes && !(foundVia?.length > 1) && <div style={{ fontSize: 13, color: C.textFaint, marginTop: 6 }}>{item.notes}</div>}
         </div>
       </div>
     </div>
@@ -3863,20 +4106,20 @@ function DifficultyBadge({ difficulty }) {
 // ─── Results ──────────────────────────────────────────────────────────────────
 
 // TODO: unify with shared RecipeCard once the Analyze/Name/Menu flow is in scope (Session 1.5)
-function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites, onSaveFavorite, onRemoveFromFavorites, toMake, onSaveToMake, onRemoveFromToMake, onFeedback, feedbackLoading, inventory, inventoryTags, feedbackError, onOpenAttributionEdit, onRename, pendingReplace, onReplaceDecision }) {
+function Results({ result, feedbackNote, shoppingList, onAddToList, favorites, onSaveFavorite, onRemoveFromFavorites, toMake, onSaveToMake, onRemoveFromToMake, onFeedback, feedbackLoading, inventory, inventoryTags, feedbackError, onOpenAttributionEdit, onRename, pendingReplace, onReplaceDecision }) {
   const [tab, setTab] = useState('ingredients')
   const [feedbackText, setFeedbackText] = useState('')
-  const adjustmentNoteRef = useRef(null)
+  const feedbackNoteRef = useRef(null)
   const [drawerItem, setDrawerItem] = useState(null)
   const [flavorCache, setFlavorCache] = useState({})
   const [drawerLoading, setDrawerLoading] = useState(false)
   const [saveError, setSaveError] = useState(null)
 
   useEffect(() => {
-    if (adjustmentNote) {
-      adjustmentNoteRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    if (feedbackNote) {
+      feedbackNoteRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
     }
-  }, [adjustmentNote])
+  }, [feedbackNote])
 
   const openDrawer = async (item) => {
     setDrawerItem(item)
@@ -4032,14 +4275,26 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
         <p style={{ fontSize: 12, color: C.textFaint, marginBottom: 20 }}>Recipe sourced from training data — web search unavailable.</p>
       )}
 
-      {/* Adjustment note */}
-      {adjustmentNote && (
-        <div ref={adjustmentNoteRef} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, background: C.gold + '18', border: `1px solid ${C.gold}44`, borderRadius: 10, padding: '12px 16px', marginBottom: 20 }}>
+      {/* Session 29, Change 4: what came back from Something Off? is either
+          an adjustment (the recipe below changed — "✓ Adjusted") or an
+          answer to a question (nothing changed — labelled as an answer, with
+          the question it answers, and no checkmark claiming a change). */}
+      {feedbackNote?.kind === 'adjusted' && (
+        <div ref={feedbackNoteRef} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, background: C.gold + '18', border: `1px solid ${C.gold}44`, borderRadius: 10, padding: '12px 16px', marginBottom: 20 }}>
           <span style={{ fontSize: 16, flexShrink: 0, marginTop: 1 }}>✓</span>
           <div>
             <span style={{ fontSize: 12, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: C.gold }}>Adjusted </span>
-            <span style={{ fontSize: 14, color: C.text }}>{adjustmentNote}</span>
+            <span style={{ fontSize: 14, color: C.text }}>{feedbackNote.text}</span>
           </div>
+        </div>
+      )}
+      {feedbackNote?.kind === 'answer' && (
+        <div ref={feedbackNoteRef} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 16px', marginBottom: 20 }}>
+          <div style={{ fontSize: 12, color: C.textFaint, marginBottom: 4 }}>
+            <span style={{ fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Answer</span>
+            {feedbackNote.question && <span> · “{feedbackNote.question}” — recipe unchanged</span>}
+          </div>
+          <div style={{ fontSize: 14, color: C.text, lineHeight: 1.55 }}>{feedbackNote.text}</div>
         </div>
       )}
 
@@ -4102,7 +4357,7 @@ function Results({ result, adjustmentNote, shoppingList, onAddToList, favorites,
       {/* Feedback */}
       <div style={{ marginTop: 32, paddingTop: 24, borderTop: `1px solid ${C.border}` }}>
         <div style={{ fontSize: 13, color: C.textFaint, marginBottom: 10 }}>
-          {feedbackLoading ? 'Revising based on your feedback…' : 'Something off? Describe what to adjust:'}
+          {feedbackLoading ? 'Working on it…' : 'Something off? Describe what to adjust, or ask a question:'}
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <input
@@ -5612,7 +5867,7 @@ function RecipeCard({
                       <span style={{ color: C.text }}>{ing.ingredient}</span>
                       {/* Session 28, Change 3 — see IngredientCard. */}
                       {foundVia
-                        ? <div style={{ color: C.textMuted, marginTop: 2 }}>✓ Covered by <span style={{ color: C.green }}>{foundViaText(foundVia)}</span> — same type, not this exact bottle</div>
+                        ? <CoveredByNote ingredient={ing.ingredient} candidates={foundVia} style={{ color: C.textMuted, marginTop: 2 }} />
                         : ing.location && <span style={{ color: C.textMuted }}> · 📍 {ing.location}</span>}
                       {/* Gated on liveStatus, not the stored status — a live match
                           upgrades this ingredient to "found," at which point a
@@ -5622,7 +5877,7 @@ function RecipeCard({
                           (the Analyze/On Deck/Favorites detail view) — this is the
                           Explorations path's own separate ingredient list, see the
                           "unify with shared RecipeCard" TODO on Results. */}
-                      {ing.bottle_note && <div style={{ color: C.textFaint, fontStyle: 'italic', marginTop: 2 }}>🥃 {ing.bottle_note}</div>}
+                      {ing.bottle_note && liveStatus === 'found' && !foundVia && <div style={{ color: C.textFaint, fontStyle: 'italic', marginTop: 2 }}>🥃 {ing.bottle_note}</div>}
                     </div>
                   </div>
                 )
@@ -8819,7 +9074,7 @@ export default function App() {
   const [error, setError] = useState(null)
   const [lastRequestBody, setLastRequestBody] = useState(null)
   const [feedbackLoading, setFeedbackLoading] = useState(false)
-  const [adjustmentNote, setAdjustmentNote] = useState(null)
+  const [feedbackNote, setFeedbackNote] = useState(null)
   const [resultSource, setResultSource] = useState(null) // 'ondeck' | 'favorites' | null
   // Session 16, Change 3: set once a modification to a SAVED recipe completes,
   // holding what handleReplaceDecision needs to either update the original
@@ -9339,7 +9594,7 @@ export default function App() {
   // separately-made save under the same name.
   const viewToMake = (item) => {
     sourceScrollRef.current = window.scrollY
-    setError(null); setAdjustmentNote(null)
+    setError(null); setFeedbackNote(null)
     setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType, origin: item.origin, origin_flag: item.originFlag, difficulty: item.difficulty, source: item.source, creator: item.creator, bar: item.bar, year: item.year, attributionSource: item.attributionSource, attributionUserSupplied: item.attributionUserSupplied, parentRecipe: item.parentRecipe, replacements: item.replacements, nameUserSupplied: item.nameUserSupplied, toMakeId: item.id, favoriteId: null })
     setResultSource('ondeck')
     setScreen('detail')
@@ -9347,7 +9602,7 @@ export default function App() {
 
   const viewFavorite = (fav) => {
     sourceScrollRef.current = window.scrollY
-    setError(null); setAdjustmentNote(null)
+    setError(null); setFeedbackNote(null)
     setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType, origin: fav.origin, origin_flag: fav.originFlag, difficulty: fav.difficulty, source: fav.source, creator: fav.creator, bar: fav.bar, year: fav.year, attributionSource: fav.attributionSource, attributionUserSupplied: fav.attributionUserSupplied, parentRecipe: fav.parentRecipe, replacements: fav.replacements, nameUserSupplied: fav.nameUserSupplied, favoriteId: fav.id, toMakeId: null })
     setResultSource('favorites')
     setScreen('detail')
@@ -9409,7 +9664,7 @@ export default function App() {
 
   const handleAnalyze = async () => {
     if (!canAnalyze()) return
-    setLoading(true); setError(null); setResult(null); setAdjustmentNote(null); setResultSource(null)
+    setLoading(true); setError(null); setResult(null); setFeedbackNote(null); setResultSource(null)
     const menuParseStep = mode === 'menu' && menuStep === 'upload'
     setLoadingMsg(menuParseStep ? 'Reading menu…' : mode === 'photo' ? 'Analyzing screenshot…' : mode === 'name' ? 'Looking up cocktail…' : 'Analyzing cocktail…')
 
@@ -9499,12 +9754,23 @@ export default function App() {
           messages: [
             ...stripInventoryFromMessages(lastRequestBody.messages),
             { role: 'assistant', content: JSON.stringify(result) },
-            { role: 'user', content: `The user reviewed this analysis and provided this feedback: ${feedbackText}. Please revise your response accordingly and return the same JSON structure, with one additional field at the top level: "adjustment_note" — a 1-2 sentence plain English explanation of what specifically changed and why (e.g. "Scaled all amounts to a 4 oz total while maintaining the 1:1:1 Negroni ratio."). Do not include adjustment_note if nothing meaningful changed.` },
+            { role: 'user', content: `The user reviewed this analysis and wrote: ${feedbackText}
+
+${FEEDBACK_QUESTION_RULE}
+
+Otherwise, revise your response accordingly and return the same JSON structure, with one additional field at the top level: "adjustment_note" — a 1-2 sentence plain English explanation of what specifically changed and why (e.g. "Scaled all amounts to a 4 oz total while maintaining the 1:1:1 Negroni ratio."). Do not include adjustment_note if nothing meaningful changed.` },
           ],
         }
         revised = await callClaude(feedbackBody)
+        // A question leaves the conversation where it was: the answer isn't
+        // a new version of the recipe for the next adjustment to build on.
+        if (isFeedbackAnswer(revised)) {
+          setFeedbackNote({ kind: 'answer', text: revised.answer, question: feedbackText })
+          return true
+        }
         setLastRequestBody(feedbackBody)
-        setAdjustmentNote(revised.adjustment_note || null)
+        setFeedbackNote(revised.adjustment_note && !sameRecipe(result, revised) ? { kind: 'adjusted', text: revised.adjustment_note }
+          : revised.adjustment_note ? { kind: 'answer', text: revised.adjustment_note, question: feedbackText } : null)
       } else {
         // Session 16: now passes inventoryText/tastingContext, which this
         // call site never did — BAR INVENTORY was rendering as "undefined"
@@ -9512,8 +9778,12 @@ export default function App() {
         // On Deck/Favorites adjustment before this. Noticed while touching
         // this exact call for Change 3; fixed in passing, not a behavior
         // change to the ownership rules themselves, just the data reaching them.
-        revised = await tweakSingleSuggestion(result, feedbackText, inventoryText, null)
-        setAdjustmentNote(null)
+        revised = await tweakSingleSuggestion(result, feedbackText, inventoryText, null, { allowAnswer: true })
+        if (isFeedbackAnswer(revised)) {
+          setFeedbackNote({ kind: 'answer', text: revised.answer, question: feedbackText })
+          return true
+        }
+        setFeedbackNote(null)
       }
       setError(null)
       // A user-supplied attribution must survive a feedback revision — the
@@ -9716,7 +9986,7 @@ export default function App() {
   // itself carries no mode-specific context, so cleanup lives here instead.
   const handleBackFromDetail = () => {
     if (resultSource) { handleBackToSource(); return }
-    setResult(null); setError(null); setAdjustmentNote(null); setLastRequestBody(null)
+    setResult(null); setError(null); setFeedbackNote(null); setLastRequestBody(null)
     setRecipePhotos([])
     setCocktailName('')
     setMenuPhoto(null); setMenuStep('upload'); setMenuCocktails([]); setMenuSelectedCocktail(''); setMenuCocktailPhoto(null)
@@ -9964,7 +10234,7 @@ export default function App() {
           </button>
           <Results
             result={result}
-            adjustmentNote={adjustmentNote}
+            feedbackNote={feedbackNote}
             shoppingList={shoppingList}
             onAddToList={addToShopping}
             favorites={favorites}
@@ -10007,7 +10277,7 @@ export default function App() {
             // that's no longer saved anywhere.
             onRemoveFromFavorites={id => {
               removeFavoriteWithUndo(id)
-              setResultSource(null); setResult(null); setAdjustmentNote(null); setError(null)
+              setResultSource(null); setResult(null); setFeedbackNote(null); setError(null)
               setSavedSubTab('favorites'); setScreen('saved')
             }}
             toMake={toMake}
@@ -10019,7 +10289,7 @@ export default function App() {
             // remove-and-return above, via removeToMakeWithUndo.
             onRemoveFromToMake={id => {
               removeToMakeWithUndo(id)
-              setResultSource(null); setResult(null); setAdjustmentNote(null); setError(null)
+              setResultSource(null); setResult(null); setFeedbackNote(null); setError(null)
               setSavedSubTab('ondeck'); setScreen('saved')
             }}
             onFeedback={handleFeedback}
