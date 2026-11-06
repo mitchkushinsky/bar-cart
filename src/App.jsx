@@ -266,17 +266,21 @@ const ROLE_LABELS = {
 // to retune after seeing real generation output, especially Sour vs. Daisy and Spritz.
 // Only tier-2 (riff) and tier-3 (original) suggestions are validated against this;
 // tier-1 (published) is exempt — see analyzeExplorationsRecipes.
+// Session 30: optionalRoles are the roles a template commonly takes but
+// doesn't need (a Daisy's syrup on top of its liqueur, a Sour's egg white).
+// Only the creation walk reads them, as its last steps — validation above
+// and below still checks required/forbidden only.
 const TEMPLATE_SIGNATURES = {
-  old_fashioned: { requiredRoles: ['base', 'sweetener', 'bitters'], forbiddenRoles: ['citrus'] },
-  manhattan_martini: { requiredRoles: ['base', 'modifier'], forbiddenRoles: ['citrus'] },
-  sour: { requiredRoles: ['base', 'citrus', 'sweetener'], forbiddenRoles: [] },
-  daisy: { requiredRoles: ['base', 'citrus', 'modifier'], forbiddenRoles: [] },
-  highball: { requiredRoles: ['base', 'lengthener'], forbiddenRoles: [] },
-  tiki: { requiredRoles: ['base', 'citrus', 'sweetener', 'modifier'], forbiddenRoles: [] },
-  bittersweet: { requiredRoles: ['base', 'modifier'], forbiddenRoles: ['citrus'] },
-  spritz: { requiredRoles: ['modifier', 'lengthener'], forbiddenRoles: ['citrus'] },
-  hot_drinks: { requiredRoles: ['base', 'sweetener', 'lengthener'], forbiddenRoles: [] },
-  flip: { requiredRoles: ['base', 'egg', 'sweetener'], forbiddenRoles: ['citrus'] },
+  old_fashioned: { requiredRoles: ['base', 'sweetener', 'bitters'], forbiddenRoles: ['citrus'], optionalRoles: ['modifier'] },
+  manhattan_martini: { requiredRoles: ['base', 'modifier'], forbiddenRoles: ['citrus'], optionalRoles: ['bitters'] },
+  sour: { requiredRoles: ['base', 'citrus', 'sweetener'], forbiddenRoles: [], optionalRoles: ['egg'] },
+  daisy: { requiredRoles: ['base', 'citrus', 'modifier'], forbiddenRoles: [], optionalRoles: ['sweetener'] },
+  highball: { requiredRoles: ['base', 'lengthener'], forbiddenRoles: [], optionalRoles: ['citrus'] },
+  tiki: { requiredRoles: ['base', 'citrus', 'sweetener', 'modifier'], forbiddenRoles: [], optionalRoles: ['bitters'] },
+  bittersweet: { requiredRoles: ['base', 'modifier'], forbiddenRoles: ['citrus'], optionalRoles: ['bitters'] },
+  spritz: { requiredRoles: ['modifier', 'lengthener'], forbiddenRoles: ['citrus'], optionalRoles: ['base'] },
+  hot_drinks: { requiredRoles: ['base', 'sweetener', 'lengthener'], forbiddenRoles: [], optionalRoles: ['citrus'] },
+  flip: { requiredRoles: ['base', 'egg', 'sweetener'], forbiddenRoles: ['citrus'], optionalRoles: ['bitters'] },
 }
 
 // Imperative structural constraint block for tier-2/3 generation (and its regeneration
@@ -757,6 +761,30 @@ function liveFoundVia(ingredientName, inventory, inventoryTags) {
 }
 function bottleWithLocation(candidate) {
   return `${candidate.spirit}${candidate.locations.length ? ` (${candidate.locations.join(', ')})` : ''}`
+}
+
+// Session 30: lifted out of ExplorationsScreen's affinities step unchanged,
+// so the creation walk can list a category's bottles through the same join
+// rather than reading inventory itself. The affinities step still calls it
+// through a one-line wrapper; see the comment block there for its history.
+function getOwnedBottlesForCategory(category, inventory, inventoryTags) {
+  const normCat = normalizeForMatch(category)
+  if (!inventory || !inventoryTags) return []
+  const inStock = inventory.filter(item => item.stockState !== 'oos')
+  const liveTags = ownedInventoryTags(inStock, inventoryTags)
+  const owned = inStock
+    .map(item => ({ item, tag: liveTags[item.spirit.trim().toLowerCase()] }))
+    .filter(({ tag }) => tag)
+  const resolvedType = owned.find(({ tag }) =>
+    normalizeForMatch(tag.generic_type) === normCat || (tag.aliases || []).some(a => normalizeForMatch(a) === normCat)
+  )?.tag.generic_type
+  if (!resolvedType) return []
+  const normType = normalizeForMatch(resolvedType)
+  const matches = owned.filter(({ tag }) => normalizeForMatch(tag.generic_type) === normType).map(({ item }) => item)
+  // Session 14, Change 4: a backup bottle (same product, second location)
+  // is correct at the tagging layer but noise in this pick-one list —
+  // collapse it to one row before the drawer ever sees it.
+  return dedupeBottlesByName(matches)
 }
 
 // Session 29, Change 3: the one downgrade. A stored "found" whose
@@ -1326,6 +1354,7 @@ async function callClaudeStream(body, { onText, signal } = {}) {
   let stopReason = null
   let sawMessageStop = false
   let inputTokens = null
+  let cacheReadTokens = null
   let outputTokens = null
   let firstTextMs = null
   const fail = (code, message) => {
@@ -1349,7 +1378,7 @@ async function callClaudeStream(body, { onText, signal } = {}) {
         let evt
         try { evt = JSON.parse(dataLine.slice(6)) } catch { continue }
         if (evt.type === 'error') fail('stream_error', `The response failed partway through (${evt.error?.type || 'error'}). Please try again.`)
-        else if (evt.type === 'message_start') inputTokens = evt.message?.usage?.input_tokens ?? null
+        else if (evt.type === 'message_start') { inputTokens = evt.message?.usage?.input_tokens ?? null; cacheReadTokens = evt.message?.usage?.cache_read_input_tokens ?? null }
         else if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
           text += evt.delta.text
           if (firstTextMs == null) firstTextMs = Math.round(performance.now() - t0)
@@ -1367,7 +1396,7 @@ async function callClaudeStream(body, { onText, signal } = {}) {
   }
   if (!sawMessageStop) fail('incomplete', 'The response stopped before it finished. Please try again.')
   if (stopReason === 'max_tokens') fail('truncated', 'That response was too long and got cut off before it finished.')
-  return { text, stopReason, inputTokens, outputTokens, firstTextMs, totalMs: Math.round(performance.now() - t0) }
+  return { text, stopReason, inputTokens, cacheReadTokens, outputTokens, firstTextMs, totalMs: Math.round(performance.now() - t0) }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -3186,6 +3215,12 @@ Return a revised version of just this one suggestion in the same JSON structure 
   }
 }
 
+// Session 30: the Refine voice, shared with the creation walk's proposal
+// check (evaluateWalkProposal) so the two can't drift. Same text
+// converseTweakStep always sent.
+const REFINE_VOICE = `Terse, direct, expert — no affirmations, no filler, no hedging.`
+const REFINE_PUSHBACK = `Never agree with a suggestion just because it was asked — evaluate it on its merits and push back plainly if it won't work.`
+
 async function converseTweakStep({ suggestion, affinityContext, tweakHistory, messages, isFinal, inventoryText, tastingContext }) {
   const recipeSummary = [
     `Recipe: ${suggestion.recipe_name}`,
@@ -3194,9 +3229,9 @@ async function converseTweakStep({ suggestion, affinityContext, tweakHistory, me
     suggestion.summary ? `Summary: ${suggestion.summary}` : null,
   ].filter(Boolean).join('\n')
 
-  const system = `You are an expert craft bartender diagnosing a cocktail. Terse, direct, expert — no affirmations, no filler, no hedging. Max 2 sentences per response unless writing a final synthesis.
+  const system = `You are an expert craft bartender diagnosing a cocktail. ${REFINE_VOICE} Max 2 sentences per response unless writing a final synthesis.
 
-Maintain your diagnostic position across exchanges. If you identify a problem in exchange 1, don't abandon it just because the user asks something new in exchange 2 — connect their question back to your diagnosis or explain why it's a separate issue. Only change your position if the user gives a compelling reason, not just because they asked something different. If the user's second question is unrelated to what you flagged, say so briefly and address both. Never agree with a suggestion just because it was asked — evaluate it on its merits and push back plainly if it won't work.
+Maintain your diagnostic position across exchanges. If you identify a problem in exchange 1, don't abandon it just because the user asks something new in exchange 2 — connect their question back to your diagnosis or explain why it's a separate issue. Only change your position if the user gives a compelling reason, not just because they asked something different. If the user's second question is unrelated to what you flagged, say so briefly and address both. ${REFINE_PUSHBACK}
 
 ${recipeSummary}${tastingContext ? `\n\n${tastingContext}` : ''}${tweakHistory.length > 0 ? `\n\nPrior tweaks on this recipe's lineage:\n${tweakHistory.map(p => `- "${p}"`).join('\n')}` : ''}${affinityContext ? `\n\nAffinity reference:\n${affinityContext}` : ''}`
 
@@ -3231,6 +3266,312 @@ ${recipeSummary}${tastingContext ? `\n\n${tastingContext}` : ''}${tweakHistory.l
     const text = await callClaudeText({ model: MODEL, max_tokens: 300, system, messages })
     return { text }
   }
+}
+
+// ─── Session 30: the creation walk ───────────────────────────────────────────
+//
+// Phase 2 of collaborative creation (S27's Help Me Decide is phase 1): build a
+// drink one ROLE at a time, with TEMPLATE_SIGNATURES as the spine. Each step
+// is analyzeFlavorForms's shape — enumerate options for one decision, argue
+// for each — plus the running build, which is load-bearing: a step that
+// doesn't know the triple sec is already there can't say the syrup is
+// unnecessary.
+//
+// Inventory reaches this flow ONLY through the shared helpers: the model sees
+// inventoryText (inventoryToText), and the app decides ownership with
+// isLiveFound / liveFoundVia, a bottle's type with ownedInventoryTags, and its
+// shelf with getOwnedBottlesForCategory. Nothing here reads the inventory
+// array itself — retiring the Google Sheet for a table means re-pointing those
+// helpers, and this flow shouldn't need opening a second time.
+
+// Walk order. The brief's spine is spirit → modifier → sweetener → bitters;
+// citrus sits before sweetener because how much sugar a drink needs depends
+// on its acid, and the lengtheners/egg/dairy come after the core is set.
+const WALK_ROLE_ORDER = ['base', 'modifier', 'citrus', 'sweetener', 'bitters', 'lengthener', 'egg', 'dairy']
+const WALK_ROLE_TITLES = { base: 'Base spirit', modifier: 'Modifier', citrus: 'Citrus', sweetener: 'Sweetener', bitters: 'Bitters', lengthener: 'Lengthener', egg: 'Egg', dairy: 'Dairy', garnish: 'Garnish' }
+
+// The step list: every seed's role first, in seed order (already decided —
+// the step only asks whether anything should share it), then the template's
+// remaining required roles in WALK_ROLE_ORDER, then its optional roles.
+// A seed whose role the template doesn't list (bitters seeding a Daisy)
+// still gets its step first; it's what the user started from.
+function planWalkRoles(templateId, seedRoles) {
+  const sig = TEMPLATE_SIGNATURES[templateId] || { requiredRoles: [], optionalRoles: [] }
+  const byOrder = (a, b) => WALK_ROLE_ORDER.indexOf(a) - WALK_ROLE_ORDER.indexOf(b)
+  const steps = []
+  const taken = new Set()
+  for (const { seed, role } of seedRoles) {
+    const existing = steps.find(s => s.role === role)
+    if (existing) { existing.preset.push(seed); continue }
+    steps.push({ role, optional: false, preset: [seed] })
+    taken.add(role)
+  }
+  for (const role of [...sig.requiredRoles].sort(byOrder)) if (!taken.has(role)) { steps.push({ role, optional: false, preset: [] }); taken.add(role) }
+  for (const role of [...(sig.optionalRoles || [])].sort(byOrder)) if (!taken.has(role)) { steps.push({ role, optional: true, preset: [] }); taken.add(role) }
+  return steps
+}
+
+function walkModifierList(modifiers) {
+  return [modifiers?.lowABV && 'Low-ABV', modifiers?.na && 'NA', modifiers?.frozen && 'Frozen'].filter(Boolean)
+}
+
+// The running build as the model reads it: every decided step with the
+// reason it was chosen, what's still to come, and the resemblances noticed
+// so far — framed as notes to re-judge, never as conclusions to defend.
+function describeWalkBuild(walk, uptoIndex) {
+  const done = walk.steps.slice(0, uptoIndex).filter(s => s.choice)
+  const lines = done.map((s, i) => {
+    const c = s.choice
+    if (c.via === 'skip') return `${i + 1}. ${WALK_ROLE_TITLES[s.role]} (optional): skipped — ${c.reason || 'not needed'}`
+    const names = c.ingredients.map(x => x.name).join(' + ')
+    const how = c.via === 'proposal' ? `the user's own proposal${c.verdict === 'clashes' ? ', kept over your objection' : ''}` : 'chosen from your options'
+    return `${i + 1}. ${WALK_ROLE_TITLES[s.role]}: ${names} (${how})${c.reason ? ` — ${c.reason}` : ''}`
+  })
+  const upcoming = walk.steps.slice(uptoIndex + 1).map(s => `${WALK_ROLE_TITLES[s.role].toLowerCase()}${s.optional ? ' (optional)' : ''}`)
+  const notes = walk.steps.slice(0, uptoIndex).map(s => s.choice?.reference).filter(Boolean)
+  return [
+    `BUILD SO FAR:\n${lines.length ? lines.join('\n') : '(nothing decided yet)'}`,
+    `STILL TO COME AFTER THIS STEP: ${upcoming.length ? upcoming.join(', ') : 'nothing — this is the last step'}`,
+    notes.length ? `WORKING NOTES — resemblances you noticed at earlier steps. They were true of the build THEN; re-judge them against the build now rather than steering toward them:\n${notes.map(n => `- ${n}`).join('\n')}` : null,
+  ].filter(Boolean).join('\n\n')
+}
+
+// Usage for the per-step time/token report; kept on the walk itself so a
+// resumed walk still has the whole tally.
+function walkUsage(label, r) {
+  return { label, ms: r.totalMs ?? null, first_text_ms: r.firstTextMs ?? null, input_tokens: r.inputTokens ?? null, cache_read_tokens: r.cacheReadTokens ?? null, output_tokens: r.outputTokens ?? null }
+}
+
+// Which role each seed plays in this template. Small and separate (rather
+// than folded into the first step) because the step order depends on it.
+// A seed's generic_type comes from ownedInventoryTags — the shared join —
+// so "Bittercube Jamaican #1" reads as bitters without the model guessing
+// from a brand name.
+function roleFromGenericType(type) {
+  const t = normalizeForMatch(type)
+  if (!t) return null
+  if (/\bbitters$/.test(t)) return 'bitters'
+  if (/\b(syrup|honey|agave nectar|grenadine|orgeat)$/.test(t)) return 'sweetener'
+  if (/\bjuice$/.test(t)) return 'citrus'
+  return null
+}
+async function classifyWalkSeeds(seeds, templateId, inventory, inventoryTags, { signal } = {}) {
+  const t = TEMPLATE_MAP[templateId]
+  const sig = TEMPLATE_SIGNATURES[templateId]
+  const owned = ownedInventoryTags(inventory, inventoryTags) || {}
+  const seedLines = seeds.map(s => {
+    const type = owned[s.trim().toLowerCase()]?.generic_type
+    return `- ${s}${type ? ` (generic type: ${type})` : ''}`
+  }).join('\n')
+  const prompt = `Someone is building a ${t.name} (${t.formula}) starting from:
+${seedLines}
+
+For each, which ONE role does it fill in this drink? Roles: ${WALK_ROLE_ORDER.join(' | ')}. This template requires ${sig.requiredRoles.join(', ')}${sig.optionalRoles?.length ? ` and optionally takes ${sig.optionalRoles.join(', ')}` : ''}. A spirit is "base"; a liqueur, vermouth, amaro or aperitivo is "modifier" unless it's plainly the drink's main spirit; a syrup or honey is "sweetener"; bitters are "bitters"; juice is "citrus"; soda, tonic, wine for topping or tea are "lengthener". For a flavor direction rather than a product ("ginger", "smoke"), pick the role it most naturally enters this template through.
+
+Return ONLY JSON, no markdown fences: {"seeds": [{"seed": "exact text as given", "role": "one role"}]}`
+  // A tag that names the role outright decides it — measured: Angostura,
+  // tagged "aromatic bitters", still came back "base" from the model (it's
+  // 44.7% ABV). Only the ambiguous rest is the model's call.
+  const byTag = seeds.map(s => roleFromGenericType(owned[s.trim().toLowerCase()]?.generic_type))
+  if (byTag.every(Boolean)) return { seedRoles: seeds.map((seed, i) => ({ seed, role: byTag[i] })), usage: null }
+  const r = await callClaudeStream({ model: MODEL, max_tokens: 200, messages: [{ role: 'user', content: prompt }] }, { signal })
+  const data = extractJSON(r.text)
+  const roles = seeds.map((seed, i) => {
+    if (byTag[i]) return { seed, role: byTag[i] }
+    const hit = (data?.seeds || []).find(x => normalizeForMatch(x?.seed) === normalizeForMatch(seed))
+    const role = WALK_ROLE_ORDER.includes(hit?.role) ? hit.role : 'base'
+    return { seed, role }
+  })
+  return { seedRoles: roles, usage: walkUsage('seed roles', r) }
+}
+
+// One step. Streams so the framing and the first option land while the
+// rest are still arriving (S27's path). onPartial({framing, options}) fires
+// as text arrives; the resolved value is only ever a complete, parsed step.
+// The inventory is ~10k input tokens and identical across every call in a
+// walk, so it goes first and is marked for prompt caching: each step after
+// the first reads it from cache instead of paying for it again.
+function walkInventoryBlock(inventoryText) {
+  return { type: 'text', text: `BAR INVENTORY — what the user has on hand right now (out-of-stock bottles are already left out):\n${inventoryText}`, cache_control: { type: 'ephemeral' } }
+}
+
+async function analyzeWalkStep(walk, index, inventoryText, { onPartial, signal } = {}) {
+  const step = walk.steps[index]
+  const t = TEMPLATE_MAP[walk.template]
+  const roleLabel = ROLE_LABELS[step.role] || step.role
+  const presetNote = step.preset.length > 0
+    ? `${step.preset.join(' and ')} already ${step.preset.length > 1 ? 'fill' : 'fills'} this role — it's what they started from, so it is decided. Do NOT offer to replace it. The question at this step is whether anything should SHARE the role with it: a split base, a second bitters, a second modifier. The first option must be ${step.preset.join(' + ')} on its own, and it should usually be your recommendation; offer a shared version only where the pairing genuinely does something the seed alone can't, and say what. Every option must include ${step.preset.join(' and ')}.`
+    : ''
+  const optionalNote = step.optional
+    ? `This role is OPTIONAL in a ${t.name}. Judge from the build so far whether this drink needs it, and set "skip" accordingly: recommended true when earlier picks already do this job — name the earlier pick and what it already does here (for instance, an Old Fashioned built on a sweet liqueur may not need its sugar). Recommend skipping when that's the honest call — this step always appears so that you can say so. Still give the options, for someone who wants it anyway.`
+    : ''
+  const prompt = `You are an expert craft bartender building a new ${t.name} with someone, one role at a time. They choose at each step; your job is the reasoning a good bartender would say out loud. Nothing has been made or tasted yet.
+
+${buildTemplateContext(walk.template, walk.modifiers || {})}
+
+STARTED FROM: ${walk.seeds.join(' + ')}
+
+${describeWalkBuild(walk, index)}
+
+THIS STEP: the ${roleLabel} role.
+${presetNote}${optionalNote}
+
+OPTIONS — 2 or 3, best first (a fourth only if it's genuinely different from all three):
+- Each option fills this role with one ingredient, or two when a split genuinely earns it (two rums in a Tiki drink, rye plus mezcal in an Old Fashioned) — say in "why" what the split does that one bottle can't. Don't offer a split just to have one.
+- Reason from the WHOLE build so far, not the template in general. When an earlier pick changes what this role needs — more or less sugar, a clash, a flavor to echo — say so in "why", naming that pick.
+- Bottles from the BAR INVENTORY first, named exactly as listed there — they're building something to pour, likely tonight. But don't hide the right answer because it isn't on the shelf: when the best or the classic choice for this role, given this build, is something NOT in the BAR INVENTORY, include it as one option (at most one), say plainly that it's the one you'd reach for, and name it as a product or a generic ("orange liqueur", "orgeat"). The app marks it as not on hand. Don't add one just to have one — only when it beats what's on the shelf.
+- "kind": "bottle" for anything bought, "staple" only for what's made at home in minutes from pantry goods (simple, rich, demerara or honey syrup; fresh citrus juice; egg; soda water).
+- "versus": when there are two or more options, one line on how this option's drink would differ from the others — the contrast, not a restatement of "why".
+- No amounts — proportions get decided at the end, with the whole drink in view.
+- Never list skipping, or "none", as an option — on an optional step that's what "skip" is for.
+
+"framing": one or two sentences on what this role has to do in THIS build, given what's already chosen.
+
+"reference" (per option): if choosing THIS option would make the build so far genuinely resemble a specific real, well-known drink, name the drink and the move they share, in one short line ("a rye–mezcal split is the Oaxaca Old Fashioned's move"). Name a drink, not a template ("a standard Old Fashioned" counts only if the build so far IS one). Not "this ingredient appears in X" — an ingredient turning up in famous drinks isn't a resemblance; only the build as a whole looking like X is. Only the resemblance — not how it differs, and nothing you aren't sure that drink actually does. Most options have none, and null is the normal answer. Never manufacture a resemblance.
+
+Return ONLY valid JSON, no markdown fences:
+{
+  "framing": "string",
+  "skip": ${step.optional ? '{ "recommended": true or false, "reason": "string" }' : 'null'},
+  "options": [{ "ingredients": [{ "name": "string", "kind": "bottle | staple" }], "why": "string — max 22 words", "versus": "string or null — max 14 words", "reference": "string or null" }]
+}`
+  const body = { model: MODEL, max_tokens: 900, messages: [{ role: 'user', content: [walkInventoryBlock(inventoryText), { type: 'text', text: prompt }] }] }
+  const scan = makeArrayElementScanner('options')
+  const streamed = []
+  const r = await callClaudeStream(body, {
+    signal,
+    onText: text => {
+      for (const o of scan(text)) streamed.push(o)
+      const m = text.match(/"framing"\s*:\s*"((?:[^"\\]|\\.)*)/)
+      let framing = null
+      if (m) { try { framing = JSON.parse(`"${m[1].replace(/\\$/, '')}"`) } catch { framing = null } }
+      onPartial?.({ framing, options: normalizeWalkOptions(streamed, step) })
+    },
+  })
+  const data = extractJSON(r.text)
+  const options = normalizeWalkOptions(data?.options || [], step)
+  if (options.length === 0) throw new Error('No options came back for this step.')
+  return {
+    framing: data?.framing || null,
+    skip: step.optional && data?.skip ? { recommended: data.skip.recommended === true, reason: data.skip.reason || null } : null,
+    options,
+    usage: walkUsage(`step ${index + 1} · ${step.role}`, r),
+  }
+}
+function normalizeWalkOptions(raw, step) {
+  return (raw || []).map(o => {
+    let ingredients = (Array.isArray(o?.ingredients) ? o.ingredients : [])
+      .map(x => typeof x === 'string' ? { name: x, kind: 'bottle' } : { name: (x?.name || '').trim(), kind: x?.kind === 'staple' ? 'staple' : 'bottle' })
+      .filter(x => x.name)
+    // A seed's step must keep the seed, whatever the option says.
+    for (const seed of step.preset) if (!ingredients.some(x => phraseMatch(x.name, seed))) ingredients = [{ name: seed, kind: 'bottle' }, ...ingredients]
+    const reference = typeof o?.reference === 'string' && o.reference.trim() ? o.reference.trim() : null
+    return { ingredients: ingredients.slice(0, 3), why: o?.why || null, versus: o?.versus || null, reference }
+  }).filter(o => o.ingredients.length > 0).slice(0, 4)
+}
+
+// Free text at a step: the user proposes, the model evaluates. Refine's
+// voice (REFINE_VOICE / REFINE_PUSHBACK) and its two-exchange cap. Everything
+// in this phase is PRE-TASTING — the drink hasn't been made — so a user's
+// prediction is not evidence and the model holds its position where it
+// genuinely disagrees. `tasting` is phase 3's door: when someone has made the
+// drink, what they report IS evidence and should be taken as fact. Nothing
+// passes it yet.
+async function evaluateWalkProposal(walk, index, messages, inventoryText, { tasting = null, signal } = {}) {
+  const step = walk.steps[index]
+  const t = TEMPLATE_MAP[walk.template]
+  const system = `You are an expert craft bartender building a new ${t.name} with someone, one role at a time. ${REFINE_VOICE} Max 2 sentences per reply.
+
+${tasting
+    ? `They have made and tasted this drink. What they report about how it tasted is evidence — take it as fact and reason from it.`
+    : `Nothing has been made or tasted yet — this is all prediction, theirs and yours. Their proposal is a guess, not evidence; yours is a judgment. Evaluate the proposal on its merits against the build below. Where it works, say why in terms of the build. Where it fights something already chosen, say so plainly and name the pick it fights ("Falernum there would work, but it'll fight the allspice you picked at step two"). Where you genuinely disagree, hold that position across their reply unless they give you a real reason — not just because they asked again. ${REFINE_PUSHBACK}`}
+
+${buildTemplateContext(walk.template, walk.modifiers || {})}
+
+STARTED FROM: ${walk.seeds.join(' + ')}
+
+${describeWalkBuild(walk, index)}
+
+THE ROLE BEING FILLED: ${ROLE_LABELS[step.role] || step.role}${step.preset.length ? ` (${step.preset.join(' + ')} already fills it; the proposal is about what joins it)` : ''}${step.optional ? ' — optional in this template' : ''}
+
+Reply ONLY with JSON, no markdown fences:
+{"verdict": "works | caution | clashes", "reply": "your answer, max 2 sentences", "ingredients": [{"name": "what the proposal puts in this role — a bottle's exact BAR INVENTORY name when it refers to one", "kind": "bottle | staple"}], "reference": "string or null — only if the build WITH this proposal genuinely resembles a real, well-known drink; null is normal"}
+"works": you'd make it as proposed. "caution": it works with a real cost worth knowing. "clashes": you'd advise against it.`
+  const r = await callClaudeStream({ model: MODEL, max_tokens: 300, system: [walkInventoryBlock(inventoryText), { type: 'text', text: system }], messages }, { signal })
+  const data = extractJSON(r.text)
+  const verdict = ['works', 'caution', 'clashes'].includes(data?.verdict) ? data.verdict : 'caution'
+  const ingredients = normalizeWalkOptions([{ ingredients: data?.ingredients || [] }], step)[0]?.ingredients || []
+  const reference = typeof data?.reference === 'string' && data.reference.trim() ? data.reference.trim() : null
+  return { verdict, reply: data?.reply || '', ingredients, reference, usage: walkUsage(`step ${index + 1} · proposal`, r) }
+}
+
+// The end of the walk: amounts, method-level summary and a name, plus the
+// closest-relative line — asked ONCE here, with the whole build in view, so
+// it costs a few output tokens rather than a call. The working notes from
+// the steps go in as notes to re-judge; this answer overrides them, and a
+// resemblance that came and went is reported as the trajectory, not hidden.
+async function finishWalk(walk, inventoryText, { signal } = {}) {
+  const t = TEMPLATE_MAP[walk.template]
+  const skipped = walk.steps.filter(s => s.choice?.via === 'skip')
+  const notes = walk.steps.map((s, i) => s.choice?.reference ? `- at step ${i + 1} (${WALK_ROLE_TITLES[s.role]}): ${s.choice.reference}` : null).filter(Boolean)
+  const prompt = `You are an expert craft bartender. Someone just built a new ${t.name} with you, one role at a time. Finish it.
+
+${buildTemplateContext(walk.template, walk.modifiers || {})}
+
+STARTED FROM: ${walk.seeds.join(' + ')}
+
+${describeWalkBuild(walk, walk.steps.length)}
+
+1. THE RECIPE. Use exactly the ingredients chosen above, each in its role${skipped.length ? `; the skipped role${skipped.length > 1 ? 's stay' : ' stays'} out` : ''}. You may add a garnish (role "garnish") and nothing else. Set every amount, with the whole drink in view — this is where the proportions get decided. "summary": one line, flavor and character only.
+
+2. IS IT A KNOWN DRINK? Look at the finished build. If it IS a documented drink — that drink itself, ingredient for ingredient, give or take the specific bottles — say so plainly: "kind": "is_known", "drink" its name, and origin "published"; "note" is only how this build departs from the documented one (a different syrup, a different split), or null — the app already says which drink it is. Don't call a known drink a relative.
+
+3. OTHERWISE, ITS CLOSEST RELATIVE. "kind": "relative" with the real drink it's closest to and, in "note", the one difference that matters. Or "kind": "none" when nothing is genuinely close. The app words that case itself as "No close precedent I can find" — a self-report of what you can find, not a claim that none exists — so "note" is only the nearest thing you'd point to, or null. Never call the drink unprecedented, undocumented, uncharted, new to the world or a first. "None" is a perfectly good answer; a resemblance invented to have one is worse than none.
+
+4. THE TRAJECTORY. ${notes.length ? `You noted these along the way:\n${notes.join('\n')}\nThey were true of the build at that step. Judge each against the FINISHED drink — it may hold, or the drink may have moved away from it. If the drink's resemblance shifted, "trajectory" says so in one line ("Started out as a Penicillin, but ultimately this is closer to a Paper Plane"). If it resembled the same drink throughout, or a resemblance simply held, "trajectory" is null — never write a line saying it stayed the same. In "notes_check", say for each whether it still holds.` : 'No resemblances were noted along the way. "trajectory" is null and "notes_check" empty.'}
+
+${TIER23_NAMING_INSTRUCTION.split('\n').find(l => l.startsWith('- ORIGINAL:'))?.replace('- ORIGINAL:', 'NAME (unless it is a known drink, which keeps its own name):')}
+
+Return ONLY valid JSON, no markdown fences:
+{
+  "recipe_name": "string",
+  "origin": "original | published",
+  "summary": "string",
+  "recipe": [{ "ingredient": "string", "amount": "string", "role": "${RECIPE_ROLES.join(' | ')}" }],
+  "relative": { "kind": "is_known | relative | none", "drink": "string or null", "note": "string" },
+  "trajectory": "string or null",
+  "notes_check": [{ "step": 1, "holds": true, "note": "string — max 15 words" }]
+}`
+  const r = await callClaudeStream({ model: MODEL, max_tokens: 900, messages: [{ role: 'user', content: [walkInventoryBlock(inventoryText), { type: 'text', text: prompt }] }] }, { signal })
+  const data = extractJSON(r.text)
+  if (!data?.recipe_name || !Array.isArray(data?.recipe) || data.recipe.length === 0) throw new Error('The finished recipe came back incomplete.')
+  const kind = ['is_known', 'relative', 'none'].includes(data?.relative?.kind) ? data.relative.kind : 'none'
+  const isKnown = kind === 'is_known'
+  const recipe = {
+    // A known drink keeps its own name — measured: an is_known Old Fashioned
+    // came back named "Rye & Demerara Old Fashioned".
+    recipe_name: isKnown && data.relative?.drink ? data.relative.drink : data.recipe_name,
+    origin: isKnown ? 'published' : 'original',
+    origin_flag: isKnown ? 'from_recipe' : 'original',
+    tier: isKnown ? 'canon' : null,
+    parent_recipe: null,
+    replacements: null,
+    summary: data.summary || null,
+    recipe: data.recipe.filter(x => x?.ingredient).map(x => ({ ingredient: x.ingredient, amount: x.amount || '', role: RECIPE_ROLES.includes(x.role) ? x.role : null })),
+    can_make_now: null,
+    creation: {
+      template: walk.template,
+      seeds: walk.seeds,
+      build_story: walk.steps.filter(s => s.choice).map(s => ({ role: s.role, ingredients: s.choice.via === 'skip' ? [] : s.choice.ingredients.map(x => x.name), via: s.choice.via, reason: s.choice.reason || null, verdict: s.choice.verdict || null })),
+      // A "none" note that asserts novelty ("has no direct precedent",
+      // "uncharted") restates the claim the app words as a self-report —
+      // measured even with the prompt forbidding it, so it's dropped here.
+      relative: { kind, drink: kind === 'none' ? null : (data.relative?.drink || null), note: kind === 'none' && /precedent|unprecedented|undocumented|uncharted|never been|first of its kind|new to the world/i.test(data.relative?.note || '') ? null : (data.relative?.note || null) },
+      trajectory: typeof data.trajectory === 'string' && data.trajectory.trim() ? data.trajectory.trim() : null,
+      notes_check: Array.isArray(data.notes_check) ? data.notes_check : [],
+    },
+  }
+  return { recipe, usage: walkUsage('finish', r) }
 }
 
 // ─── Shared small components ──────────────────────────────────────────────────
@@ -5136,6 +5477,38 @@ function removeLocalExplorationHistory(searchKey) {
   return entries
 }
 
+// Session 30: Refine's "What works with these ingredients" panel, lifted out
+// of TweakModal unchanged so the creation walk's proposal box shows the same
+// reference. Controlled (open/onToggle) so TweakModal keeps one open state
+// across its modes, as before.
+function AffinityReferencePanel({ affinities, open, onToggle }) {
+  return (
+    <div style={{ marginTop: 20, borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
+      <button onClick={onToggle}
+        style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0, display: 'flex', alignItems: 'center', gap: 5 }}>
+        What works with these ingredients {open ? '▲' : '▼'}
+      </button>
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          {affinities.length === 0
+            ? <div style={{ fontSize: 12, color: C.textFaint }}>No affinity data available.</div>
+            : affinities.map(a => (
+              <div key={a.ingredient_name} style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: C.gold, marginBottom: 5, textTransform: 'capitalize' }}>{a.ingredient_name}</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                  {[...(a.spirit_tags || []), ...(a.flavor_tags || [])].slice(0, 8).map(tag => (
+                    <span key={tag} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, color: C.textMuted, fontSize: 11, padding: '2px 8px' }}>{tag}</span>
+                  ))}
+                </div>
+              </div>
+            ))
+          }
+        </div>
+      )}
+    </div>
+  )
+}
+
 function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, inventoryText, tried, notes, onClose, onApply }) {
   const [mode, setMode] = useState('choose')
   const [directText, setDirectText] = useState('')
@@ -5242,31 +5615,8 @@ function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, inventoryTex
     setProposedRevision(null)
   }
 
-  const affinitiesPanel = (
-    <div style={{ marginTop: 20, borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
-      <button onClick={() => setAffinitiesOpen(o => !o)}
-        style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0, display: 'flex', alignItems: 'center', gap: 5 }}>
-        What works with these ingredients {affinitiesOpen ? '▲' : '▼'}
-      </button>
-      {affinitiesOpen && (
-        <div style={{ marginTop: 10 }}>
-          {affinities.length === 0
-            ? <div style={{ fontSize: 12, color: C.textFaint }}>No affinity data available.</div>
-            : affinities.map(a => (
-              <div key={a.ingredient_name} style={{ marginBottom: 10 }}>
-                <div style={{ fontSize: 11, fontWeight: 700, color: C.gold, marginBottom: 5, textTransform: 'capitalize' }}>{a.ingredient_name}</div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                  {[...(a.spirit_tags || []), ...(a.flavor_tags || [])].slice(0, 8).map(tag => (
-                    <span key={tag} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, color: C.textMuted, fontSize: 11, padding: '2px 8px' }}>{tag}</span>
-                  ))}
-                </div>
-              </div>
-            ))
-          }
-        </div>
-      )}
-    </div>
-  )
+  const affinitiesPanel = <AffinityReferencePanel affinities={affinities} open={affinitiesOpen} onToggle={() => setAffinitiesOpen(o => !o)} />
+
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', zIndex: 900, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }} onClick={onClose}>
@@ -5363,6 +5713,40 @@ function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, inventoryTex
           </div>
         )}
       </div>
+    </div>
+  )
+}
+
+// Session 30: the build story under a finished creation (RecipeCard, and so
+// the whiteboard and the walk's own last screen).
+function CreationLineage({ creation }) {
+  const [open, setOpen] = useState(false)
+  const rel = creation.relative || {}
+  const t = TEMPLATE_MAP[creation.template]
+  const article = w => /^[aeiou]/i.test(w || '') ? 'an' : 'a'
+  const relLine = rel.kind === 'is_known'
+    ? `This is ${article(rel.drink)} ${rel.drink}.${rel.note ? ` ${rel.note}` : ''}`
+    : rel.kind === 'relative'
+      ? `Closest relative: ${rel.drink}${rel.note ? ` — ${rel.note}` : ''}`
+      : `No close precedent I can find.${rel.note ? ` Nearest: ${rel.note}` : ''}`
+  return (
+    <div style={{ fontSize: 12, color: C.textFaint, lineHeight: 1.5, marginTop: -4, marginBottom: 10 }}>
+      <div style={{ color: C.textMuted, marginBottom: 4 }}>{relLine}</div>
+      {creation.trajectory && <div style={{ fontStyle: 'italic', marginBottom: 4 }}>{creation.trajectory}</div>}
+      <button onClick={() => setOpen(o => !o)} style={{ background: 'none', border: 'none', color: C.textFaint, fontSize: 12, cursor: 'pointer', padding: 0 }}>
+        Built {article(t?.name)} {t?.name || creation.template} from {(creation.seeds || []).join(' + ')}, step by step {open ? '▲' : '▼'}
+      </button>
+      {open && (
+        <ol style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+          {(creation.build_story || []).map((b, i) => (
+            <li key={i} style={{ marginBottom: 4 }}>
+              <span style={{ color: C.textMuted }}>{WALK_ROLE_TITLES[b.role] || b.role}: {b.via === 'skip' ? 'skipped' : b.ingredients.join(' + ')}</span>
+              {b.via === 'proposal' && <span> (your call{b.verdict === 'clashes' ? ', over an objection' : ''})</span>}
+              {b.reason && <span> — {b.reason}</span>}
+            </li>
+          ))}
+        </ol>
+      )}
     </div>
   )
 }
@@ -5779,6 +6163,11 @@ function RecipeCard({
           {formatLineageLine(displayed.parent_recipe, displayed.replacements)}
         </p>
       )}
+      {/* Session 30: a creation's lineage is its build story — template, seed,
+          and the reasoned choice at each step — not parent-plus-swaps. The
+          relative line was asked once, at the end, with the whole build in
+          view; the trajectory says when an early resemblance didn't last. */}
+      {displayed.creation && <CreationLineage creation={displayed.creation} />}
 
       {showSaveButtons && <AttributionDisplay recipe={{ ...displayed, attributionSource: displayed.attribution_source }} />}
 
@@ -6014,6 +6403,378 @@ function TemplateInfoSheet({ template, onClose }) {
   )
 }
 
+// Session 30: where an option's bottle sits, through the shared joins only —
+// its type from ownedInventoryTags, its shelf from getOwnedBottlesForCategory.
+function walkBottleLocation(name, inventory, inventoryTags) {
+  const tag = ownedInventoryTags(inventory, inventoryTags)?.[normalizeForMatch(name)] || ownedInventoryTags(inventory, inventoryTags)?.[name.trim().toLowerCase()]
+  if (!tag?.generic_type) return null
+  const bottle = getOwnedBottlesForCategory(tag.generic_type, inventory, inventoryTags).find(b => normalizeForMatch(b.spirit) === normalizeForMatch(name))
+  return bottle?.location || null
+}
+
+// One ingredient's ownership line inside a walk option: owned outright (with
+// its shelf), covered by a same-type bottle (S29's recommendation, reused as
+// is), made at home, or not on hand — the last one visibly flagged, since
+// the walk is for something to pour tonight.
+function WalkIngredient({ item, inventory, inventoryTags }) {
+  const owned = isLiveFound(item.name, inventory, inventoryTags)
+  const via = owned ? liveFoundVia(item.name, inventory, inventoryTags) : null
+  const loc = owned && !via ? walkBottleLocation(item.name, inventory, inventoryTags) : null
+  return (
+    <div style={{ marginBottom: 2 }}>
+      <span style={{ fontSize: 14, fontWeight: 600, color: C.text }}>{item.name}</span>
+      {owned && !via && <span style={{ fontSize: 12, color: C.green, marginLeft: 8 }}>✓ on hand{loc ? ` · ${loc}` : ''}</span>}
+      {!owned && item.kind === 'staple' && <span style={{ fontSize: 12, color: C.textFaint, marginLeft: 8 }}>make it</span>}
+      {!owned && item.kind !== 'staple' && (
+        <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', color: C.amber, background: C.amber + '18', border: `1px solid ${C.amber}55`, borderRadius: 4, padding: '1px 6px', marginLeft: 8 }}>Not on hand</span>
+      )}
+      {via?.length > 0 && <CoveredByNote ingredient={item.name} candidates={via} style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }} />}
+    </div>
+  )
+}
+
+const WALK_VERDICT_STYLE = {
+  works: { label: 'Works', color: C.green },
+  caution: { label: 'Works, with a cost', color: C.amber },
+  clashes: { label: 'I’d advise against it', color: C.red },
+}
+
+// The walk itself. State lives on the whiteboard as one `creation` node
+// (payload { walk, recipe }), written after every step and every choice, so
+// a refresh resumes exactly where it stopped. Signed out, it still works,
+// but there's nowhere to keep it — said so on screen.
+function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventory, inventoryTags, inventoryText, user, onBack, onSaveOnDeck, toMake }) {
+  const [walk, setWalk] = useState(null)
+  const [recipe, setRecipe] = useState(null)
+  const [node, setNode] = useState(null) // { id, whiteboardId, tried, notes }
+  const [live, setLive] = useState(null) // streaming step: { index, framing, options }
+  const [busy, setBusy] = useState(null) // 'starting' | 'step' | 'finishing' | null
+  const [error, setError] = useState(null) // { message, retry }
+  const [proposal, setProposal] = useState('')
+  const [conv, setConv] = useState({ index: null, messages: [], result: null, loading: false, error: null })
+  const [affinities, setAffinities] = useState([])
+  const [affinitiesOpen, setAffinitiesOpen] = useState(false)
+  const abortRef = useRef(null)
+  const nodeRef = useRef(null)
+  useEffect(() => { nodeRef.current = node }, [node])
+  useEffect(() => () => abortRef.current?.abort(), [])
+  const t = TEMPLATE_MAP[template]
+
+  const persist = async (w, r) => {
+    const n = nodeRef.current
+    if (!user || !n?.id) return
+    const { error: err } = await supabase.from('exploration_nodes').update({ payload: { walk: w, recipe: r ?? null } }).eq('id', n.id)
+    if (err) console.warn('[creation] save failed:', err.message)
+    supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', n.whiteboardId).then()
+  }
+
+  const freshSignal = () => { abortRef.current?.abort(); abortRef.current = new AbortController(); return abortRef.current.signal }
+
+  const runStep = async (w, index) => {
+    setBusy('step'); setError(null)
+    setLive({ index, framing: null, options: [] })
+    try {
+      const res = await analyzeWalkStep(w, index, inventoryText, { signal: freshSignal(), onPartial: p => setLive({ index, ...p }) })
+      const steps = w.steps.map((s, i) => i === index ? { ...s, framing: res.framing, skip: res.skip, options: res.options } : s)
+      const next = { ...w, steps, usage: [...(w.usage || []), res.usage] }
+      if (DIAG_ON) console.log(`[DIAG:creation-step] ${JSON.stringify(res.usage)}`)
+      setWalk(next); setLive(null); setBusy(null)
+      persist(next, null)
+    } catch (err) {
+      if (err.code === 'aborted') return
+      setLive(null); setBusy(null)
+      setError({ message: err.message || 'This step didn’t come back.', retry: () => runStep(w, index) })
+    }
+  }
+
+  const runFinish = async (w) => {
+    setBusy('finishing'); setError(null)
+    try {
+      const { recipe: r, usage } = await finishWalk(w, inventoryText, { signal: freshSignal() })
+      const next = { ...w, status: 'complete', usage: [...(w.usage || []), usage] }
+      if (DIAG_ON) console.log(`[DIAG:creation-finish] ${JSON.stringify(usage)} total_output_tokens=${next.usage.reduce((a, u) => a + (u?.output_tokens || 0), 0)}`)
+      setWalk(next); setRecipe(r); setBusy(null)
+      persist(next, r)
+    } catch (err) {
+      if (err.code === 'aborted') return
+      setBusy(null)
+      setError({ message: err.message || 'Couldn’t finish the drink.', retry: () => runFinish(w) })
+    }
+  }
+
+  // Where a loaded walk picks up: the first undecided step (generating its
+  // options if they never arrived), else the finish, else nothing to do.
+  const continueWalk = (w, r) => {
+    if (r) return
+    const i = w.steps.findIndex(s => !s.choice)
+    if (i < 0) return runFinish(w)
+    if (!w.steps[i].options) return runStep(w, i)
+  }
+
+  useEffect(() => {
+    let cancelled = false
+    const start = async () => {
+      setBusy('starting'); setError(null)
+      try {
+        if (resume?.nodeId) {
+          const { data, error: err } = await supabase.from('exploration_nodes').select('id, whiteboard_id, payload, tried, notes').eq('id', resume.nodeId).single()
+          if (err || !data?.payload?.walk) throw new Error(err?.message || 'This creation couldn’t be loaded.')
+          if (cancelled) return
+          const n = { id: data.id, whiteboardId: data.whiteboard_id, tried: !!data.tried, notes: data.notes || '' }
+          setNode(n); nodeRef.current = n
+          setWalk(data.payload.walk); setRecipe(data.payload.recipe || null); setBusy(null)
+          continueWalk(data.payload.walk, data.payload.recipe || null)
+          return
+        }
+        const { seedRoles, usage } = await classifyWalkSeeds(seeds, template, inventory, inventoryTags, { signal: freshSignal() })
+        if (cancelled) return
+        const w = {
+          version: 1, seeds, seed_labels: seedLabels, template, modifiers: modifiers || {},
+          steps: planWalkRoles(template, seedRoles).map(s => ({ ...s, framing: null, skip: null, options: null, choice: null })),
+          status: 'in_progress', usage: usage ? [usage] : [],
+        }
+        if (user) {
+          const now = new Date().toISOString()
+          const { data: wb } = await supabase.from('exploration_whiteboards')
+            .insert({ user_id: user.id, title: `${seedLabels.join(' + ')} · ${t?.name || template}`, status: 'active', last_touched_at: now })
+            .select('id').single()
+          if (wb?.id) {
+            const { data: cn, error: err } = await supabase.from('exploration_nodes')
+              .insert({ whiteboard_id: wb.id, parent_node_id: null, node_type: 'creation', payload: { walk: w, recipe: null } })
+              .select('id').single()
+            if (err) console.warn('[creation] node insert failed:', err.message)
+            if (cn?.id) { const n = { id: cn.id, whiteboardId: wb.id, tried: false, notes: '' }; setNode(n); nodeRef.current = n }
+          }
+        }
+        if (cancelled) return
+        setWalk(w); setBusy(null)
+        runStep(w, 0)
+      } catch (err) {
+        if (err.code === 'aborted' || cancelled) return
+        setBusy(null)
+        setError({ message: err.message || 'Couldn’t start.', retry: start })
+      }
+    }
+    start()
+    return () => { cancelled = true }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The reference panel tracks the build: the seeds plus everything chosen.
+  const chosenNames = (walk?.steps || []).flatMap(s => s.choice?.ingredients?.map(x => x.name) || [])
+  const affinityKey = [...seeds, ...chosenNames].map(n => n.trim().toLowerCase()).join('|')
+  useEffect(() => {
+    const names = affinityKey.split('|').filter(Boolean)
+    if (names.length === 0) return
+    supabase.from('ingredient_affinities').select('ingredient_name, flavor_affinities, spirit_tags, flavor_tags').in('ingredient_name', names)
+      .then(({ data }) => { if (data) setAffinities(data) }, () => {})
+  }, [affinityKey])
+
+  const choose = (index, choice) => {
+    const steps = walk.steps.map((s, i) => i === index ? { ...s, choice } : s)
+    const next = { ...walk, steps }
+    setWalk(next)
+    setProposal(''); setConv({ index: null, messages: [], result: null, loading: false, error: null })
+    persist(next, null)
+    if (index + 1 < next.steps.length) runStep(next, index + 1)
+    else runFinish(next)
+  }
+
+  const sendProposal = async (index, text) => {
+    const content = text.trim()
+    if (!content || conv.loading) return
+    const prior = conv.index === index ? conv.messages : []
+    const messages = [...prior, { role: 'user', content }]
+    setConv({ index, messages, result: conv.index === index ? conv.result : null, loading: true, error: null })
+    setProposal('')
+    try {
+      const res = await evaluateWalkProposal(walk, index, messages, inventoryText, { signal: freshSignal() })
+      const withReply = [...messages, { role: 'assistant', content: JSON.stringify({ verdict: res.verdict, reply: res.reply }), display: res.reply, verdict: res.verdict }]
+      const next = { ...walk, usage: [...(walk.usage || []), res.usage] }
+      setWalk(next)
+      // A follow-up keeps what the proposal puts in the role unless the
+      // model's reading of it changed.
+      const ingredients = res.ingredients.length ? res.ingredients : (conv.result?.ingredients || [])
+      setConv({ index, messages: withReply, result: { ...res, ingredients, firstProposal: prior[0]?.content || content }, loading: false, error: null })
+    } catch (err) {
+      if (err.code === 'aborted') return
+      setConv(c => ({ ...c, messages: prior, loading: false, error: err.message || 'That didn’t come back.' }))
+      setProposal(content)
+    }
+  }
+
+  const exchanges = conv.messages.filter(m => m.role === 'user').length
+  const modifierLabels = walkModifierList(modifiers)
+
+  const header = (
+    <>
+      <button onClick={onBack} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: 14, padding: '8px 0', cursor: 'pointer', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+      <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Create Something New</div>
+      <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 6 }}>
+        <span style={{ color: C.gold }}>{(walk?.seed_labels || seedLabels).join(' + ')}</span> · {t?.name || template}{modifierLabels.length > 0 && <span> · {modifierLabels.join(', ')}</span>}
+      </div>
+      {!user && <div style={{ fontSize: 12, color: C.textFaint, marginBottom: 12 }}>Signed out — this build won’t survive a refresh. Sign in to keep it in In Progress.</div>}
+    </>
+  )
+
+  const errorBox = error && (
+    <div style={{ background: C.amber + '14', border: `1px solid ${C.amber}55`, borderRadius: 12, padding: 14, margin: '12px 0' }}>
+      <div style={{ fontSize: 14, color: C.amber, marginBottom: 8 }}>{error.message}</div>
+      <button onClick={error.retry} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 13, padding: '8px 14px', cursor: 'pointer' }}>Try again</button>
+    </div>
+  )
+
+  if (!walk) return (
+    <div>
+      {header}
+      {busy === 'starting' && <div style={{ fontSize: 13, color: C.textMuted, padding: '20px 0', animation: 'bcpulse 1.4s ease-in-out infinite' }}>Working out where {seedLabels.join(' + ')} sits in a {t?.name}…</div>}
+      {errorBox}
+      <style>{`@keyframes bcpulse { 0%,100% { opacity: 0.45 } 50% { opacity: 0.9 } }`}</style>
+    </div>
+  )
+
+  const total = walk.steps.length
+  const currentIndex = walk.steps.findIndex(s => !s.choice)
+  const decided = walk.steps.filter(s => s.choice)
+
+  const buildSoFar = decided.length > 0 && (
+    <div style={{ borderLeft: `2px solid ${C.gold}55`, paddingLeft: 12, margin: '14px 0 18px' }}>
+      {walk.steps.map((s, i) => s.choice && (
+        <div key={i} style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: C.textFaint }}>{WALK_ROLE_TITLES[s.role]}</div>
+          <div style={{ fontSize: 14, color: s.choice.via === 'skip' ? C.textFaint : C.text }}>
+            {s.choice.via === 'skip' ? 'Skipped' : s.choice.ingredients.map(x => x.name).join(' + ')}
+            {s.choice.via === 'proposal' && <span style={{ fontSize: 11, color: C.textFaint, marginLeft: 6 }}>your call{s.choice.verdict === 'clashes' ? ' — over my objection' : ''}</span>}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+
+  const renderStep = (index) => {
+    const step = walk.steps[index]
+    const streaming = live?.index === index
+    const framing = streaming ? live.framing : step.framing
+    const rawOptions = streaming ? live.options : (step.options || [])
+    // Owned first (stable within each group — the model's rank otherwise).
+    const unowned = o => o.ingredients.some(x => x.kind !== 'staple' && !isLiveFound(x.name, inventory, inventoryTags))
+    const options = streaming ? rawOptions : [...rawOptions].sort((a, b) => Number(unowned(a)) - Number(unowned(b)))
+    const convHere = conv.index === index
+    const result = convHere ? conv.result : null
+    return (
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 4 }}>
+          Step {index + 1} of {total} · {WALK_ROLE_TITLES[step.role]}{step.optional ? ' · optional' : ''}
+        </div>
+        {step.preset.length > 0 && <div style={{ fontSize: 13, color: C.gold, marginBottom: 6 }}>{step.preset.join(' + ')} — what you started from</div>}
+        {streaming && (
+          <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 8, animation: 'bcpulse 1.4s ease-in-out infinite' }}>
+            {options.length === 0 ? 'Thinking it through with everything chosen so far…' : `Still weighing options… ${options.length} so far`}
+          </div>
+        )}
+        {framing && <div style={{ fontSize: 14, color: C.text, lineHeight: 1.55, marginBottom: 12 }}>{framing}</div>}
+        {!streaming && step.skip && (
+          <div style={{ background: C.bg, border: `1px solid ${step.skip.recommended ? C.gold + '66' : C.border}`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
+            <div style={{ fontSize: 13, color: step.skip.recommended ? C.gold : C.textMuted, fontWeight: 600, marginBottom: 4 }}>{step.skip.recommended ? 'My call: skip it' : 'Worth adding'}</div>
+            {step.skip.reason && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, marginBottom: 8 }}>{step.skip.reason}</div>}
+            <button onClick={() => choose(index, { via: 'skip', ingredients: [], reason: step.skip.reason || null })}
+              style={{ background: step.skip.recommended ? C.gold : 'none', border: `1px solid ${step.skip.recommended ? C.gold : C.border}`, borderRadius: 8, color: step.skip.recommended ? '#0f0f0f' : C.text, fontSize: 13, fontWeight: 600, padding: '7px 14px', cursor: 'pointer' }}>
+              Skip the {WALK_ROLE_TITLES[step.role].toLowerCase()}
+            </button>
+          </div>
+        )}
+        {options.map((o, k) => (
+          <div key={k} style={{ border: `1px solid ${C.border}`, borderRadius: 10, padding: 12, marginBottom: 8, background: C.bg }}>
+            {o.ingredients.map((x, j) => <WalkIngredient key={j} item={x} inventory={inventory} inventoryTags={inventoryTags} />)}
+            {o.why && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, marginTop: 6 }}>{o.why}</div>}
+            {options.length > 1 && o.versus && <div style={{ fontSize: 12, color: C.textFaint, lineHeight: 1.45, marginTop: 4 }}>vs. the others: {o.versus}</div>}
+            {!streaming && (
+              <button onClick={() => choose(index, { via: 'option', ingredients: o.ingredients, reason: o.why, reference: o.reference })}
+                style={{ marginTop: 8, background: 'none', border: `1px solid ${C.gold}`, borderRadius: 20, color: C.gold, fontSize: 12, fontWeight: 600, padding: '5px 14px', cursor: 'pointer' }}>
+                Use this
+              </button>
+            )}
+          </div>
+        ))}
+
+        {!streaming && step.options && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 12, color: C.textFaint, marginBottom: 6 }}>{convHere && conv.messages.length > 0 ? 'Your proposal' : 'Or propose your own — I’ll tell you if it works with what’s here:'}</div>
+            {convHere && conv.messages.map((m, i) => (
+              <div key={i} style={{ display: 'flex', justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start', marginBottom: 6 }}>
+                <div style={{ maxWidth: '85%', background: m.role === 'user' ? C.gold + '22' : C.bg, border: `1px solid ${m.role === 'user' ? C.gold + '44' : C.border}`, borderRadius: m.role === 'user' ? '10px 10px 2px 10px' : '10px 10px 10px 2px', padding: '8px 12px', fontSize: 14, color: C.text, lineHeight: 1.5 }}>
+                  {m.role === 'assistant' && m.verdict && <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.05em', textTransform: 'uppercase', color: WALK_VERDICT_STYLE[m.verdict].color, marginBottom: 3 }}>{WALK_VERDICT_STYLE[m.verdict].label}</div>}
+                  {m.display ?? m.content}
+                </div>
+              </div>
+            ))}
+            {convHere && conv.loading && <div style={{ fontSize: 13, color: C.textFaint, marginBottom: 6, animation: 'bcpulse 1.4s ease-in-out infinite' }}>Weighing it against the build…</div>}
+            {result && !conv.loading && result.ingredients.length > 0 && (
+              <div style={{ margin: '6px 0 10px' }}>
+                {result.ingredients.map((x, j) => <WalkIngredient key={j} item={x} inventory={inventory} inventoryTags={inventoryTags} />)}
+                <button onClick={() => choose(index, { via: 'proposal', ingredients: result.ingredients, reason: result.reply, verdict: result.verdict, reference: result.reference, proposal: result.firstProposal, conversation: conv.messages.map(m => ({ role: m.role, content: m.display ?? m.content })) })}
+                  style={{ marginTop: 6, background: result.verdict === 'clashes' ? 'none' : C.gold, border: `1px solid ${result.verdict === 'clashes' ? C.border : C.gold}`, borderRadius: 20, color: result.verdict === 'clashes' ? C.textMuted : '#0f0f0f', fontSize: 12, fontWeight: 600, padding: '5px 14px', cursor: 'pointer' }}>
+                  {result.verdict === 'clashes' ? 'Use it anyway' : 'Use it'}
+                </button>
+              </div>
+            )}
+            {(!convHere || exchanges < 2) && (
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input type="text" value={convHere || !conv.messages.length ? proposal : ''} onChange={e => setProposal(e.target.value)} onKeyDown={e => e.key === 'Enter' && sendProposal(index, proposal)}
+                  placeholder={convHere && exchanges > 0 ? 'Reply…' : `e.g. a ${WALK_ROLE_TITLES[step.role].toLowerCase()} you have in mind`} disabled={conv.loading}
+                  style={{ flex: 1, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 14, padding: '10px 12px', outline: 'none', opacity: conv.loading ? 0.5 : 1, minWidth: 0 }} />
+                <button onClick={() => sendProposal(index, proposal)} disabled={!proposal.trim() || conv.loading}
+                  style={{ background: proposal.trim() && !conv.loading ? C.gold : C.surface, border: `1px solid ${proposal.trim() && !conv.loading ? C.gold : C.border}`, borderRadius: 8, color: proposal.trim() && !conv.loading ? '#0f0f0f' : C.textFaint, fontSize: 16, fontWeight: 700, padding: '10px 16px', cursor: proposal.trim() && !conv.loading ? 'pointer' : 'default' }}>→</button>
+              </div>
+            )}
+            {convHere && conv.error && <div style={{ fontSize: 12, color: C.red, marginTop: 6 }}>{conv.error}</div>}
+            <AffinityReferencePanel affinities={affinities} open={affinitiesOpen} onToggle={() => setAffinitiesOpen(o => !o)} />
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div>
+      <style>{`@keyframes bcpulse { 0%,100% { opacity: 0.45 } 50% { opacity: 0.9 } }`}</style>
+      {header}
+      {buildSoFar}
+      {currentIndex >= 0 && renderStep(currentIndex)}
+      {busy === 'finishing' && <div style={{ fontSize: 14, color: C.textMuted, padding: '16px 0', animation: 'bcpulse 1.4s ease-in-out infinite' }}>Setting the proportions and naming it…</div>}
+      {errorBox}
+      {recipe && (
+        <RecipeCard
+          suggestion={recipe}
+          primaryIngredients={walk.seeds}
+          onSaveOnDeck={onSaveOnDeck}
+          user={user}
+          whiteboardId={node?.whiteboardId || null}
+          restoreRecipeNodeId={node?.id || null}
+          autoExpand
+          initialTried={node?.tried || false}
+          initialNotes={node?.notes || ''}
+          inventoryText={inventoryText}
+          inventory={inventory}
+          inventoryTags={inventoryTags}
+          template={walk.template}
+          modifiers={walk.modifiers}
+          toMake={toMake}
+          onDetailFetched={(name, patch) => { setRecipe(prev => { const merged = { ...prev, ...patch }; persist(walk, merged); return merged }) }}
+          onRename={async (newName) => {
+            const renamed = { ...recipe, display_name: newName, name_user_supplied: true }
+            setRecipe(renamed)
+            if (user && node?.id) {
+              const { error: err } = await supabase.from('exploration_nodes').update({ payload: { walk, recipe: renamed } }).eq('id', node.id)
+              if (err) throw new Error(err.message || 'Could not save name.')
+            }
+          }}
+          onSaved={(name, toMakeId) => { setRecipe(prev => { const merged = { ...prev, to_make_id: toMakeId }; persist(walk, merged); return merged }) }}
+        />
+      )}
+    </div>
+  )
+}
+
 function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnDeck, toMake, user, pendingRestore, onRestoreConsumed, onBackToInProgress, onOpenWhiteboard }) {
   const [step, setStep] = useState('ingredients')
   const [navStack, setNavStack] = useState([])
@@ -6036,6 +6797,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const [selectedLabels, setSelectedLabels] = useState([])
   const [selectedMeta, setSelectedMeta] = useState([])
   const [template, setTemplate] = useState(null)
+  // Session 30: the creation walk's launch parameters (seeds, template,
+  // modifiers, and a node to resume) — set on entry, read by step 'walk'.
+  const [walkLaunch, setWalkLaunch] = useState(null)
   const [frozen, setFrozen] = useState(false)
   const [na, setNa] = useState(false)
   const [lowABV, setLowABV] = useState(false)
@@ -6475,6 +7239,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       stack.push({ type: 'whiteboard', id: pendingRestore.whiteboardId })
     }
     setNavStack(stack)
+    if (pendingRestore.creation) {
+      setWalkLaunch({ key: pendingRestore.creation.nodeId, seeds: pendingRestore.primary_ingredients || [], labels: pendingRestore.seed_labels || pendingRestore.primary_ingredients || [], template: pendingRestore.template, modifiers: { frozen: !!pendingRestore.frozen, lowABV: !!pendingRestore.low_abv, na: !!pendingRestore.na }, resume: pendingRestore.creation })
+    }
     setStep(pendingRestore.resumeStep || (pendingRestore.result ? 'results' : 'ingredients'))
     onRestoreConsumed?.()
   }, [pendingRestore]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -7031,7 +7798,15 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     }
   }
 
-  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); setTier1SeedDropped(false); guidanceRequestRef.current += 1; guidanceAbortRef.current?.abort(); guidanceAbortRef.current = null; setGuidance(null); setGuidanceLoading(false); setGuidanceError(null); setShowAllGuidance(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityKey(null); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null) }
+  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); setTier1SeedDropped(false); guidanceRequestRef.current += 1; guidanceAbortRef.current?.abort(); guidanceAbortRef.current = null; setGuidance(null); setGuidanceLoading(false); setGuidanceError(null); setShowAllGuidance(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityKey(null); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null); setWalkLaunch(null) }
+
+  // Session 30: Create Something New — from Help Me Decide (template picked)
+  // or the affinities screen. Same seeds and modifiers the Build path uses.
+  const handleCreateSomethingNew = () => {
+    if (!template) return
+    setWalkLaunch({ key: `new-${Date.now()}`, seeds: selected, labels: selectedLabels.length === selected.length ? selectedLabels : selected, template, modifiers: { frozen, lowABV, na }, resume: null })
+    goToStep('walk')
+  }
 
   const handleFeedback = async () => {
     if (!feedback.trim() || isFeedbackLoading) return
@@ -7561,32 +8336,14 @@ Rules:
     // reverse — so it was never exposed to an orphaned tag. Routed through
     // ownedInventoryTags now too, not because this needed fixing, but so both
     // paths share the one join instead of each carrying its own copy of it.
-    const getOwnedBottlesForCategory = (category) => {
-      const normCat = normalizeForMatch(category)
-      if (!inventory || !inventoryTags) return []
-      const inStock = inventory.filter(item => item.stockState !== 'oos')
-      const liveTags = ownedInventoryTags(inStock, inventoryTags)
-      const owned = inStock
-        .map(item => ({ item, tag: liveTags[item.spirit.trim().toLowerCase()] }))
-        .filter(({ tag }) => tag)
-      const resolvedType = owned.find(({ tag }) =>
-        normalizeForMatch(tag.generic_type) === normCat || (tag.aliases || []).some(a => normalizeForMatch(a) === normCat)
-      )?.tag.generic_type
-      if (!resolvedType) return []
-      const normType = normalizeForMatch(resolvedType)
-      const matches = owned.filter(({ tag }) => normalizeForMatch(tag.generic_type) === normType).map(({ item }) => item)
-      // Session 14, Change 4: a backup bottle (same product, second location)
-      // is correct at the tagging layer but noise in this pick-one list —
-      // collapse it to one row before the drawer ever sees it.
-      return dedupeBottlesByName(matches)
-    }
+    const ownedBottlesFor = (category) => getOwnedBottlesForCategory(category, inventory, inventoryTags)
 
     // Spirit chips always open the drawer, owned or not — the drawer itself
     // always offers "Add <category>" as a generic option, with owned bottles
     // (if any) listed below it as a refinement. The whole chip is one tap
     // target regardless of ownership; the dot is a status indicator only.
     const renderSpiritChip = (category) => {
-      const owned = getOwnedBottlesForCategory(category)
+      const owned = ownedBottlesFor(category)
       const isOwned = owned.length > 0
       const label = titleCase(category)
       return (
@@ -7793,6 +8550,11 @@ Rules:
           style={{ width: '100%', background: C.gold, border: `1px solid ${C.gold}`, borderRadius: 10, color: '#0f0f0f', fontWeight: 700, fontSize: 15, padding: '13px', cursor: 'pointer', marginTop: 24, transition: 'background 0.15s, color 0.15s' }}>
           ✨ Build
         </button>
+        {/* Session 30: same entry to the creation walk as Help Me Decide. */}
+        <button onClick={handleCreateSomethingNew} disabled={!template}
+          style={{ width: '100%', background: 'none', border: `1px solid ${template ? C.gold : C.border}`, borderRadius: 10, color: template ? C.gold : C.textFaint, fontWeight: 600, fontSize: 14, padding: '12px', cursor: template ? 'pointer' : 'default', marginTop: 10 }}>
+          ✏️ Create Something New
+        </button>
       </div>
     )
   }
@@ -7932,6 +8694,24 @@ Rules:
   // "see all" yet), complete (the "see all" control appears), and failed
   // partway (a banner above the pills naming how many of the ten came back,
   // with Try again; what arrived stays pickable, and there's no "see all").
+  if (step === 'walk' && walkLaunch) return (
+    <CreationWalk
+      key={walkLaunch.key}
+      seeds={walkLaunch.seeds}
+      seedLabels={walkLaunch.labels}
+      template={walkLaunch.template}
+      modifiers={walkLaunch.modifiers}
+      resume={walkLaunch.resume}
+      inventory={inventory}
+      inventoryTags={inventoryTags}
+      inventoryText={inventoryText}
+      user={user}
+      onBack={goBack}
+      onSaveOnDeck={onSaveOnDeck}
+      toMake={toMake}
+    />
+  )
+
   if (step === 'guidance') {
     const entries = guidance?.entries || []
     const complete = !!guidance?.complete
@@ -8037,14 +8817,12 @@ Rules:
             style={{ width: '100%', background: canProceed ? C.gold : C.surface, border: `1px solid ${canProceed ? C.gold : C.border}`, borderRadius: 10, color: canProceed ? '#0f0f0f' : C.textFaint, fontWeight: 700, fontSize: 15, padding: '13px', cursor: canProceed ? 'pointer' : 'default', opacity: affinityLoading ? 0.7 : 1, transition: 'background 0.15s, color 0.15s' }}>
             {affinityLoading ? 'Loading…' : template ? `Published and Riffs →` : 'Pick one to see Published and Riffs'}
           </button>
-          {/* Not yet built (the creation walk). Dashed outline + an explicit
-              "Coming soon" tag so it reads as "not yet", not "broken" (S19).
-              No handler on purpose — tapping does nothing. */}
-          <div role="button" aria-disabled="true" title="Coming soon"
-            style={{ width: '100%', boxSizing: 'border-box', marginTop: 10, border: `1px dashed ${C.textFaint}`, borderRadius: 10, padding: '12px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, cursor: 'default', userSelect: 'none' }}>
-            <span style={{ color: C.textFaint, fontWeight: 600, fontSize: 14 }}>✏️ Create Something New</span>
-            <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.gold, background: C.gold + '18', border: `1px solid ${C.gold + '44'}`, borderRadius: 20, padding: '2px 8px' }}>Coming soon</span>
-          </div>
+          {/* Session 30: the creation walk, wired (was a "Coming soon"
+              placeholder since S19). Needs a template, same as the CTA above. */}
+          <button onClick={handleCreateSomethingNew} disabled={!template}
+            style={{ width: '100%', boxSizing: 'border-box', marginTop: 10, background: 'none', border: `1px solid ${template ? C.gold : C.border}`, borderRadius: 10, color: template ? C.gold : C.textFaint, fontWeight: 600, fontSize: 14, padding: '12px', cursor: template ? 'pointer' : 'default' }}>
+            ✏️ Create Something New{template ? ` — build ${/^[aeiou]/i.test(TEMPLATE_MAP[template]?.name || '') ? 'an' : 'a'} ${TEMPLATE_MAP[template]?.name} step by step` : ''}
+          </button>
         </div>
       </div>
     )
@@ -8300,6 +9078,9 @@ Rules:
 function WhiteboardsTab({ user, onOpen }) {
   const [whiteboards, setWhiteboards] = useState([])
   const [loading, setLoading] = useState(true)
+  // Session 30: whiteboard id → { complete } for whiteboards holding a
+  // creation, so a walk reads as one in the list (opened the same way).
+  const [creations, setCreations] = useState({})
 
   useEffect(() => {
     if (!user) { setLoading(false); return }
@@ -8315,6 +9096,13 @@ function WhiteboardsTab({ user, onOpen }) {
           .eq('user_id', user.id).eq('status', 'active')
           .order('last_touched_at', { ascending: false })
         setWhiteboards(data || [])
+        const ids = (data || []).map(w => w.id)
+        if (ids.length > 0) {
+          const { data: cn } = await supabase.from('exploration_nodes').select('whiteboard_id, payload').eq('node_type', 'creation').in('whiteboard_id', ids)
+          const map = {}
+          for (const n of cn || []) map[n.whiteboard_id] = { complete: !!n.payload?.recipe }
+          setCreations(map)
+        }
       } catch (err) {
         console.warn('[whiteboards] load error:', err.message)
       } finally {
@@ -8343,7 +9131,10 @@ function WhiteboardsTab({ user, onOpen }) {
         <div key={wb.id} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 10 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 14, fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{wb.title}</div>
-            <div style={{ fontSize: 11, color: C.textFaint, marginTop: 2 }}>{relativeTime(wb.last_touched_at)}</div>
+            <div style={{ fontSize: 11, color: C.textFaint, marginTop: 2 }}>
+              {creations[wb.id] && <span style={{ color: C.gold, fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', marginRight: 6 }}>✏️ Creation{creations[wb.id].complete ? '' : ' · in progress'}</span>}
+              {relativeTime(wb.last_touched_at)}
+            </div>
           </div>
           <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
             <button onClick={() => onOpen(wb.id)}
@@ -8453,6 +9244,15 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
   }
 
   const buildContinueRestore = (node) => {
+    // Session 30: a creation resumes the walk itself, from its own node.
+    if (node.node_type === 'creation') {
+      const w = node.payload?.walk || {}
+      return {
+        primary_ingredients: w.seeds || [], seed_labels: w.seed_labels || w.seeds || [], template: w.template || null,
+        frozen: !!w.modifiers?.frozen, low_abv: !!w.modifiers?.lowABV, na: !!w.modifiers?.na,
+        result: null, resumeStep: 'walk', whiteboardId, creation: { whiteboardId, nodeId: node.id },
+      }
+    }
     const nodeMap = {}
     nodes.forEach(n => { nodeMap[n.id] = n })
 
@@ -8556,7 +9356,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
     }
   }
 
-  const NODE_LABELS = { ingredients: 'Ingredients', recipe_list: 'Recipes', recipe: 'Recipe', tweak: 'Tweak' }
+  const NODE_LABELS = { ingredients: 'Ingredients', recipe_list: 'Recipes', recipe: 'Recipe', tweak: 'Tweak', creation: 'Creation' }
 
   const nodeSummary = (node) => {
     if (node.node_type === 'ingredients') {
@@ -8566,6 +9366,13 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
     }
     if (node.node_type === 'recipe_list') return `${(node.payload?.recipes || []).length} recipes generated`
     if (node.node_type === 'recipe') return node.payload?.recipe?.recipe_name || 'Recipe'
+    if (node.node_type === 'creation') {
+      const r = node.payload?.recipe
+      if (r) return r.display_name || r.recipe_name
+      const w = node.payload?.walk || {}
+      const done = (w.steps || []).filter(st => st.choice).length
+      return `Building: ${(w.seed_labels || w.seeds || []).join(' + ')} · ${TEMPLATE_MAP[w.template]?.name || w.template} — ${done} of ${(w.steps || []).length} steps`
+    }
     if (node.node_type === 'tweak') {
       if (node.payload?.tweak_label) return node.payload.tweak_label
       const p = node.payload?.prompt || ''
@@ -8651,6 +9458,49 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
         />
       )
     }
+    if (node.node_type === 'creation') {
+      const w = node.payload?.walk || {}
+      const r = node.payload?.recipe
+      if (!r) return (
+        <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.6 }}>
+          {(w.steps || []).map((st, i) => (
+            <div key={i}><b>{WALK_ROLE_TITLES[st.role]}:</b> {st.choice ? (st.choice.via === 'skip' ? 'skipped' : st.choice.ingredients.map(x => x.name).join(' + ')) : <span style={{ color: C.textFaint }}>not yet</span>}</div>
+          ))}
+        </div>
+      )
+      return (
+        <RecipeCard
+          suggestion={r}
+          initialTried={!!triedMap[node.id]}
+          initialNotes={nodeNotes[node.id] ?? node.notes ?? ''}
+          showSaveButtons={false}
+          showRefineCTA={false}
+          restoreRecipeNodeId={node.id}
+          inventory={inventory}
+          inventoryTags={inventoryTags}
+          onTriedToggle={async (next, triedAt) => {
+            setTriedMap(prev => ({ ...prev, [node.id]: next }))
+            const { error } = await supabase.from('exploration_nodes').update({ tried: next, tried_at: triedAt }).eq('id', node.id)
+            if (error) {
+              setTriedMap(prev => ({ ...prev, [node.id]: !next }))
+              throw new Error(error.message || 'Could not save.')
+            }
+            supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId).then()
+          }}
+          onNotesSave={async (value) => {
+            setNodeNotes(prev => ({ ...prev, [node.id]: value }))
+            await handleSaveNotes(node.id, value)
+          }}
+          onRename={async (newName) => {
+            // The payload also carries the walk — keep it, rename only the recipe.
+            const { error } = await supabase.from('exploration_nodes')
+              .update({ payload: { ...node.payload, recipe: { ...r, display_name: newName, name_user_supplied: true } } })
+              .eq('id', node.id)
+            if (error) throw new Error(error.message || 'Could not save name.')
+          }}
+        />
+      )
+    }
     if (node.node_type === 'tweak') {
       const tried = !!triedMap[node.id]
       const hasConv = node.payload?.conversation?.length > 0
@@ -8721,7 +9571,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
     const isExpanded = expandedIds.has(node.id)
     const isRoot = !node.parent_node_id
     const children = childrenMap[node.id] || []
-    const isTried = (node.node_type === 'recipe' || node.node_type === 'tweak') && (triedMap[node.id] ?? !!node.tried)
+    const isTried = (node.node_type === 'recipe' || node.node_type === 'tweak' || node.node_type === 'creation') && (triedMap[node.id] ?? !!node.tried)
 
     return (
       <div key={node.id}>
@@ -8740,11 +9590,11 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
             {isExpanded && (
               <div style={{ marginTop: 10 }} onClick={e => e.stopPropagation()}>
                 {renderNodeDetail(node)}
-                {!isRoot && (
+                {(!isRoot || node.node_type === 'creation') && (
                   <button
                     onClick={() => onContinueFromNode(buildContinueRestore(node))}
                     style={{ marginTop: 12, background: 'none', border: `1px solid ${C.gold}`, borderRadius: 20, color: C.gold, fontSize: 12, fontWeight: 600, padding: '5px 14px', cursor: 'pointer' }}>
-                    Continue from here →
+                    {node.node_type === 'creation' && !node.payload?.recipe ? 'Continue building →' : 'Continue from here →'}
                   </button>
                 )}
               </div>
