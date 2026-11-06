@@ -6460,12 +6460,57 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
   useEffect(() => () => abortRef.current?.abort(), [])
   const t = TEMPLATE_MAP[template]
 
-  const persist = async (w, r) => {
-    const n = nodeRef.current
-    if (!user || !n?.id) return
-    const { error: err } = await supabase.from('exploration_nodes').update({ payload: { walk: w, recipe: r ?? null } }).eq('id', n.id)
-    if (err) console.warn('[creation] save failed:', err.message)
-    supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', n.whiteboardId).then()
+  // Every save writes the whole walk, so saves run one at a time and each
+  // writes the latest state: a failed one is healed by the next that lands,
+  // and an older write can never land after a newer one. A Supabase write
+  // reports failure as { error } on a resolved promise — checked, not
+  // swallowed, and shown with a retry (Session 9's lesson).
+  const [saveError, setSaveError] = useState(null)
+  const latestRef = useRef({ walk: null, recipe: null })
+  const saveChainRef = useRef(Promise.resolve())
+  const persist = (w, r) => {
+    latestRef.current = { walk: w, recipe: r ?? null }
+    if (!user) return
+    saveChainRef.current = saveChainRef.current.then(async () => {
+      const n = nodeRef.current
+      if (!n?.id) return
+      const { walk: lw, recipe: lr } = latestRef.current
+      try {
+        const { error: err } = await supabase.from('exploration_nodes').update({ payload: { walk: lw, recipe: lr } }).eq('id', n.id)
+        if (err) throw err
+        const { error: touchErr } = await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', n.whiteboardId)
+        if (touchErr) throw touchErr
+        setSaveError(null)
+      } catch (err) {
+        console.warn('[creation] save failed:', err?.message)
+        setSaveError(err?.message || 'The last change didn’t save.')
+      }
+    })
+  }
+
+  // Signed in, the walk only runs once its board and node exist. A failed
+  // node insert removes the board it just made, so In Progress never shows
+  // an empty one, and the walk stops on a visible error instead of carrying
+  // on from component state looking healthy.
+  const createRecord = async (w) => {
+    const now = new Date().toISOString()
+    const { data: wb, error: wbErr } = await supabase.from('exploration_whiteboards')
+      .insert({ user_id: user.id, title: `${seedLabels.join(' + ')} · ${t?.name || template}`, status: 'active', last_touched_at: now })
+      .select('id').single()
+    if (wbErr || !wb?.id) throw new Error(`Couldn’t save this build to In Progress${wbErr?.message ? ` (${wbErr.message})` : ''}. Nothing was started.`)
+    const { data: cn, error: nodeErr } = await supabase.from('exploration_nodes')
+      .insert({ whiteboard_id: wb.id, parent_node_id: null, node_type: 'creation', payload: { walk: w, recipe: null } })
+      .select('id').single()
+    if (nodeErr || !cn?.id) {
+      const { error: delErr } = await supabase.from('exploration_whiteboards').delete().eq('id', wb.id)
+      if (delErr) {
+        const { error: archErr } = await supabase.from('exploration_whiteboards').update({ status: 'archived' }).eq('id', wb.id)
+        if (archErr) console.warn('[creation] empty board left behind:', wb.id, archErr.message)
+      }
+      throw new Error(`Couldn’t save this build to In Progress${nodeErr?.message ? ` (${nodeErr.message})` : ''}. Nothing was started.`)
+    }
+    const n = { id: cn.id, whiteboardId: wb.id, tried: false, notes: '' }
+    setNode(n); nodeRef.current = n
   }
 
   const freshSignal = () => { abortRef.current?.abort(); abortRef.current = new AbortController(); return abortRef.current.signal }
@@ -6522,6 +6567,7 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
           if (cancelled) return
           const n = { id: data.id, whiteboardId: data.whiteboard_id, tried: !!data.tried, notes: data.notes || '' }
           setNode(n); nodeRef.current = n
+          latestRef.current = { walk: data.payload.walk, recipe: data.payload.recipe || null }
           setWalk(data.payload.walk); setRecipe(data.payload.recipe || null); setBusy(null)
           continueWalk(data.payload.walk, data.payload.recipe || null)
           return
@@ -6533,26 +6579,27 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
           steps: planWalkRoles(template, seedRoles).map(s => ({ ...s, framing: null, skip: null, options: null, choice: null })),
           status: 'in_progress', usage: usage ? [usage] : [],
         }
-        if (user) {
-          const now = new Date().toISOString()
-          const { data: wb } = await supabase.from('exploration_whiteboards')
-            .insert({ user_id: user.id, title: `${seedLabels.join(' + ')} · ${t?.name || template}`, status: 'active', last_touched_at: now })
-            .select('id').single()
-          if (wb?.id) {
-            const { data: cn, error: err } = await supabase.from('exploration_nodes')
-              .insert({ whiteboard_id: wb.id, parent_node_id: null, node_type: 'creation', payload: { walk: w, recipe: null } })
-              .select('id').single()
-            if (err) console.warn('[creation] node insert failed:', err.message)
-            if (cn?.id) { const n = { id: cn.id, whiteboardId: wb.id, tried: false, notes: '' }; setNode(n); nodeRef.current = n }
-          }
-        }
         if (cancelled) return
-        setWalk(w); setBusy(null)
-        runStep(w, 0)
+        await begin(w)
       } catch (err) {
         if (err.code === 'aborted' || cancelled) return
         setBusy(null)
         setError({ message: err.message || 'Couldn’t start.', retry: start })
+      }
+    }
+    // Retrying a failed save keeps the classified walk — no second model call.
+    const begin = async (w) => {
+      setBusy('starting'); setError(null)
+      try {
+        if (user) await createRecord(w)
+        if (cancelled) return
+        latestRef.current = { walk: w, recipe: null }
+        setWalk(w); setBusy(null)
+        runStep(w, 0)
+      } catch (err) {
+        if (cancelled) return
+        setBusy(null)
+        setError({ message: err.message, retry: () => begin(w) })
       }
     }
     start()
@@ -6620,6 +6667,13 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
     <div style={{ background: C.amber + '14', border: `1px solid ${C.amber}55`, borderRadius: 12, padding: 14, margin: '12px 0' }}>
       <div style={{ fontSize: 14, color: C.amber, marginBottom: 8 }}>{error.message}</div>
       <button onClick={error.retry} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 13, padding: '8px 14px', cursor: 'pointer' }}>Try again</button>
+    </div>
+  )
+
+  const saveErrorBox = saveError && (
+    <div style={{ background: C.red + '14', border: `1px solid ${C.red}55`, borderRadius: 12, padding: 14, margin: '12px 0' }}>
+      <div style={{ fontSize: 14, color: C.red, marginBottom: 8 }}>Not saved — a refresh would lose the latest step. ({saveError})</div>
+      <button onClick={() => persist(latestRef.current.walk, latestRef.current.recipe)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 13, padding: '8px 14px', cursor: 'pointer' }}>Retry save</button>
     </div>
   )
 
@@ -6738,6 +6792,7 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
     <div>
       <style>{`@keyframes bcpulse { 0%,100% { opacity: 0.45 } 50% { opacity: 0.9 } }`}</style>
       {header}
+      {saveErrorBox}
       {buildSoFar}
       {currentIndex >= 0 && renderStep(currentIndex)}
       {busy === 'finishing' && <div style={{ fontSize: 14, color: C.textMuted, padding: '16px 0', animation: 'bcpulse 1.4s ease-in-out infinite' }}>Setting the proportions and naming it…</div>}
@@ -6759,16 +6814,18 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
           template={walk.template}
           modifiers={walk.modifiers}
           toMake={toMake}
-          onDetailFetched={(name, patch) => { setRecipe(prev => { const merged = { ...prev, ...patch }; persist(walk, merged); return merged }) }}
+          onDetailFetched={(name, patch) => { const merged = { ...latestRef.current.recipe, ...patch }; setRecipe(merged); persist(latestRef.current.walk, merged) }}
           onRename={async (newName) => {
-            const renamed = { ...recipe, display_name: newName, name_user_supplied: true }
+            const prev = latestRef.current.recipe
+            const renamed = { ...prev, display_name: newName, name_user_supplied: true }
             setRecipe(renamed)
+            latestRef.current = { ...latestRef.current, recipe: renamed }
             if (user && node?.id) {
-              const { error: err } = await supabase.from('exploration_nodes').update({ payload: { walk, recipe: renamed } }).eq('id', node.id)
-              if (err) throw new Error(err.message || 'Could not save name.')
+              const { error: err } = await supabase.from('exploration_nodes').update({ payload: { walk: latestRef.current.walk, recipe: renamed } }).eq('id', node.id)
+              if (err) { setRecipe(prev); latestRef.current = { ...latestRef.current, recipe: prev }; throw new Error(err.message || 'Could not save name.') }
             }
           }}
-          onSaved={(name, toMakeId) => { setRecipe(prev => { const merged = { ...prev, to_make_id: toMakeId }; persist(walk, merged); return merged }) }}
+          onSaved={(name, toMakeId) => { const merged = { ...latestRef.current.recipe, to_make_id: toMakeId }; setRecipe(merged); persist(latestRef.current.walk, merged) }}
         />
       )}
     </div>
