@@ -3327,7 +3327,10 @@ function describeWalkBuild(walk, uptoIndex) {
     const how = c.via === 'proposal' ? `the user's own proposal${c.verdict === 'clashes' ? ', kept over your objection' : ''}` : 'chosen from your options'
     return `${i + 1}. ${WALK_ROLE_TITLES[s.role]}: ${names} (${how})${c.reason ? ` — ${c.reason}` : ''}`
   })
-  const upcoming = walk.steps.slice(uptoIndex + 1).map(s => `${WALK_ROLE_TITLES[s.role].toLowerCase()}${s.optional ? ' (optional)' : ''}`)
+  // Session 31: after a go-back, steps past this one can already be decided —
+  // listed as kept, so the options are reasoned against them. In the forward
+  // walk nothing later is ever decided, so this reads exactly as before.
+  const upcoming = walk.steps.slice(uptoIndex + 1).map(s => `${WALK_ROLE_TITLES[s.role].toLowerCase()}${s.optional ? ' (optional)' : ''}${s.choice ? ` — already decided and kept: ${s.choice.via === 'skip' ? 'skipped' : s.choice.ingredients.map(x => x.name).join(' + ')}` : ''}`)
   const notes = walk.steps.slice(0, uptoIndex).map(s => s.choice?.reference).filter(Boolean)
   return [
     `BUILD SO FAR:\n${lines.length ? lines.join('\n') : '(nothing decided yet)'}`,
@@ -3514,6 +3517,16 @@ async function finishWalk(walk, inventoryText, { signal } = {}) {
   const t = TEMPLATE_MAP[walk.template]
   const skipped = walk.steps.filter(s => s.choice?.via === 'skip')
   const notes = walk.steps.map((s, i) => s.choice?.reference ? `- at step ${i + 1} (${WALK_ROLE_TITLES[s.role]}): ${s.choice.reference}` : null).filter(Boolean)
+  // Session 31: a re-finish after going back. What they reported from MAKING
+  // an earlier version is evidence the new proportions must answer; the
+  // earlier name carries over unless the change makes it wrong. Absent on a
+  // first finish, so the forward walk's prompt is unchanged.
+  const tasted = (walk.consults || []).filter(c => c.tasted && c.messages?.[0]?.content)
+  const prev = (walk.previous_recipes || []).at(-1)
+  const revision = [
+    prev ? `THIS IS A REVISION of "${prev.display_name || prev.recipe_name}" (${(prev.recipe || []).map(x => `${x.amount} ${x.ingredient}`).join(', ')}). They went back and changed decisions since. Keep that name unless the changes make it wrong.` : null,
+    tasted.length ? `THEY MADE AND TASTED EARLIER VERSIONS. What they reported is evidence — their palate, their pour, their bottles. The amounts this time must answer it:\n${tasted.map(c => `- "${c.recipe_name}" (${(c.recipe_lines || []).join(', ')}): "${c.messages[0].content}"`).join('\n')}` : null,
+  ].filter(Boolean).join('\n\n')
   const prompt = `You are an expert craft bartender. Someone just built a new ${t.name} with you, one role at a time. Finish it.
 
 ${buildTemplateContext(walk.template, walk.modifiers || {})}
@@ -3521,7 +3534,7 @@ ${buildTemplateContext(walk.template, walk.modifiers || {})}
 STARTED FROM: ${walk.seeds.join(' + ')}
 
 ${describeWalkBuild(walk, walk.steps.length)}
-
+${revision ? `\n${revision}\n` : ''}
 1. THE RECIPE. Use exactly the ingredients chosen above, each in its role${skipped.length ? `; the skipped role${skipped.length > 1 ? 's stay' : ' stays'} out` : ''}. You may add a garnish (role "garnish") and nothing else. Set every amount, with the whole drink in view — this is where the proportions get decided. "summary": one line, flavor and character only.
 
 2. IS IT A KNOWN DRINK? Look at the finished build. If it IS a documented drink — that drink itself, ingredient for ingredient, give or take the specific bottles — say so plainly: "kind": "is_known", "drink" its name, and origin "published"; "note" is only how this build departs from the documented one (a different syrup, a different split), or null — the app already says which drink it is. Don't call a known drink a relative.
@@ -3559,7 +3572,12 @@ Return ONLY valid JSON, no markdown fences:
     summary: data.summary || null,
     recipe: data.recipe.filter(x => x?.ingredient).map(x => ({ ingredient: x.ingredient, amount: x.amount || '', role: RECIPE_ROLES.includes(x.role) ? x.role : null })),
     can_make_now: null,
-    creation: {
+    // Session 31: `__`-prefixed so stripInternalFields keeps it out of every
+    // prompt the recipe is sent in. As plain `creation` it went to Refine as
+    // part of "the same JSON structure", got echoed back, and ran Refine's
+    // 1500-token reply out (measured: 1480-1500 tokens with S30's block, a
+    // hard failure once revisions were added). Read through creationOf().
+    __creation: {
       template: walk.template,
       seeds: walk.seeds,
       build_story: walk.steps.filter(s => s.choice).map(s => ({ role: s.role, ingredients: s.choice.via === 'skip' ? [] : s.choice.ingredients.map(x => x.name), via: s.choice.via, reason: s.choice.reason || null, verdict: s.choice.verdict || null })),
@@ -3569,9 +3587,104 @@ Return ONLY valid JSON, no markdown fences:
       relative: { kind, drink: kind === 'none' ? null : (data.relative?.drink || null), note: kind === 'none' && /precedent|unprecedented|undocumented|uncharted|never been|first of its kind|new to the world/i.test(data.relative?.note || '') ? null : (data.relative?.note || null) },
       trajectory: typeof data.trajectory === 'string' && data.trajectory.trim() ? data.trajectory.trim() : null,
       notes_check: Array.isArray(data.notes_check) ? data.notes_check : [],
+      revisions: (walk.history || []).length ? walk.history : undefined,
     },
   }
-  return { recipe, usage: walkUsage('finish', r) }
+  return { recipe, usage: walkUsage(prev ? 'refinish' : 'finish', r) }
+}
+
+// ─── Session 31: going back, and what happened when it was made ─────────────
+//
+// Two kinds of looking back, kept apart on purpose:
+// - reevaluateWalk: a DECISION changed. Structural — re-judge every other
+//   decision against it and flag only what no longer fits. Nothing is
+//   discarded; the user decides what to change next.
+// - consultOnCreation: they're talking about how the finished drink tastes.
+//   Whether they have MADE it (node.tried) decides how their words are read:
+//   after tasting it's evidence, taken as fact; before, it's a prediction the
+//   model may disagree with. Phase 2's in-walk proposals are pre-tasting by
+//   definition and stay in evaluateWalkProposal, untouched.
+
+// Every step, decided or not, numbered as the model refers to them.
+function describeWalkSteps(walk, { changedIndex = null, from = null } = {}) {
+  return walk.steps.map((s, i) => {
+    const c = s.choice
+    const what = !c ? '(not decided yet)' : c.via === 'skip' ? 'skipped' : c.ingredients.map(x => x.name).join(' + ')
+    const why = c?.reason ? ` — chosen because: ${c.reason}` : ''
+    const changed = i === changedIndex ? `  ← JUST CHANGED, was: ${from}` : ''
+    return `${i + 1}. ${WALK_ROLE_TITLES[s.role]}${s.optional ? ' (optional)' : ''}: ${what}${changed ? '' : why}${changed}`
+  }).join('\n')
+}
+const walkChoiceLabel = c => !c ? 'nothing' : c.via === 'skip' ? 'skipped' : c.ingredients.map(x => x.name).join(' + ')
+
+function normalizeWalkFlags(raw, walk, { exclude = null, decidedOnly = true } = {}) {
+  const seen = new Set()
+  return (Array.isArray(raw) ? raw : []).map(f => {
+    const i = Number(f?.step) - 1
+    if (!Number.isInteger(i) || i < 0 || i >= walk.steps.length || i === exclude || seen.has(i)) return null
+    if (decidedOnly && !walk.steps[i].choice) return null
+    const reason = typeof f?.reason === 'string' ? f.reason.trim() : ''
+    if (!reason) return null
+    seen.add(i)
+    return { index: i, reason, kind: f?.kind === 'amount' ? 'amount' : 'ingredient' }
+  }).filter(Boolean)
+}
+
+async function reevaluateWalk(walk, changedIndex, from, inventoryText, { signal } = {}) {
+  const t = TEMPLATE_MAP[walk.template]
+  const step = walk.steps[changedIndex]
+  const prompt = `You are an expert craft bartender. You've been building a new ${t.name} with someone, one role at a time. They just went back and changed an earlier decision. Nothing has been made or tasted yet.
+
+${buildTemplateContext(walk.template, walk.modifiers || {})}
+
+STARTED FROM: ${walk.seeds.join(' + ')}
+
+THE BUILD NOW:
+${describeWalkSteps(walk, { changedIndex, from })}
+
+THE CHANGE: step ${changedIndex + 1} (${WALK_ROLE_TITLES[step.role]}) was ${from}; it is now ${walkChoiceLabel(step.choice)}.
+
+Everything else they chose is KEPT — nothing gets thrown out on their behalf. Your job is to say which of the OTHER decided steps no longer fit because of this change, if any.
+- The test for every other step: with the build as it is NOW, would you tell them to change that step before making the drink? Flag it only if yes — the two would fight in the glass, the drink would come out clearly unbalanced, or a skipped optional role's job is now undone (the sweet element that made the sugar unnecessary is gone). Name both sides of the conflict — "the allspice dram was there to echo the rum's funk; against gin it fights the juniper" — in at most 25 words.
+- NOT a conflict: a step whose stated reason mentions the old pick but still works with the new one; a pick that would merely taste different now; one you'd have chosen differently from the start; a pairing that's standard in well-known drinks; the drink simply getting a little sweeter, drier or softer than before, when it's still in balance for a ${t.name}. Most changes leave most of a build fine. When nothing conflicts, say so in the summary and flag nothing — an invented problem is worse than none.
+- Never flag the changed step itself, or a step that isn't decided yet.
+
+"summary": one or two sentences on what the change does to this drink — its balance and character. Don't name or compare it to specific drinks here; what it resembles is judged once, at the finish.
+
+Return ONLY valid JSON, no markdown fences:
+{"summary": "string", "conflicts": [{"step": 1, "reason": "string"}]}`
+  const r = await callClaudeStream({ model: MODEL, max_tokens: 500, messages: [{ role: 'user', content: [walkInventoryBlock(inventoryText), { type: 'text', text: prompt }] }] }, { signal })
+  const data = extractJSON(r.text)
+  if (!data || typeof data.summary !== 'string') throw new Error('The re-check came back incomplete.')
+  return { summary: data.summary.trim(), conflicts: normalizeWalkFlags(data.conflicts, walk, { exclude: changedIndex }), usage: walkUsage('re-evaluate', r) }
+}
+
+async function consultOnCreation(walk, recipe, messages, inventoryText, { tasted, signal } = {}) {
+  const t = TEMPLATE_MAP[walk.template]
+  const stance = tasted
+    ? `They have MADE this drink and tasted it. What they tell you about how it tasted is EVIDENCE — their palate, their pour, their bottles. Take it as fact. Don't question it, don't ask whether they measured right, don't defend the build or explain why it should have tasted otherwise. Your job is the diagnosis: from the recipe, what most likely caused what they tasted, and which step or steps it comes from. When the ingredient was right and the problem is how much of it, say so — "kind": "amount" — the amounts are re-set when the drink is re-finished; when it's the choice itself, "kind": "ingredient".`
+    : `They have NOT made this drink yet. What they say about how it will taste is a PREDICTION — a guess, not evidence; yours is a judgment, and neither side wins by default. Work it out from the recipe first — the actual amounts of what sweetens, what's sour, what's strong, set against what a balanced ${t.name} carries — then decide. If they're right, agree, say why, and point at the step responsible; a correct worry deserves agreement, not a defence of the build. If the recipe says otherwise, disagree plainly and say why in terms of this recipe ("the rye's proof will carry the vermouth further than you'd expect"), and flag nothing. Hold your position across their reply unless they give you a real reason — not just because they said it again. ${REFINE_PUSHBACK}`
+  const system = `You are an expert craft bartender. You built this ${t.name} with them one role at a time. ${REFINE_VOICE} Max 2 sentences per reply.
+
+${stance}
+
+${buildTemplateContext(walk.template, walk.modifiers || {})}
+
+THE RECIPE — ${recipe.display_name || recipe.recipe_name}:
+${(recipe.recipe || []).map(x => `- ${x.amount} ${x.ingredient}${x.role ? ` (${x.role})` : ''}`).join('\n')}${recipe.instructions ? `\nMethod: ${recipe.instructions}` : ''}
+
+THE STEPS IT WAS BUILT FROM (refer to these numbers):
+${describeWalkSteps(walk)}
+
+Reply ONLY with JSON, no markdown fences:
+{${tasted ? '' : '"assessment": "the balance worked out from the amounts — max 25 words", "verdict": "agree | disagree", '}"reply": "max 2 sentences", "slots": [{"step": 1, "kind": "ingredient | amount", "reason": "max 20 words — what this step has to do with it"}]}
+"slots": the steps responsible${tasted ? '' : ' — only when you agree; empty when you disagree'}.`
+  const r = await callClaudeStream({ model: MODEL, max_tokens: 400, system: [walkInventoryBlock(inventoryText), { type: 'text', text: system }], messages }, { signal })
+  const data = extractJSON(r.text)
+  if (!data?.reply) throw new Error('That didn’t come back.')
+  const verdict = tasted ? null : (data.verdict === 'disagree' ? 'disagree' : 'agree')
+  const slots = verdict === 'disagree' ? [] : normalizeWalkFlags(data.slots, walk)
+  return { reply: data.reply, verdict, slots, usage: walkUsage(tasted ? 'tasting diagnosis' : 'prediction', r) }
 }
 
 // ─── Shared small components ──────────────────────────────────────────────────
@@ -5719,6 +5832,16 @@ function TweakModal({ suggestion, user, whiteboardId, recipeNodeId, inventoryTex
 
 // Session 30: the build story under a finished creation (RecipeCard, and so
 // the whiteboard and the walk's own last screen).
+// The walk's lineage on a finished recipe. S30 stored it as `creation`;
+// it's `__creation` since S31 (see finishWalk). Both are read; the legacy
+// key is moved over on load so it stops reaching prompts.
+const creationOf = r => r?.__creation || r?.creation || null
+function withInternalCreation(r) {
+  if (!r?.creation || r.__creation) return r
+  const { creation, ...rest } = r
+  return { ...rest, __creation: creation }
+}
+
 function CreationLineage({ creation }) {
   const [open, setOpen] = useState(false)
   const rel = creation.relative || {}
@@ -5746,6 +5869,11 @@ function CreationLineage({ creation }) {
             </li>
           ))}
         </ol>
+      )}
+      {open && creation.revisions?.length > 0 && (
+        <div style={{ marginTop: 6 }}>
+          Went back {creation.revisions.length === 1 ? 'once' : `${creation.revisions.length} times`}: {creation.revisions.map(r => `${(WALK_ROLE_TITLES[r.role] || r.role).toLowerCase()} ${r.from} → ${r.to}`).join('; ')}
+        </div>
       )}
     </div>
   )
@@ -6167,7 +6295,7 @@ function RecipeCard({
           and the reasoned choice at each step — not parent-plus-swaps. The
           relative line was asked once, at the end, with the whole build in
           view; the trajectory says when an early resemblance didn't last. */}
-      {displayed.creation && <CreationLineage creation={displayed.creation} />}
+      {creationOf(displayed) && <CreationLineage creation={creationOf(displayed)} />}
 
       {showSaveButtons && <AttributionDisplay recipe={{ ...displayed, attributionSource: displayed.attribution_source }} />}
 
@@ -6448,16 +6576,25 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
   const [recipe, setRecipe] = useState(null)
   const [node, setNode] = useState(null) // { id, whiteboardId, tried, notes }
   const [live, setLive] = useState(null) // streaming step: { index, framing, options }
-  const [busy, setBusy] = useState(null) // 'starting' | 'step' | 'finishing' | null
+  const [busy, setBusy] = useState(null) // 'starting' | 'step' | 'finishing' | 'reeval' | null
   const [error, setError] = useState(null) // { message, retry }
   const [proposal, setProposal] = useState('')
   const [conv, setConv] = useState({ index: null, messages: [], result: null, loading: false, error: null })
   const [affinities, setAffinities] = useState([])
   const [affinitiesOpen, setAffinitiesOpen] = useState(false)
-  const abortRef = useRef(null)
+  // Session 31: going back. `editing` is the decided step reopened for a
+  // change (jump-to-slot); `tried` mirrors the node's Tried flag, which is
+  // what decides how anything said about the finished drink is read.
+  const [editing, setEditing] = useState(null)
+  const [tried, setTried] = useState(false)
+  const [consult, setConsult] = useState({ messages: [], loading: false, error: null, tasted: null })
+  const [consultText, setConsultText] = useState('')
+  const triedRef = useRef(false)
+  useEffect(() => { triedRef.current = tried }, [tried])
+  const abortRef = useRef({})
   const nodeRef = useRef(null)
   useEffect(() => { nodeRef.current = node }, [node])
-  useEffect(() => () => abortRef.current?.abort(), [])
+  useEffect(() => () => Object.values(abortRef.current).forEach(c => c?.abort()), [])
   const t = TEMPLATE_MAP[template]
 
   // Every save writes the whole walk, so saves run one at a time and each
@@ -6468,10 +6605,14 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
   const [saveError, setSaveError] = useState(null)
   const latestRef = useRef({ walk: null, recipe: null })
   const saveChainRef = useRef(Promise.resolve())
+  // Every write to this node — the payload, Tried, notes — goes through one
+  // chain, so nothing lands out of order. The returned promise rejects on a
+  // failed write for callers that surface it themselves.
+  const queueSave = (fn) => { const p = saveChainRef.current.then(fn); saveChainRef.current = p.catch(() => {}); return p }
   const persist = (w, r) => {
     latestRef.current = { walk: w, recipe: r ?? null }
     if (!user) return
-    saveChainRef.current = saveChainRef.current.then(async () => {
+    queueSave(async () => {
       const n = nodeRef.current
       if (!n?.id) return
       const { walk: lw, recipe: lr } = latestRef.current
@@ -6486,6 +6627,32 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
         setSaveError(err?.message || 'The last change didn’t save.')
       }
     })
+  }
+
+  // Tried and notes on the creation node: checked writes through the same
+  // chain; a failure throws so RecipeCard rolls the checkbox back and shows it.
+  const saveTried = async (next, triedAt) => {
+    const n = nodeRef.current
+    if (user && n?.id) {
+      await queueSave(async () => {
+        const { error: err } = await supabase.from('exploration_nodes').update({ tried: next, tried_at: triedAt }).eq('id', n.id)
+        if (err) throw new Error(err.message || 'Could not save.')
+        const { error: touchErr } = await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', n.whiteboardId)
+        if (touchErr) throw new Error(touchErr.message || 'Could not save.')
+      })
+      const updated = { ...nodeRef.current, tried: next }; nodeRef.current = updated; setNode(updated)
+    }
+    setTried(next)
+    setConsult({ messages: [], loading: false, error: null, tasted: null })
+  }
+  const saveNotes = async (value) => {
+    const n = nodeRef.current
+    if (!user || !n?.id) return
+    await queueSave(async () => {
+      const { error: err } = await supabase.from('exploration_nodes').update({ notes: value }).eq('id', n.id)
+      if (err) throw new Error(err.message || 'Could not save note.')
+    })
+    const updated = { ...nodeRef.current, notes: value }; nodeRef.current = updated; setNode(updated)
   }
 
   // Signed in, the walk only runs once its board and node exist. A failed
@@ -6513,18 +6680,20 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
     setNode(n); nodeRef.current = n
   }
 
-  const freshSignal = () => { abortRef.current?.abort(); abortRef.current = new AbortController(); return abortRef.current.signal }
+  // One in-flight call per lane: a new step aborts the last step, but a
+  // re-check or a tasting question runs in its own lane and isn't cut off.
+  const freshSignal = (lane = 'main') => { abortRef.current[lane]?.abort(); abortRef.current[lane] = new AbortController(); return abortRef.current[lane].signal }
 
   const runStep = async (w, index) => {
     setBusy('step'); setError(null)
     setLive({ index, framing: null, options: [] })
     try {
       const res = await analyzeWalkStep(w, index, inventoryText, { signal: freshSignal(), onPartial: p => setLive({ index, ...p }) })
-      const steps = w.steps.map((s, i) => i === index ? { ...s, framing: res.framing, skip: res.skip, options: res.options } : s)
+      const steps = w.steps.map((s, i) => i === index ? { ...s, framing: res.framing, skip: res.skip, options: res.options, options_stale: false } : s)
       const next = { ...w, steps, usage: [...(w.usage || []), res.usage] }
       if (DIAG_ON) console.log(`[DIAG:creation-step] ${JSON.stringify(res.usage)}`)
       setWalk(next); setLive(null); setBusy(null)
-      persist(next, null)
+      persist(next, latestRef.current.recipe)
     } catch (err) {
       if (err.code === 'aborted') return
       setLive(null); setBusy(null)
@@ -6532,13 +6701,27 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
     }
   }
 
+  // A re-finish (after going back) keeps the earlier recipe in
+  // previous_recipes — nothing replaced is lost — carries a name the user
+  // gave it, and clears Tried: the drink now in the card hasn't been made.
+  // What they reported tasting the earlier one stays in walk.consults.
   const runFinish = async (w) => {
     setBusy('finishing'); setError(null)
     try {
-      const { recipe: r, usage } = await finishWalk(w, inventoryText, { signal: freshSignal() })
-      const next = { ...w, status: 'complete', usage: [...(w.usage || []), usage] }
+      const prevRecipe = latestRef.current.recipe
+      const base = prevRecipe ? { ...w, previous_recipes: [...(w.previous_recipes || []), prevRecipe] } : w
+      const { recipe: fresh, usage } = await finishWalk(base, inventoryText, { signal: freshSignal() })
+      const r = prevRecipe?.name_user_supplied && prevRecipe.display_name ? { ...fresh, display_name: prevRecipe.display_name, name_user_supplied: true } : fresh
+      // A flag about HOW MUCH is answered by the re-finish itself — the
+      // amounts are set again. A flag about WHAT stays until it's changed or kept.
+      const steps = prevRecipe ? base.steps.map(s => s.flag?.kind === 'amount' ? { ...s, flag: null } : s) : base.steps
+      const next = { ...base, steps, status: 'complete', changed_since_finish: false, usage: [...(base.usage || []), usage] }
       if (DIAG_ON) console.log(`[DIAG:creation-finish] ${JSON.stringify(usage)} total_output_tokens=${next.usage.reduce((a, u) => a + (u?.output_tokens || 0), 0)}`)
+      if (prevRecipe && triedRef.current) {
+        try { await saveTried(false, null) } catch (e) { setSaveError(`Couldn’t clear Tried for the new version (${e.message}).`) }
+      }
       setWalk(next); setRecipe(r); setBusy(null)
+      setConsult({ messages: [], loading: false, error: null, tasted: null })
       persist(next, r)
     } catch (err) {
       if (err.code === 'aborted') return
@@ -6566,10 +6749,11 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
           if (err || !data?.payload?.walk) throw new Error(err?.message || 'This creation couldn’t be loaded.')
           if (cancelled) return
           const n = { id: data.id, whiteboardId: data.whiteboard_id, tried: !!data.tried, notes: data.notes || '' }
-          setNode(n); nodeRef.current = n
-          latestRef.current = { walk: data.payload.walk, recipe: data.payload.recipe || null }
-          setWalk(data.payload.walk); setRecipe(data.payload.recipe || null); setBusy(null)
-          continueWalk(data.payload.walk, data.payload.recipe || null)
+          setNode(n); nodeRef.current = n; setTried(n.tried)
+          const loaded = withInternalCreation(data.payload.recipe) || null
+          latestRef.current = { walk: data.payload.walk, recipe: loaded }
+          setWalk(data.payload.walk); setRecipe(loaded); setBusy(null)
+          continueWalk(data.payload.walk, loaded)
           return
         }
         const { seedRoles, usage } = await classifyWalkSeeds(seeds, template, inventory, inventoryTags, { signal: freshSignal() })
@@ -6617,13 +6801,131 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
   }, [affinityKey])
 
   const choose = (index, choice) => {
+    if (walk.steps[index].choice) return changeDecision(index, choice)
     const steps = walk.steps.map((s, i) => i === index ? { ...s, choice } : s)
     const next = { ...walk, steps }
     setWalk(next)
     setProposal(''); setConv({ index: null, messages: [], result: null, loading: false, error: null })
-    persist(next, null)
+    persist(next, latestRef.current.recipe)
     if (index + 1 < next.steps.length) runStep(next, index + 1)
     else runFinish(next)
+  }
+
+  // ── Session 31, Change 1: go back to a fork ──
+  // Reopen a decided step. Its options are regenerated only when something
+  // before it changed since they were made (options_stale) — they're reasoned
+  // from the steps before, with everything after listed as kept.
+  const resetConv = () => { setProposal(''); setConv({ index: null, messages: [], result: null, loading: false, error: null }) }
+  const openEdit = (index) => {
+    resetConv(); setEditing(index)
+    const w = latestRef.current.walk
+    const s = w.steps[index]
+    if (!s.options || s.options_stale) runStep(w, index)
+  }
+  const cancelEdit = () => {
+    resetConv(); setEditing(null)
+    const w = latestRef.current.walk
+    const i = w.steps.findIndex(s => !s.choice)
+    if (i >= 0 && !w.steps[i].options && !busy) runStep(w, i)
+  }
+
+  // A changed decision KEEPS everything else — a re-evaluation, not a
+  // rewind. The model then flags what no longer fits; the user decides what
+  // to change next. Later steps' options go stale (they were reasoned from
+  // the old pick); a finished drink is marked as behind its build until the
+  // user re-finishes it.
+  const changeDecision = async (index, choice) => {
+    const base = latestRef.current.walk
+    const prev = base.steps[index].choice
+    resetConv(); setEditing(null)
+    if (prev?.via === choice.via && walkChoiceLabel(prev) === walkChoiceLabel(choice)) return
+    const from = walkChoiceLabel(prev)
+    const at = new Date().toISOString()
+    const steps = base.steps.map((s, i) => {
+      if (i === index) return { ...s, choice, flag: null }
+      let n = s.flag?.source === 'change' ? { ...s, flag: null } : s
+      if (i > index && n.options) n = n.choice ? { ...n, options_stale: true } : { ...n, options: null, framing: null, skip: null }
+      return n
+    })
+    const change = { at, step: index, role: base.steps[index].role, from, to: walkChoiceLabel(choice), summary: null, conflicts: null }
+    const next = {
+      ...base, steps,
+      history: [...(base.history || []), { at, step: index, role: change.role, from, to: change.to }],
+      last_change: change,
+      changed_since_finish: !!latestRef.current.recipe || !!base.changed_since_finish,
+    }
+    setWalk(next); persist(next, latestRef.current.recipe)
+    if (next.steps.some((s, i) => i !== index && s.choice)) await runReevaluate(next, index, from)
+    // Mid-walk, carry on where the walk was — its next step's options are
+    // regenerated against the changed build.
+    const cur = latestRef.current.walk
+    const i = cur.steps.findIndex(s => !s.choice)
+    if (i >= 0 && !cur.steps[i].options) runStep(cur, i)
+  }
+
+  const runReevaluate = async (w, index, from) => {
+    setBusy('reeval'); setError(null)
+    try {
+      const res = await reevaluateWalk(w, index, from, inventoryText, { signal: freshSignal('reeval') })
+      const cur = latestRef.current.walk
+      const flagged = new Map(res.conflicts.map(c => [c.index, c]))
+      const at = new Date().toISOString()
+      const steps = cur.steps.map((s, i) => flagged.has(i) ? { ...s, flag: { source: 'change', reason: flagged.get(i).reason, from_step: index, at } } : s)
+      const next = { ...cur, steps, last_change: { ...cur.last_change, summary: res.summary, conflicts: res.conflicts.map(c => c.index) }, usage: [...(cur.usage || []), res.usage] }
+      if (DIAG_ON) console.log(`[DIAG:creation-reeval] ${JSON.stringify(res.usage)} conflicts=${res.conflicts.length}`)
+      setWalk(next); setBusy(null)
+      persist(next, latestRef.current.recipe)
+    } catch (err) {
+      if (err.code === 'aborted') return
+      setBusy(null)
+      setError({ message: `Your change is kept, but the re-check of the rest didn’t come back (${err.message || 'no response'}).`, retry: () => runReevaluate(latestRef.current.walk, index, from) })
+    }
+  }
+
+  // "Keep it": the user overrules a flag. Nothing else about the step changes.
+  const dismissFlag = (index) => {
+    const cur = latestRef.current.walk
+    const next = { ...cur, steps: cur.steps.map((s, i) => i === index ? { ...s, flag: null } : s) }
+    setWalk(next); persist(next, latestRef.current.recipe)
+  }
+
+  // ── Session 31, Change 2: what happened when they made it ──
+  // Same box before and after making it; the Tried flag decides which kind
+  // of feedback it is — evidence after, a prediction before (see
+  // consultOnCreation). Two exchanges, like Refine. Responsible steps come
+  // back flagged in the build, and jump-to-slot takes it from there.
+  const sendConsult = async (text) => {
+    const content = text.trim()
+    const r = latestRef.current.recipe
+    if (!content || consult.loading || !r) return
+    const tasted = !!tried
+    const prior = consult.tasted === tasted ? consult.messages : []
+    const messages = [...prior, { role: 'user', content }]
+    setConsult({ messages, loading: true, error: null, tasted }); setConsultText('')
+    try {
+      const res = await consultOnCreation(latestRef.current.walk, r, messages, inventoryText, { tasted, signal: freshSignal('consult') })
+      const withReply = [...messages, { role: 'assistant', content: JSON.stringify({ verdict: res.verdict, reply: res.reply }), display: res.reply, verdict: res.verdict }]
+      const cur = latestRef.current.walk
+      const at = new Date().toISOString()
+      const flagged = new Map(res.slots.map(x => [x.index, x]))
+      const steps = cur.steps.map((s, i) => flagged.has(i) ? { ...s, flag: { source: tasted ? 'tasting' : 'prediction', reason: flagged.get(i).reason, kind: flagged.get(i).kind, at } } : s)
+      const entry = {
+        at, tasted, recipe_name: r.display_name || r.recipe_name, recipe_version: (cur.previous_recipes || []).length,
+        recipe_lines: (r.recipe || []).map(x => `${x.amount} ${x.ingredient}`),
+        messages: withReply.map(m => ({ role: m.role, content: m.display ?? m.content, ...(m.verdict ? { verdict: m.verdict } : {}) })),
+        slots: res.slots.map(x => ({ step: x.index, kind: x.kind, reason: x.reason })),
+      }
+      // One entry per conversation: a follow-up replaces its own first entry.
+      const consults = prior.length ? [...(cur.consults || []).slice(0, -1), entry] : [...(cur.consults || []), entry]
+      const next = { ...cur, steps, consults, usage: [...(cur.usage || []), res.usage] }
+      if (DIAG_ON) console.log(`[DIAG:creation-${tasted ? 'tasting' : 'prediction'}] ${JSON.stringify(res.usage)} slots=${res.slots.length}`)
+      setWalk(next); persist(next, r)
+      setConsult({ messages: withReply, loading: false, error: null, tasted })
+    } catch (err) {
+      if (err.code === 'aborted') return
+      setConsult(c => ({ ...c, messages: prior, loading: false, error: err.message || 'That didn’t come back.' }))
+      setConsultText(content)
+    }
   }
 
   const sendProposal = async (index, text) => {
@@ -6672,7 +6974,7 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
 
   const saveErrorBox = saveError && (
     <div style={{ background: C.red + '14', border: `1px solid ${C.red}55`, borderRadius: 12, padding: 14, margin: '12px 0' }}>
-      <div style={{ fontSize: 14, color: C.red, marginBottom: 8 }}>Not saved — a refresh would lose the latest step. ({saveError})</div>
+      <div style={{ fontSize: 14, color: C.red, marginBottom: 8 }}>Not saved — a refresh would lose the latest change. ({saveError})</div>
       <button onClick={() => persist(latestRef.current.walk, latestRef.current.recipe)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 13, padding: '8px 14px', cursor: 'pointer' }}>Retry save</button>
     </div>
   )
@@ -6690,17 +6992,53 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
   const currentIndex = walk.steps.findIndex(s => !s.choice)
   const decided = walk.steps.filter(s => s.choice)
 
+  // Session 31: anything that would interrupt a call in flight blocks a change.
+  const locked = !!busy || conv.loading || consult.loading
+  const FLAG_SOURCE = { change: 'After your change', tasting: 'From your tasting', prediction: 'From your concern' }
+  const flaggedCount = walk.steps.filter(s => s.choice && s.flag).length
+  const smallBtn = (active) => ({ background: 'none', border: `1px solid ${active ? C.gold : C.border}`, borderRadius: 14, color: active ? C.gold : C.textMuted, fontSize: 11, fontWeight: 600, padding: '3px 10px', cursor: locked ? 'default' : 'pointer', opacity: locked ? 0.5 : 1 })
+
   const buildSoFar = decided.length > 0 && (
     <div style={{ borderLeft: `2px solid ${C.gold}55`, paddingLeft: 12, margin: '14px 0 18px' }}>
       {walk.steps.map((s, i) => s.choice && (
-        <div key={i} style={{ marginBottom: 8 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: C.textFaint }}>{WALK_ROLE_TITLES[s.role]}</div>
+        <div key={i} style={{ marginBottom: 8, ...(editing === i ? { background: C.gold + '10', borderRadius: 8, padding: '4px 8px', marginLeft: -8 } : {}) }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: C.textFaint }}>{WALK_ROLE_TITLES[s.role]}</div>
+            {editing !== i && <button disabled={locked || editing != null} onClick={() => openEdit(i)} style={{ ...smallBtn(!!s.flag), opacity: locked || editing != null ? 0.5 : 1 }}>Change</button>}
+          </div>
           <div style={{ fontSize: 14, color: s.choice.via === 'skip' ? C.textFaint : C.text }}>
             {s.choice.via === 'skip' ? 'Skipped' : s.choice.ingredients.map(x => x.name).join(' + ')}
             {s.choice.via === 'proposal' && <span style={{ fontSize: 11, color: C.textFaint, marginLeft: 6 }}>your call{s.choice.verdict === 'clashes' ? ' — over my objection' : ''}</span>}
           </div>
+          {s.flag && (
+            <div style={{ background: C.amber + '12', border: `1px solid ${C.amber}44`, borderRadius: 8, padding: '8px 10px', marginTop: 6 }}>
+              <div style={{ fontSize: 13, color: C.amber, lineHeight: 1.45 }}>
+                <b>{FLAG_SOURCE[s.flag.source] || 'Flagged'}:</b> {s.flag.reason}{s.flag.kind === 'amount' ? ' (how much, not what — re-finishing resets the amounts)' : ''}
+              </div>
+              {editing !== i && (
+                <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+                  <button disabled={locked || editing != null} onClick={() => openEdit(i)} style={smallBtn(true)}>Change it →</button>
+                  <button disabled={locked} onClick={() => dismissFlag(i)} style={smallBtn(false)}>Keep it</button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       ))}
+    </div>
+  )
+
+  const lc = walk.last_change
+  const changeBox = lc && (
+    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 12, margin: '0 0 14px' }}>
+      <div style={{ fontSize: 13, color: C.text, marginBottom: 4 }}>Changed {WALK_ROLE_TITLES[lc.role]?.toLowerCase()}: <span style={{ color: C.textFaint, textDecoration: 'line-through' }}>{lc.from}</span> → <b>{lc.to}</b>. Everything else is kept.</div>
+      {busy === 'reeval' && <div style={{ fontSize: 13, color: C.textMuted, animation: 'bcpulse 1.4s ease-in-out infinite' }}>Re-checking the rest of the build against it…</div>}
+      {lc.summary && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5 }}>{lc.summary}</div>}
+      {lc.summary && Array.isArray(lc.conflicts) && (
+        <div style={{ fontSize: 13, color: lc.conflicts.length ? C.amber : C.green, marginTop: 4 }}>
+          {lc.conflicts.length === 0 ? 'Nothing else in the build conflicts with it.' : `${lc.conflicts.length === 1 ? 'One step no longer fits' : `${lc.conflicts.length} steps no longer fit`} — flagged above.`}
+        </div>
+      )}
     </div>
   )
 
@@ -6717,8 +7055,14 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
     return (
       <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16 }}>
         <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textFaint, marginBottom: 4 }}>
-          Step {index + 1} of {total} · {WALK_ROLE_TITLES[step.role]}{step.optional ? ' · optional' : ''}
+          {editing === index ? 'Changing step' : 'Step'} {index + 1} of {total} · {WALK_ROLE_TITLES[step.role]}{step.optional ? ' · optional' : ''}
         </div>
+        {editing === index && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 8 }}>
+            <div style={{ fontSize: 13, color: C.textMuted }}>Now: <b style={{ color: C.text }}>{walkChoiceLabel(step.choice)}</b>. Pick another and the rest of the build is kept and re-checked against it.</div>
+            <button disabled={busy === 'step' || conv.loading} onClick={cancelEdit} style={{ ...smallBtn(false), cursor: 'pointer', opacity: busy === 'step' || conv.loading ? 0.5 : 1, flexShrink: 0 }}>Cancel</button>
+          </div>
+        )}
         {step.preset.length > 0 && <div style={{ fontSize: 13, color: C.gold, marginBottom: 6 }}>{step.preset.join(' + ')} — what you started from</div>}
         {streaming && (
           <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 8, animation: 'bcpulse 1.4s ease-in-out infinite' }}>
@@ -6741,7 +7085,9 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
             {o.ingredients.map((x, j) => <WalkIngredient key={j} item={x} inventory={inventory} inventoryTags={inventoryTags} />)}
             {o.why && <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, marginTop: 6 }}>{o.why}</div>}
             {options.length > 1 && o.versus && <div style={{ fontSize: 12, color: C.textFaint, lineHeight: 1.45, marginTop: 4 }}>vs. the others: {o.versus}</div>}
-            {!streaming && (
+            {!streaming && editing === index && step.choice?.via !== 'skip' && walkChoiceLabel(step.choice) === o.ingredients.map(x => x.name).join(' + ') ? (
+              <div style={{ marginTop: 8, fontSize: 12, color: C.textFaint }}>Current choice</div>
+            ) : !streaming && (
               <button onClick={() => choose(index, { via: 'option', ingredients: o.ingredients, reason: o.why, reference: o.reference })}
                 style={{ marginTop: 8, background: 'none', border: `1px solid ${C.gold}`, borderRadius: 20, color: C.gold, fontSize: 12, fontWeight: 600, padding: '5px 14px', cursor: 'pointer' }}>
                 Use this
@@ -6794,11 +7140,25 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
       {header}
       {saveErrorBox}
       {buildSoFar}
-      {currentIndex >= 0 && renderStep(currentIndex)}
-      {busy === 'finishing' && <div style={{ fontSize: 14, color: C.textMuted, padding: '16px 0', animation: 'bcpulse 1.4s ease-in-out infinite' }}>Setting the proportions and naming it…</div>}
+      {changeBox}
+      {editing != null ? renderStep(editing) : currentIndex >= 0 && renderStep(currentIndex)}
+      {busy === 'finishing' && <div style={{ fontSize: 14, color: C.textMuted, padding: '16px 0', animation: 'bcpulse 1.4s ease-in-out infinite' }}>{recipe ? 'Re-working the proportions for the changed build…' : 'Setting the proportions and naming it…'}</div>}
       {errorBox}
+      {recipe && walk.changed_since_finish && busy !== 'finishing' && (
+        <div style={{ background: C.gold + '12', border: `1px solid ${C.gold}55`, borderRadius: 12, padding: 14, margin: '12px 0' }}>
+          <div style={{ fontSize: 14, color: C.text, lineHeight: 1.5, marginBottom: 8 }}>
+            The build has changed since this drink was finished — the recipe below is the earlier version.{flaggedCount > 0 ? ` ${flaggedCount === 1 ? 'One step is' : `${flaggedCount} steps are`} still flagged; you can change ${flaggedCount === 1 ? 'it' : 'them'} first, or update now.` : ''}
+          </div>
+          <button disabled={locked || editing != null} onClick={() => runFinish(latestRef.current.walk)}
+            style={{ background: C.gold, border: `1px solid ${C.gold}`, borderRadius: 8, color: '#0f0f0f', fontSize: 13, fontWeight: 700, padding: '8px 14px', cursor: 'pointer', opacity: locked || editing != null ? 0.5 : 1 }}>
+            Update the drink →
+          </button>
+        </div>
+      )}
       {recipe && (
+        <div style={{ opacity: walk.changed_since_finish ? 0.55 : 1 }}>
         <RecipeCard
+          key={`v${(walk.previous_recipes || []).length}`}
           suggestion={recipe}
           primaryIngredients={walk.seeds}
           onSaveOnDeck={onSaveOnDeck}
@@ -6806,8 +7166,10 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
           whiteboardId={node?.whiteboardId || null}
           restoreRecipeNodeId={node?.id || null}
           autoExpand
-          initialTried={node?.tried || false}
+          initialTried={tried}
           initialNotes={node?.notes || ''}
+          onTriedToggle={saveTried}
+          onNotesSave={saveNotes}
           inventoryText={inventoryText}
           inventory={inventory}
           inventoryTags={inventoryTags}
@@ -6821,13 +7183,69 @@ function CreationWalk({ seeds, seedLabels, template, modifiers, resume, inventor
             setRecipe(renamed)
             latestRef.current = { ...latestRef.current, recipe: renamed }
             if (user && node?.id) {
-              const { error: err } = await supabase.from('exploration_nodes').update({ payload: { walk: latestRef.current.walk, recipe: renamed } }).eq('id', node.id)
-              if (err) { setRecipe(prev); latestRef.current = { ...latestRef.current, recipe: prev }; throw new Error(err.message || 'Could not save name.') }
+              try {
+                await queueSave(async () => {
+                  const { error: err } = await supabase.from('exploration_nodes').update({ payload: { walk: latestRef.current.walk, recipe: latestRef.current.recipe } }).eq('id', node.id)
+                  if (err) throw new Error(err.message || 'Could not save name.')
+                })
+              } catch (err) { setRecipe(prev); latestRef.current = { ...latestRef.current, recipe: prev }; throw err }
             }
           }}
           onSaved={(name, toMakeId) => { const merged = { ...latestRef.current.recipe, to_make_id: toMakeId }; setRecipe(merged); persist(latestRef.current.walk, merged) }}
         />
+        </div>
       )}
+      {recipe && !walk.changed_since_finish && busy !== 'finishing' && (() => {
+        const tasted = !!tried
+        const here = consult.tasted === tasted ? consult.messages : []
+        const exchanges = here.filter(m => m.role === 'user').length
+        const lastReply = [...here].reverse().find(m => m.role === 'assistant')
+        const lastSlots = lastReply ? (walk.consults || []).at(-1)?.slots || [] : []
+        return (
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16, marginTop: 14 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: C.text, marginBottom: 4 }}>{tasted ? 'How did it taste?' : 'Before you make it'}</div>
+            <div style={{ fontSize: 12, color: C.textFaint, marginBottom: 10, lineHeight: 1.45 }}>
+              {tasted
+                ? 'You’ve marked it Tried, so what you tell me is taken as what happened — I’ll work out which step it comes from.'
+                : 'Anything you expect to be off? Until you’ve made it that’s a prediction, and I’ll tell you if I think otherwise. Mark it Tried above once you have.'}
+            </div>
+            {here.map((m, i) => (
+              <div key={i} style={{ display: 'flex', justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start', marginBottom: 6 }}>
+                <div style={{ maxWidth: '85%', background: m.role === 'user' ? C.gold + '22' : C.bg, border: `1px solid ${m.role === 'user' ? C.gold + '44' : C.border}`, borderRadius: m.role === 'user' ? '10px 10px 2px 10px' : '10px 10px 10px 2px', padding: '8px 12px', fontSize: 14, color: C.text, lineHeight: 1.5 }}>
+                  {m.role === 'assistant' && (
+                    <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.05em', textTransform: 'uppercase', color: tasted ? C.gold : m.verdict === 'disagree' ? C.amber : C.green, marginBottom: 3 }}>
+                      {tasted ? 'From your tasting' : m.verdict === 'disagree' ? 'I don’t think so' : 'I think you’re right'}
+                    </div>
+                  )}
+                  {m.display ?? m.content}
+                </div>
+              </div>
+            ))}
+            {consult.loading && <div style={{ fontSize: 13, color: C.textFaint, marginBottom: 6, animation: 'bcpulse 1.4s ease-in-out infinite' }}>{tasted ? 'Working out where that comes from…' : 'Weighing it against the recipe…'}</div>}
+            {!consult.loading && lastSlots.length > 0 && (
+              <div style={{ margin: '6px 0 10px' }}>
+                {lastSlots.map(x => (
+                  <button key={x.step} disabled={locked || editing != null} onClick={() => openEdit(x.step)} style={{ ...smallBtn(true), marginRight: 6, marginBottom: 6 }}>
+                    Go to {WALK_ROLE_TITLES[walk.steps[x.step]?.role]?.toLowerCase()} →
+                  </button>
+                ))}
+              </div>
+            )}
+            {exchanges < 2 ? (
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input type="text" value={consultText} onChange={e => setConsultText(e.target.value)} onKeyDown={e => e.key === 'Enter' && sendConsult(consultText)} disabled={consult.loading}
+                  placeholder={exchanges > 0 ? 'Reply…' : tasted ? 'e.g. too sweet, the rye gets lost' : 'e.g. I think this will be too sweet'}
+                  style={{ flex: 1, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontSize: 14, padding: '10px 12px', outline: 'none', opacity: consult.loading ? 0.5 : 1, minWidth: 0 }} />
+                <button onClick={() => sendConsult(consultText)} disabled={!consultText.trim() || consult.loading}
+                  style={{ background: consultText.trim() && !consult.loading ? C.gold : C.surface, border: `1px solid ${consultText.trim() && !consult.loading ? C.gold : C.border}`, borderRadius: 8, color: consultText.trim() && !consult.loading ? '#0f0f0f' : C.textFaint, fontSize: 16, fontWeight: 700, padding: '10px 16px', cursor: consultText.trim() && !consult.loading ? 'pointer' : 'default' }}>→</button>
+              </div>
+            ) : (
+              <button onClick={() => setConsult({ messages: [], loading: false, error: null, tasted: null })} style={smallBtn(false)}>Say something else</button>
+            )}
+            {consult.error && <div style={{ fontSize: 12, color: C.red, marginTop: 6 }}>{consult.error}</div>}
+          </div>
+        )
+      })()}
     </div>
   )
 }
@@ -9517,15 +9935,18 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
     }
     if (node.node_type === 'creation') {
       const w = node.payload?.walk || {}
-      const r = node.payload?.recipe
+      const r = withInternalCreation(node.payload?.recipe)
       if (!r) return (
         <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.6 }}>
           {(w.steps || []).map((st, i) => (
-            <div key={i}><b>{WALK_ROLE_TITLES[st.role]}:</b> {st.choice ? (st.choice.via === 'skip' ? 'skipped' : st.choice.ingredients.map(x => x.name).join(' + ')) : <span style={{ color: C.textFaint }}>not yet</span>}</div>
+            <div key={i}><b>{WALK_ROLE_TITLES[st.role]}:</b> {st.choice ? (st.choice.via === 'skip' ? 'skipped' : st.choice.ingredients.map(x => x.name).join(' + ')) : <span style={{ color: C.textFaint }}>not yet</span>}{st.choice && st.flag && <span style={{ color: C.amber }}> · flagged</span>}</div>
           ))}
         </div>
       )
+      const tastings = (w.consults || []).filter(c => c.tasted)
       return (
+        <>
+        {w.changed_since_finish && <div style={{ fontSize: 12, color: C.amber, marginBottom: 8 }}>The build has changed since this was finished — Continue to update the drink.</div>}
         <RecipeCard
           suggestion={r}
           initialTried={!!triedMap[node.id]}
@@ -9556,6 +9977,16 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
             if (error) throw new Error(error.message || 'Could not save name.')
           }}
         />
+        {tastings.length > 0 && (
+          <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, marginTop: 8 }}>
+            {tastings.map((c, i) => (
+              <div key={i} style={{ marginBottom: 6 }}>
+                <b>Made {c.recipe_name}:</b> “{c.messages?.[0]?.content}” — {c.messages?.find(m => m.role === 'assistant')?.content}
+              </div>
+            ))}
+          </div>
+        )}
+        </>
       )
     }
     if (node.node_type === 'tweak') {
