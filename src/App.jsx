@@ -1225,6 +1225,14 @@ function extractJSON(text) {
   throw err
 }
 
+// Stored conversation turns carry UI-only fields (display, verdict) beside
+// role and content. The API rejects unknown properties on a message
+// ("messages.1.display: Extra inputs are not permitted"), so any replayed
+// history goes through this before it's sent — only role and content leave.
+function toApiMessages(messages) {
+  return messages.map(m => ({ role: m.role, content: m.content }))
+}
+
 // err.code lets callers distinguish failure causes without string-matching
 // message text: 'network' | 'rate_limited' | 'http_error' | 'truncated' |
 // 'parse_failed'. Attaching it is safe for every existing caller (pure
@@ -3148,9 +3156,23 @@ Exactly ten entries, every id listed above exactly once, ranked best fit first.`
 // for the caller to mistake for a revision). Only the Results screen's
 // Something Off? passes this — the Explorations tweak sheet already has
 // its own conversation path for questions (converseTweakStep).
-const FEEDBACK_QUESTION_RULE = `First decide what that message is. If it only ASKS something — which bottle to use, why an ingredient is there, what something tastes like, whether a swap would work — and doesn't ask you to change the recipe, change nothing: answer it in 1-3 terse, direct sentences, and return ONLY {"answer": "..."} as JSON, with no recipe fields at all. Name only bottles that appear in the bar inventory when recommending one. If it asks for a change (scale, swap, rebalance, add or remove something, fix an error), it's an adjustment.`
+//
+// S32: the model ignored "return ONLY {answer}" when the adjustment
+// instructions came after it — it re-emitted the whole recipe and put the
+// answer at the end, which used up the 1500-token reply budget before the
+// answer finished (stop_reason max_tokens → "Could not read that
+// response"). So the question/adjustment choice is now the reply's FIRST
+// key ("kind"), and a question's schema has no recipe in it at all — the
+// app already has the recipe; asking for it back to answer one question
+// is what used up the budget.
+const FEEDBACK_QUESTION_RULE = `First decide what that message is. If it only ASKS something — which bottle to use, why an ingredient is there, what something tastes like, whether a swap would work, whether something would be better — and doesn't tell you to change the recipe, it's a QUESTION: change nothing, answer it in 1-3 terse, direct sentences, and return ONLY {"kind": "question", "answer": "..."} — those two keys and nothing else, no recipe fields at all; the app already has the recipe. Name only bottles that appear in the bar inventory when recommending one. If it tells you to make a change (scale, swap, rebalance, add or remove something, fix an error), it's an ADJUSTMENT, and the reply's first key is "kind": "adjustment".`
+// S32: an answer is an answer even when the model also sent a recipe back
+// (it did: full recipe + "answer" + tweak_label "No adjustment made") — the
+// old !Array.isArray(recipe) condition turned that into a "revision" and
+// put a Replace-this-saved-recipe prompt over an unchanged recipe.
 function isFeedbackAnswer(revised) {
-  return typeof revised?.answer === 'string' && revised.answer.trim() !== '' && !Array.isArray(revised?.recipe)
+  if (revised?.kind === 'adjustment') return false
+  return typeof revised?.answer === 'string' && revised.answer.trim() !== ''
 }
 // Belt and braces for the adjustment path: a "revision" whose build is
 // identical to the one on screen didn't adjust anything, whatever the
@@ -3176,7 +3198,7 @@ async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, ta
   const isPublished = resolvedOrigin === 'published' || resolvedOrigin === 'published_variation'
   const body = {
     model: MODEL,
-    max_tokens: 1500,
+    max_tokens: MAX_TOKENS,
     messages: [{
       role: 'user',
       content: `You are an expert craft bartender. The user wants this specific cocktail suggestion adjusted.
@@ -3184,7 +3206,7 @@ async function tweakSingleSuggestion(suggestion, feedbackText, inventoryText, ta
 Current suggestion:
 ${JSON.stringify(stripInternalFields(suggestion), null, 2)}
 
-The user's feedback: "${feedbackText}"${tastingContext ? `\n\n${tastingContext}` : ''}${demotionNamingNote}${allowAnswer ? `\n\n${FEEDBACK_QUESTION_RULE} Otherwise, adjust as below.` : ''}
+The user's feedback: "${feedbackText}"${tastingContext ? `\n\n${tastingContext}` : ''}${demotionNamingNote}${allowAnswer ? `\n\nIf this feedback is a question, none of the adjustment instructions below apply — see the last paragraph.` : ''}
 
 BAR INVENTORY:
 ${inventoryText}
@@ -3195,23 +3217,20 @@ ${isPublished ? '' : WATCH_OUTS_INSTRUCTION}
 
 ${BOTTLE_JUSTIFICATION_INSTRUCTION}
 
-Return a revised version of just this one suggestion in the same JSON structure as a single suggestion object, re-checking every ingredient in the "ingredients" array (location, substitute, substitute_location, flavor_impact, bottle_note) against the bar inventory above per the ownership rule and the bottle-choice gates above — do not leave stale or guessed status values from the original. Set can_make_now: true when every ingredient is "found" or "substitute", false only when at least one is "missing". ${isPublished ? 'This is a published recipe — leave "watch_outs" null (even if the current suggestion object already carries a non-null value from before); watch_outs is never used for a published recipe. ' : 'Include a "watch_outs" field (string or null) per the guidance above — null when there is nothing worth flagging. '}Also include a "tweak_label" field: a short 3-6 word label summarizing what changed (e.g. "Sparkling rosé swap, soda removed"). Return ONLY valid JSON with no markdown fences — a single object, not an array.`,
+Return a revised version of just this one suggestion in the same JSON structure as a single suggestion object, re-checking every ingredient in the "ingredients" array (location, substitute, substitute_location, flavor_impact, bottle_note) against the bar inventory above per the ownership rule and the bottle-choice gates above — do not leave stale or guessed status values from the original. Set can_make_now: true when every ingredient is "found" or "substitute", false only when at least one is "missing". ${isPublished ? 'This is a published recipe — leave "watch_outs" null (even if the current suggestion object already carries a non-null value from before); watch_outs is never used for a published recipe. ' : 'Include a "watch_outs" field (string or null) per the guidance above — null when there is nothing worth flagging. '}Also include a "tweak_label" field: a short 3-6 word label summarizing what changed (e.g. "Sparkling rosé swap, soda removed"). Return ONLY valid JSON with no markdown fences — a single object, not an array.${allowAnswer ? `\n\n${FEEDBACK_QUESTION_RULE} For an adjustment, return the revised suggestion object described above, with "kind": "adjustment" as its first key.` : ''}`,
     }],
   }
-  const firstText = await callClaudeText(body)
+  // S32: was a hard-coded 1500 with no truncation check — the hotfix that
+  // raised MAX_TOKENS never reached this function, and a max_tokens stop
+  // went straight into extractJSON as "Could not read that response". The
+  // retry repeated the same 1500 budget, so it failed the same way. Now:
+  // truncation throws before extractJSON, and the one retry is a fresh
+  // attempt at 1.5× the budget (the hotfix rule), not a continuation.
   try {
-    return extractJSON(firstText)
-  } catch (_) {
-    const retryText = await callClaudeText({
-      model: MODEL,
-      max_tokens: 1500,
-      messages: [
-        body.messages[0],
-        { role: 'assistant', content: firstText },
-        { role: 'user', content: 'Your previous response was cut off or invalid JSON. Please return ONLY the complete valid JSON object for the single suggestion, no other text.' },
-      ],
-    })
-    return extractJSON(retryText)
+    return extractJSON(await callClaudeText(body, { detectTruncation: true }))
+  } catch (err) {
+    if (err.code !== 'truncated' && err.code !== 'parse_failed') throw err
+    return extractJSON(await callClaudeText({ ...body, max_tokens: Math.round(body.max_tokens * 1.5) }, { detectTruncation: true }))
   }
 }
 
@@ -3241,14 +3260,24 @@ ${recipeSummary}${tastingContext ? `\n\n${tastingContext}` : ''}${tweakHistory.l
     const resolvedOrigin = resolveOrigin(suggestion?.origin, suggestion?.origin_flag)
     const isPublished = resolvedOrigin === 'published' || resolvedOrigin === 'published_variation'
     const finalMessages = [
-      ...messages,
+      ...toApiMessages(messages),
       {
         role: 'user',
         content: `Synthesize this into a concrete tweak. Write one sentence starting with "Based on what you're describing, here's what I'd try: " Then write "---JSON---" on a new line followed by the complete revised recipe as valid JSON — same structure as the original with all fields: recipe_name, origin_flag, difficulty, difficulty_note, can_make_now, summary, recipe (array of {ingredient, amount}), instructions, glass_type, ingredients (array of {ingredient, status, location, substitute, substitute_location, flavor_impact, bottle_note}), technique_notes${isPublished ? '' : ', watch_outs'}, tweak_label (a short 3-6 word label summarizing what changed, e.g. "Sparkling rosé swap, soda removed"). Re-check every ingredient's status/location/substitute against this bar inventory instead of leaving stale values from the original:\n\n${inventoryText}\n\n${OWNERSHIP_STATUS_RULES}\n\n${isPublished ? '' : WATCH_OUTS_INSTRUCTION}\n\n${BOTTLE_JUSTIFICATION_INSTRUCTION}\n\nSet can_make_now: true when every ingredient is "found" or "substitute", false only when at least one is "missing".${isPublished ? ' This is a published recipe — leave "watch_outs" null (even if the current suggestion object already carries a non-null value from before); watch_outs is never used for a published recipe.' : ' watch_outs must be null (not omitted) when there is nothing worth flagging.'} bottle_note must be null (not omitted) for every ingredient where nothing genuinely needed to be said.`,
       },
     ]
-    const body = { model: MODEL, max_tokens: 1500, system, messages: finalMessages }
-    const text = await callClaudeText(body)
+    // S32: same gap as tweakSingleSuggestion — a hard-coded 1500, no
+    // truncation check, and a retry at the same budget. Truncation now
+    // throws before parsing; each retry gets 1.5× the call it retries.
+    const body = { model: MODEL, max_tokens: MAX_TOKENS, system, messages: finalMessages }
+    const retryBudget = Math.round(body.max_tokens * 1.5)
+    let text
+    try {
+      text = await callClaudeText(body, { detectTruncation: true })
+    } catch (err) {
+      if (err.code !== 'truncated') throw err
+      text = await callClaudeText({ ...body, max_tokens: retryBudget }, { detectTruncation: true })
+    }
     const sepIdx = text.indexOf('---JSON---')
     const synthesisText = (sepIdx >= 0 ? text.slice(0, sepIdx) : text).trim()
     const jsonPart = sepIdx >= 0 ? text.slice(sepIdx + 10).trim() : ''
@@ -3256,14 +3285,14 @@ ${recipeSummary}${tastingContext ? `\n\n${tastingContext}` : ''}${tweakHistory.l
     if (jsonPart) { try { revised = extractJSON(jsonPart) } catch (_) {} }
     if (!revised) {
       const retryText = await callClaudeText({
-        model: MODEL, max_tokens: 1500, system,
+        model: MODEL, max_tokens: retryBudget, system,
         messages: [...finalMessages, { role: 'assistant', content: text }, { role: 'user', content: 'Return ONLY the revised recipe as valid JSON, no other text.' }],
-      })
+      }, { detectTruncation: true })
       try { revised = extractJSON(retryText) } catch (_) {}
     }
     return { synthesisText, revised }
   } else {
-    const text = await callClaudeText({ model: MODEL, max_tokens: 300, system, messages })
+    const text = await callClaudeText({ model: MODEL, max_tokens: 300, system, messages: toApiMessages(messages) })
     return { text }
   }
 }
@@ -3500,7 +3529,7 @@ THE ROLE BEING FILLED: ${ROLE_LABELS[step.role] || step.role}${step.preset.lengt
 Reply ONLY with JSON, no markdown fences:
 {"verdict": "works | caution | clashes", "reply": "your answer, max 2 sentences", "ingredients": [{"name": "what the proposal puts in this role — a bottle's exact BAR INVENTORY name when it refers to one", "kind": "bottle | staple"}], "reference": "string or null — only if the build WITH this proposal genuinely resembles a real, well-known drink; null is normal"}
 "works": you'd make it as proposed. "caution": it works with a real cost worth knowing. "clashes": you'd advise against it.`
-  const r = await callClaudeStream({ model: MODEL, max_tokens: 300, system: [walkInventoryBlock(inventoryText), { type: 'text', text: system }], messages }, { signal })
+  const r = await callClaudeStream({ model: MODEL, max_tokens: 300, system: [walkInventoryBlock(inventoryText), { type: 'text', text: system }], messages: toApiMessages(messages) }, { signal })
   const data = extractJSON(r.text)
   const verdict = ['works', 'caution', 'clashes'].includes(data?.verdict) ? data.verdict : 'caution'
   const ingredients = normalizeWalkOptions([{ ingredients: data?.ingredients || [] }], step)[0]?.ingredients || []
@@ -3679,7 +3708,7 @@ ${describeWalkSteps(walk)}
 Reply ONLY with JSON, no markdown fences:
 {${tasted ? '' : '"assessment": "the balance worked out from the amounts — max 25 words", "verdict": "agree | disagree", '}"reply": "max 2 sentences", "slots": [{"step": 1, "kind": "ingredient | amount", "reason": "max 20 words — what this step has to do with it"}]}
 "slots": the steps responsible${tasted ? '' : ' — only when you agree; empty when you disagree'}.`
-  const r = await callClaudeStream({ model: MODEL, max_tokens: 400, system: [walkInventoryBlock(inventoryText), { type: 'text', text: system }], messages }, { signal })
+  const r = await callClaudeStream({ model: MODEL, max_tokens: 400, system: [walkInventoryBlock(inventoryText), { type: 'text', text: system }], messages: toApiMessages(messages) }, { signal })
   const data = extractJSON(r.text)
   if (!data?.reply) throw new Error('That didn’t come back.')
   const verdict = tasted ? null : (data.verdict === 'disagree' ? 'disagree' : 'agree')
@@ -10421,6 +10450,16 @@ export default function App() {
   // recipe being adjusted isn't actually saved (Test 12: adjusting something
   // unsaved never shows this prompt at all).
   const [pendingReplace, setPendingReplace] = useState(null)
+  // S32: a pending replace only applies while the recipe on screen is still
+  // the saved row it was raised for. Anything else that swaps `result` (a
+  // new Analyze, Back, a mode change) leaves pendingReplace behind; without
+  // this check "Yes, replace" would write whatever is on screen into that
+  // other row.
+  const pendingReplaceFor = r => {
+    if (!pendingReplace || !r) return null
+    const onScreenId = pendingReplace.table === 'to_make' ? r.toMakeId : r.favoriteId
+    return onScreenId === pendingReplace.id ? pendingReplace : null
+  }
   const sourceScrollRef = useRef(0)
   const [sharedImage, setSharedImage] = useState(null) // pending share-target file awaiting mode selection
 
@@ -10930,9 +10969,15 @@ export default function App() {
   // Session 16 report on remaining name-matches). Saving it fresh from this
   // view still works correctly, it just doesn't retroactively detect a prior,
   // separately-made save under the same name.
+  //
+  // S32: both clear pendingReplace. It used to survive opening another
+  // recipe: adjust A, go Back, open B, and A's "Replace this saved recipe?"
+  // showed on B — and "Yes, replace" wrote B's content into A's row.
+  // pendingReplaceFor() below is the backstop for every other way result
+  // gets swapped out from under it.
   const viewToMake = (item) => {
     sourceScrollRef.current = window.scrollY
-    setError(null); setFeedbackNote(null)
+    setError(null); setFeedbackNote(null); setPendingReplace(null)
     setResult({ recipe_name: item.recipeName, summary: item.summary, recipe: item.recipe, instructions: item.instructions, ingredients: item.ingredients, variations: item.variations, glass_type: item.glassType, origin: item.origin, origin_flag: item.originFlag, difficulty: item.difficulty, source: item.source, creator: item.creator, bar: item.bar, year: item.year, attributionSource: item.attributionSource, attributionUserSupplied: item.attributionUserSupplied, parentRecipe: item.parentRecipe, replacements: item.replacements, nameUserSupplied: item.nameUserSupplied, toMakeId: item.id, favoriteId: null })
     setResultSource('ondeck')
     setScreen('detail')
@@ -10940,7 +10985,7 @@ export default function App() {
 
   const viewFavorite = (fav) => {
     sourceScrollRef.current = window.scrollY
-    setError(null); setFeedbackNote(null)
+    setError(null); setFeedbackNote(null); setPendingReplace(null)
     setResult({ recipe_name: fav.recipeName, summary: fav.summary, recipe: fav.recipe, instructions: fav.instructions, ingredients: fav.ingredients, variations: fav.variations, glass_type: fav.glassType, origin: fav.origin, origin_flag: fav.originFlag, difficulty: fav.difficulty, source: fav.source, creator: fav.creator, bar: fav.bar, year: fav.year, attributionSource: fav.attributionSource, attributionUserSupplied: fav.attributionUserSupplied, parentRecipe: fav.parentRecipe, replacements: fav.replacements, nameUserSupplied: fav.nameUserSupplied, favoriteId: fav.id, toMakeId: null })
     setResultSource('favorites')
     setScreen('detail')
@@ -11121,8 +11166,19 @@ Otherwise, revise your response accordingly and return the same JSON structure, 
           setFeedbackNote({ kind: 'answer', text: revised.answer, question: feedbackText })
           return true
         }
+        // S32: the Results branch above already had this guard; this one
+        // didn't, so an unchanged "revision" of a saved recipe raised the
+        // Replace-this-saved-recipe prompt with nothing to replace.
+        if (sameRecipe(result, revised)) {
+          setFeedbackNote({ kind: 'answer', text: 'Nothing in the recipe changed, so there’s nothing to replace.', question: feedbackText })
+          return true
+        }
         setFeedbackNote(null)
       }
+      // "kind" only routes the reply (FEEDBACK_QUESTION_RULE); it isn't a
+      // recipe field, and left on the result it'd be echoed into the next
+      // Adjust prompt.
+      if (revised && 'kind' in revised) { const { kind: _kind, ...rest } = revised; revised = rest }
       setError(null)
       // A user-supplied attribution must survive a feedback revision — the
       // model was handed the prior result (including these fields) and asked
@@ -11174,9 +11230,9 @@ Otherwise, revise your response accordingly and return the same JSON structure, 
   // the adjusted recipe (result now holds the revised content; pendingReplace
   // holds what's needed to act on the ORIGINAL saved row).
   const handleReplaceDecision = async (replace) => {
-    const decision = pendingReplace
-    if (!decision) return
+    const decision = pendingReplaceFor(result)
     setPendingReplace(null)
+    if (!decision) return
     const { table, id, originalName, originalNameUserSupplied } = decision
     const setter = table === 'to_make' ? setToMake : setFavorites
     const idField = table === 'to_make' ? 'toMakeId' : 'favoriteId'
@@ -11636,7 +11692,7 @@ Otherwise, revise your response accordingly and return the same JSON structure, 
             feedbackError={error}
             onOpenAttributionEdit={() => setAttributionDrawerOpen(true)}
             onRename={handleRenameResult}
-            pendingReplace={pendingReplace}
+            pendingReplace={pendingReplaceFor(result)}
             onReplaceDecision={handleReplaceDecision}
           />
         </>
