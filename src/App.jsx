@@ -11144,7 +11144,16 @@ ${FEEDBACK_QUESTION_RULE}
 Otherwise, revise your response accordingly and return the same JSON structure, with one additional field at the top level: "adjustment_note" — a 1-2 sentence plain English explanation of what specifically changed and why (e.g. "Scaled all amounts to a 4 oz total while maintaining the 1:1:1 Negroni ratio."). Do not include adjustment_note if nothing meaningful changed.` },
           ],
         }
-        revised = await callClaude(feedbackBody)
+        // S32: the last Adjust path without truncation protection. Same rule
+        // as tweakSingleSuggestion: a max_tokens stop throws before
+        // extractJSON instead of surfacing as "Could not read that
+        // response", and the one retry is a fresh call at 1.5× the budget.
+        try {
+          revised = await callClaude(feedbackBody, { detectTruncation: true })
+        } catch (err) {
+          if (err.code !== 'truncated' && err.code !== 'parse_failed') throw err
+          revised = await callClaude({ ...feedbackBody, max_tokens: Math.round(feedbackBody.max_tokens * 1.5) }, { detectTruncation: true })
+        }
         // A question leaves the conversation where it was: the answer isn't
         // a new version of the recipe for the next adjustment to build on.
         if (isFeedbackAnswer(revised)) {
