@@ -7467,6 +7467,36 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const currentRecipeNodeIdsRef = useRef(currentRecipeNodeIds)
   useEffect(() => { currentRecipeNodeIdsRef.current = currentRecipeNodeIds }, [currentRecipeNodeIds])
 
+  // S32: the results session — the results list on screen plus the node ids
+  // its cards bind to (by recipe NAME) and the whiteboard/list/ingredients
+  // ids new nodes attach to. It ends wherever those get replaced: reset, a
+  // new explore, a restore, Back out of a redirect, leaving the screen.
+  //
+  // Every async path that later writes any of that state captures the
+  // session when it starts and drops its state writes if the session has
+  // since ended. Before this, a slow explore/See More/rename from session 1
+  // resolving during session 2 replaced or merged session 1's node ids into
+  // session 2's map — so a session-2 card with the same recipe name wrote
+  // its notes/Tried straight to session 1's node — merged session 1's See
+  // More suggestions into session 2's list on screen, and could point
+  // session 2 at session 1's whiteboard. Rows the old session already
+  // created stay; they belong to its own whiteboard.
+  //
+  // The name-keyed buffers below are cleared at the same moment (option A):
+  // a value typed in the second or two before its node existed, in a
+  // session the user then left, is dropped rather than drained by name into
+  // whatever session is current. That loss is the accepted cost.
+  const resultsSessionRef = useRef(0)
+  const endResultsSession = () => {
+    resultsSessionRef.current += 1
+    setPendingRecipeNotes({}); setPendingRecipeTried({}); setPendingRecipeNames({})
+    // A See More still running belongs to the session that just ended; its
+    // own finally won't clear these once it's stale (it would otherwise
+    // clear a newer session's), and handleSeeMore refuses to start while
+    // seeMoreLoading is set.
+    setSeeMoreLoading(false); setSeeMorePublishedLoading(false)
+  }
+
   // Writes straight through once a node id is known; otherwise buffers above.
   // Throws on a real write failure so RecipeCard's own await/catch can roll
   // back its optimistic UI and show the user something actually failed,
@@ -7524,6 +7554,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   //    itself. Reported in the session writeup as the one propagation case
   //    that's best-effort rather than guaranteed.
   const handleRecipeRename = async (originalName, newName) => {
+    const session = resultsSessionRef.current
     const nodeId = currentRecipeNodeIds[originalName]
     const existing = (result?.suggestions || []).find(x => x.recipe_name === originalName)
     const renamedSuggestion = existing
@@ -7544,17 +7575,21 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           .insert({ whiteboard_id: currentWhiteboardId, parent_node_id: currentRecipeListNodeId, node_type: 'recipe', payload: nodePayload })
           .select('id').single()
         if (error) throw error
-        if (data?.id) setCurrentRecipeNodeIds(prev => ({ ...prev, [originalName]: data.id }))
+        if (data?.id && resultsSessionRef.current === session) setCurrentRecipeNodeIds(prev => ({ ...prev, [originalName]: data.id }))
       } catch (err) {
         throw new Error(err?.message || 'Could not save name.')
       }
     } else {
       setPendingRecipeNames(prev => ({ ...prev, [originalName]: newName }))
     }
-
     // Best-effort sibling-list sync — see comment above. Never blocks or
     // throws past this point; the primary write above already succeeded.
-    setResult(prev => prev ? {
+    // S32: the on-screen list is only this rename's to update while its
+    // session is still the one on screen — otherwise another session's
+    // card with the same name shows this rename. The list-node write below
+    // stays unconditional: it uses this session's own list id and
+    // suggestions, captured when the rename started.
+    if (resultsSessionRef.current === session) setResult(prev => prev ? {
       ...prev,
       suggestions: (prev.suggestions || []).map(x => x.recipe_name === originalName ? renamedSuggestion : x),
     } : prev)
@@ -7574,6 +7609,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // Progress — the exact sequence in the original bug) would have nothing to
   // derive "already saved" from at all.
   const handleRecipeSaved = async (originalName, newId) => {
+    const session = resultsSessionRef.current
     const nodeId = currentRecipeNodeIds[originalName]
     const existing = (result?.suggestions || []).find(x => x.recipe_name === originalName)
     const savedSuggestion = existing
@@ -7590,7 +7626,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           .insert({ whiteboard_id: currentWhiteboardId, parent_node_id: currentRecipeListNodeId, node_type: 'recipe', payload: nodePayload })
           .select('id').single()
         if (error) throw error
-        if (data?.id) setCurrentRecipeNodeIds(prev => ({ ...prev, [originalName]: data.id }))
+        if (data?.id && resultsSessionRef.current === session) setCurrentRecipeNodeIds(prev => ({ ...prev, [originalName]: data.id }))
       } catch (err) {
         console.warn('[save] node create failed (non-fatal, to_make row already saved):', err.message)
       }
@@ -7601,7 +7637,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     // Worst case if this fails: the card shows as unsaved again after a
     // remount, which is the pre-existing (if wrong) behavior, not a new one.
 
-    setResult(prev => prev ? {
+    // S32: same split as handleRecipeRename — the screen only while this
+    // session is current; the list-node write below is this session's own.
+    if (resultsSessionRef.current === session) setResult(prev => prev ? {
       ...prev,
       suggestions: (prev.suggestions || []).map(x => x.recipe_name === originalName ? savedSuggestion : x),
     } : prev)
@@ -7679,7 +7717,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // any in-flight background buffer fill, the same silent-cancel mechanism
   // handleExplore/reset use. No warning, no confirmation: losing the fill
   // costs only a slower See More next time.
-  useEffect(() => () => { bufferFillGenerationRef.current += 1 }, [])
+  useEffect(() => () => { bufferFillGenerationRef.current += 1; resultsSessionRef.current += 1 }, [])
 
   useEffect(() => {
     const load = async () => {
@@ -7722,7 +7760,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     // falls through to a real search, same as any other empty-buffer tap.
     setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(true); setMoreIdeasExist(false); setMorePublishedExist(true)
     setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set())
-    bufferFillGenerationRef.current += 1
+    bufferFillGenerationRef.current += 1; endResultsSession()
     bufferFillPromiseRef.current = null
     setCurrentWhiteboardId(pendingRestore.whiteboardId || null)
     setCurrentIngredientsNodeId(pendingRestore.ingredientsNodeId || null)
@@ -7870,7 +7908,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         setMorePublishedExist(top.morePublishedExist)
         setCurrentRecipeNodeIds(top.recipeNodeIds)
         setNewBatchNames(new Set())
-        bufferFillGenerationRef.current += 1
+        bufferFillGenerationRef.current += 1; endResultsSession()
         bufferFillPromiseRef.current = null
         setStep('results')
       }
@@ -7921,8 +7959,13 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     // from the exploration this call is replacing — its result, if it lands
     // after this, must be silently discarded rather than overwriting this
     // exploration's (empty, freshly-started) buffer.
-    bufferFillGenerationRef.current += 1
+    bufferFillGenerationRef.current += 1; endResultsSession()
     bufferFillPromiseRef.current = null
+    // S32: this explore's own session (endResultsSession just started it).
+    // Checked after every await below; null is the same "nothing to
+    // continue with" every caller already handles from the error path.
+    const session = resultsSessionRef.current
+    const isCurrent = () => resultsSessionRef.current === session
     try {
       const modifiers = { frozen, lowABV, na }
       let data
@@ -7964,6 +8007,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           if (seedDroppedAll) console.warn(`[seed filter] tier-1 returned ${rawCount}, all dropped for not featuring ${selected.join(' + ')}; advancing to tier-2/3`)
         }
       }
+      if (!isCurrent()) return null
       setResult(data)
       setMorePublishedExist(data?.more_published_exist === true)
       if (DIAG_ON) console.log('[DIAG:tier1-build] tiers+candidates', JSON.stringify({ displayed: (data?.suggestions || []).map(s => ({ name: s.recipe_name, tier: s.tier, origin: s.origin })), rawCandidates: data?.buffer || [] }))
@@ -8023,7 +8067,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
                 .insert({ user_id: user.id, title: selected.join(' + '), status: 'active', last_touched_at: now })
                 .select('id').single()
               wbId = wb?.id
-              setCurrentWhiteboardId(wbId ?? null)
+              // S32: the row is this session's whiteboard either way; only
+              // point the screen at it while this is still the session on it.
+              if (isCurrent()) setCurrentWhiteboardId(wbId ?? null)
               if (wbId) {
                 const { data: ingNode } = await supabase
                   .from('exploration_nodes')
@@ -8031,7 +8077,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
                   .select('id').single()
                 recipeListParentId = ingNode?.id ?? null
                 ingredientsNodeId = ingNode?.id ?? null
-                setCurrentIngredientsNodeId(ingredientsNodeId)
+                if (isCurrent()) setCurrentIngredientsNodeId(ingredientsNodeId)
               }
             }
 
@@ -8042,8 +8088,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
                 .insert({ whiteboard_id: wbId, parent_node_id: recipeListParentId ?? null, node_type: 'recipe_list', payload: { recipes } })
                 .select('id').single()
               recipeListNodeId = listNode?.id ?? null
-              setCurrentRecipeListNodeId(recipeListNodeId)
-              setContinueFromNodeId(null)
+              if (isCurrent()) {
+                setCurrentRecipeListNodeId(recipeListNodeId)
+                setContinueFromNodeId(null)
+              }
 
               const recipeNodeIds = {}
               if (recipeListNodeId && recipes.length > 0) {
@@ -8061,7 +8109,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
                   }
                 })
               }
-              setCurrentRecipeNodeIds(recipeNodeIds)
+              // Replaces the whole map — from a stale session this is what
+              // put session 1's ids under session 2's cards.
+              if (isCurrent()) setCurrentRecipeNodeIds(recipeNodeIds)
 
               await supabase.from('exploration_whiteboards').update({ last_touched_at: now }).eq('id', wbId)
             }
@@ -8070,12 +8120,16 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           }
         }
       }
+      if (!isCurrent()) return null
       if (seedDroppedAll) {
         await handleSeeMore({ template: activeTemplate, whiteboardId: wbId, recipeListNodeId, baseSuggestions: [] })
+        if (!isCurrent()) return null
         setStep('results')
       }
       return { data, wbId, recipeListNodeId, ingredientsNodeId, advancedToTier23: seedDroppedAll }
     } catch (err) {
+      // A failure from a session the user already left isn't theirs to see.
+      if (!isCurrent()) return null
       setError(err.message || 'Something went wrong. Please try again.')
       setStep('error')
       return null
@@ -8089,6 +8143,11 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // Mirrors the old handlePartialRetry's merge-and-persist pattern.
   const handleSeeMore = async (opts = {}) => {
     if (seeMoreLoading) return
+    // S32: see resultsSessionRef. A See More can take many seconds; if the
+    // user starts another session meanwhile, its suggestions must not be
+    // merged into that session's list, nor its node ids into that map.
+    const session = resultsSessionRef.current
+    const isCurrent = () => resultsSessionRef.current === session
     const activeTemplate = opts.template ?? template
     const wbId = opts.whiteboardId !== undefined ? opts.whiteboardId : currentWhiteboardId
     const recipeListNodeId = opts.recipeListNodeId !== undefined ? opts.recipeListNodeId : currentRecipeListNodeId
@@ -8108,6 +8167,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         .filter(s => s.origin === 'riff' || s.origin === 'original')
         .map(s => `${s.recipe_name} (${(s.recipe || []).map(r => r.ingredient).join(', ')})`)
       const freshData = stripCiteTags(await analyzeExplorationsOriginals(selected, activeTemplate, modifiers, inventoryText, excludeNames, DIAG_ON ? 'tier2-3-see-more-ideas' : null))
+      if (!isCurrent()) return null
       const rawSuggestions = freshData?.suggestions || []
       // Session 21, Change 2: tier-2/3 has no search tool and, until now, no
       // code backstop for the prompt's own "every featured ingredient" rule
@@ -8160,7 +8220,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
               newIds[recipe.recipe_name] = r.value.data.id
             }
           })
-          setCurrentRecipeNodeIds(prev => ({ ...prev, ...newIds }))
+          if (isCurrent()) setCurrentRecipeNodeIds(prev => ({ ...prev, ...newIds }))
           await supabase.from('exploration_nodes').update({ payload: { recipes: mergedSuggestions } }).eq('id', recipeListNodeId)
           await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', wbId)
         } catch (err) {
@@ -8170,10 +8230,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       return { mergedSuggestions }
     } catch (err) {
       console.warn('[see more] failed:', err.code || 'unknown', err.message)
-      setSeeMoreError(err.message || 'Could not load more ideas. Please try again.')
+      if (isCurrent()) setSeeMoreError(err.message || 'Could not load more ideas. Please try again.')
       return null
     } finally {
-      setSeeMoreLoading(false)
+      if (isCurrent()) setSeeMoreLoading(false)
     }
   }
 
@@ -8186,6 +8246,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // from the model's own judgment again.
   const handleSeeMorePublished = async () => {
     if (seeMorePublishedLoading) return
+    // S32: same session check as handleSeeMore.
+    const session = resultsSessionRef.current
+    const isCurrent = () => resultsSessionRef.current === session
     const baseSuggestions = result?.suggestions ?? []
     setSeeMorePublishedLoading(true)
     setSeeMorePublishedError(null)
@@ -8200,6 +8263,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       let currentBuffer = publishedBuffer
       if (currentBuffer.length === 0 && bufferFillPromiseRef.current) {
         currentBuffer = await bufferFillPromiseRef.current
+        if (!isCurrent()) return null
       }
       const drainBatch = currentBuffer.slice(0, PUBLISHED_BUFFER_DRAIN_BATCH)
       const usingBuffer = drainBatch.length > 0
@@ -8214,6 +8278,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           console.log(`[DIAG:tier1-see-more-published-tap${tapN}] draining buffer ${JSON.stringify({ batchSize: drainBatch.length, remainingBefore: currentBuffer.length, names: drainBatch.map(c => c.name) })}`)
         }
         const drained = await analyzeBufferedDrinkSkeletons(drainBatch, selected, template, modifiers, inventoryText, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null)
+        if (!isCurrent()) return null
         // Session 17, Change 1: this is the buffer's own "written up" moment
         // — a candidate only gains an actual ingredient list here, so this is
         // where the seed-ingredient check first has something to check. A
@@ -8236,6 +8301,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           console.log(`[DIAG:tier1-see-more-published-tap${tapN}] exclusion list ${JSON.stringify({ count: excludeNames.length, chars: joined.length, approxWords: joined.split(/\s+/).filter(Boolean).length })}`)
         }
         freshData = stripCiteTags(await analyzeExplorationsRecipes(selected, template, modifiers, inventoryText, excludeNames, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null))
+        if (!isCurrent()) return null
         // Session 17, Change 1: same backstop as the initial Build call.
         newSuggestions = filterSuggestionsBySeedIngredients(freshData?.suggestions || [], selected, inventoryTags, DIAG_ON ? `tier1-see-more-published-tap${tapN}` : null)
         setMorePublishedExist(freshData?.more_published_exist === true)
@@ -8285,7 +8351,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
               newIds[recipe.recipe_name] = r.value.data.id
             }
           })
-          setCurrentRecipeNodeIds(prev => ({ ...prev, ...newIds }))
+          if (isCurrent()) setCurrentRecipeNodeIds(prev => ({ ...prev, ...newIds }))
           await supabase.from('exploration_nodes').update({ payload: { recipes: mergedSuggestions } }).eq('id', currentRecipeListNodeId)
           await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', currentWhiteboardId)
         } catch (err) {
@@ -8295,14 +8361,14 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       return { mergedSuggestions }
     } catch (err) {
       console.warn('[see more published] failed:', err.message)
-      setSeeMorePublishedError('Could not load more published recipes. Please try again.')
+      if (isCurrent()) setSeeMorePublishedError('Could not load more published recipes. Please try again.')
       return null
     } finally {
-      setSeeMorePublishedLoading(false)
+      if (isCurrent()) setSeeMorePublishedLoading(false)
     }
   }
 
-  const reset = () => { bufferFillGenerationRef.current += 1; bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); setTier1SeedDropped(false); guidanceRequestRef.current += 1; guidanceAbortRef.current?.abort(); guidanceAbortRef.current = null; setGuidance(null); setGuidanceLoading(false); setGuidanceError(null); setShowAllGuidance(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityKey(null); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null); setWalkLaunch(null) }
+  const reset = () => { bufferFillGenerationRef.current += 1; endResultsSession(); bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); setTier1SeedDropped(false); guidanceRequestRef.current += 1; guidanceAbortRef.current?.abort(); guidanceAbortRef.current = null; setGuidance(null); setGuidanceLoading(false); setGuidanceError(null); setShowAllGuidance(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityKey(null); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null); setWalkLaunch(null) }
 
   // Session 30: Create Something New — from Help Me Decide (template picked)
   // or the affinities screen. Same seeds and modifiers the Build path uses.
@@ -8450,12 +8516,16 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // — preserving their existing "full set immediately" behavior instead of adopting the
   // tier-1-first-then-opt-in flow used by the deliberate template-picker path.
   const handleQuickBuild = async () => {
+    const session = resultsSessionRef.current
     const fromStep = stepRef.current
     setTemplatePickerLoading(true)
     setStep('loading') // covers the template-resolution round trip too, not just generation
     try {
       const affinityMap = await ensureAffinityData()
       const resolved = await resolveTemplate(selected, affinityMap)
+      // S32: pressing New while the template resolves must not let this
+      // carry on and start an explore for the old ingredients.
+      if (resultsSessionRef.current !== session) return
       setTemplate(resolved)
       const tier1 = await handleExplore({ template: resolved, fromStep })
       if (tier1 && !tier1.advancedToTier23 && !tier1.data.incompatible && !hasFictionalSeedIngredient(tier1.data)) {
@@ -8467,6 +8537,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   }
 
   const handleSurpriseMe = async () => {
+    const session = resultsSessionRef.current
     const fromStep = stepRef.current
     setTemplatePickerLoading(true)
     setStep('loading') // covers the template-resolution round trip too, not just generation
@@ -8477,6 +8548,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       // directly, same as Quick Build already does.
       const affinityMap = await ensureAffinityData()
       const resolved = await resolveTemplate(selected, affinityMap)
+      // S32: pressing New while the template resolves must not let this
+      // carry on and start an explore for the old ingredients.
+      if (resultsSessionRef.current !== session) return
       setTemplate(resolved)
       const tier1 = await handleExplore({ template: resolved, fromStep, viaSurpriseMe: true })
       if (tier1 && !tier1.advancedToTier23 && !tier1.data.incompatible && !hasFictionalSeedIngredient(tier1.data)) {
