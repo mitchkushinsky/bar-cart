@@ -7617,8 +7617,28 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     tweakNodeIdsRef.current.add(nodeId)
     setCurrentRecipeNodeIds(prev => ({ ...prev, [cardKey]: nodeId }))
   }
+  // S32: continuing from a tweak shows the tweak in its ancestor's slot of
+  // result.suggestions — a display-only override for that one card. The list
+  // node must keep the ORIGINAL entry: every list write serializes
+  // result.suggestions, so before this a See More, See More Published, or a
+  // rename/save of ANY other card wrote the tweak over the original's entry
+  // (and a later rename/save on that card then overwrote the original's
+  // recipe node too — observed on a test whiteboard). cardKey → original
+  // entry, set by the restore, cleared with the session.
+  const listEntryOriginalsRef = useRef({})
+  // Every list-node write goes through this: overridden cards get their
+  // original entry back, and the restore's in-memory auto-expand marker
+  // never reaches the database.
+  const listForSave = (suggestions) => (suggestions || []).map(s => {
+    const { __autoExpandNodeId, ...entry } = listEntryOriginalsRef.current[s?.__cardKey] ?? s
+    return entry
+  })
+  // What "already on screen" means for See More exclusion: an overridden
+  // card is still the original drink's slot, so its original name counts.
+  const shownForExclusion = (suggestions) => [...(suggestions || []), ...Object.values(listEntryOriginalsRef.current)]
   const endResultsSession = () => {
     resultsSessionRef.current += 1
+    listEntryOriginalsRef.current = {}
     setPendingRecipeNotes({}); setPendingRecipeTried({}); setPendingRecipeNames({})
     // A See More still running belongs to the session that just ended; its
     // own finally won't clear these once it's stale (it would otherwise
@@ -7728,7 +7748,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     // S32: a tweak card's list entry is the ORIGINAL recipe — the tweak
     // lives on its own node — so its rename/save isn't synced into the list.
     if (user && currentRecipeListNodeId && result?.suggestions && !(nodeId && tweakNodeIdsRef.current.has(nodeId))) {
-      const updatedList = result.suggestions.map(x => x.__cardKey === cardKey ? renamedSuggestion : x)
+      const updatedList = listForSave(result.suggestions.map(x => x.__cardKey === cardKey ? renamedSuggestion : x))
       supabase.from('exploration_nodes').update({ payload: { recipes: updatedList } }).eq('id', currentRecipeListNodeId)
         .then(({ error }) => { if (error) console.warn('[rename] sibling list sync failed (non-fatal, primary save already succeeded):', error.message) })
     }
@@ -7782,7 +7802,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     // S32: a tweak card's list entry is the ORIGINAL recipe — the tweak
     // lives on its own node — so its rename/save isn't synced into the list.
     if (user && currentRecipeListNodeId && result?.suggestions && !(nodeId && tweakNodeIdsRef.current.has(nodeId))) {
-      const updatedList = result.suggestions.map(x => x.__cardKey === cardKey ? savedSuggestion : x)
+      const updatedList = listForSave(result.suggestions.map(x => x.__cardKey === cardKey ? savedSuggestion : x))
       supabase.from('exploration_nodes').update({ payload: { recipes: updatedList } }).eq('id', currentRecipeListNodeId)
         .then(({ error }) => { if (error) console.warn('[save] sibling list sync failed (non-fatal):', error.message) })
     }
@@ -7900,6 +7920,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(true); setMoreIdeasExist(false); setMorePublishedExist(true)
     setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchKeys(new Set())
     bufferFillGenerationRef.current += 1; endResultsSession()
+    listEntryOriginalsRef.current = pendingRestore.listEntryOriginals || {}
     bufferFillPromiseRef.current = null
     setCurrentWhiteboardId(pendingRestore.whiteboardId || null)
     setCurrentIngredientsNodeId(pendingRestore.ingredientsNodeId || null)
@@ -8299,6 +8320,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     const wbId = opts.whiteboardId !== undefined ? opts.whiteboardId : currentWhiteboardId
     const recipeListNodeId = opts.recipeListNodeId !== undefined ? opts.recipeListNodeId : currentRecipeListNodeId
     const baseSuggestions = opts.baseSuggestions ?? result?.suggestions ?? []
+    const shown = shownForExclusion(baseSuggestions)
     setSeeMoreLoading(true)
     setSeeMoreError(null)
     setSeeMoreSeedWarning(false)
@@ -8310,10 +8332,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       // ingredients to judge substantive overlap (e.g. two different-round suggestions both
       // swapping in Cardamaro under different invented names). Include each excluded
       // suggestion's full ingredient list so distinctness is judged on the swap, not the name.
-      const excludeNames = baseSuggestions
+      const excludeNames = shown
         .filter(s => s.origin === 'riff' || s.origin === 'original')
         .map(s => `${s.recipe_name} (${(s.recipe || []).map(r => r.ingredient).join(', ')})`)
-      const freshData = stripCiteTags(await analyzeExplorationsOriginals(selected, activeTemplate, modifiers, inventoryText, excludeNames, DIAG_ON ? 'tier2-3-see-more-ideas' : null, publishedShownList(baseSuggestions)))
+      const freshData = stripCiteTags(await analyzeExplorationsOriginals(selected, activeTemplate, modifiers, inventoryText, excludeNames, DIAG_ON ? 'tier2-3-see-more-ideas' : null, publishedShownList(shown)))
       if (!isCurrent()) return null
       const rawSuggestions = freshData?.suggestions || []
       // Session 21, Change 2: tier-2/3 has no search tool and, until now, no
@@ -8327,7 +8349,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       // for being untagged alone.
       const seedKept = filterSuggestionsBySeedIngredients(rawSuggestions, selected, inventoryTags, DIAG_ON ? 'tier2-3-see-more-ideas' : null)
       // S32: the backstop for ALREADY ON SCREEN — see dropAlreadyShownDrinks.
-      const { kept: unshown, dropped: alreadyShown } = dropAlreadyShownDrinks(seedKept, baseSuggestions)
+      const { kept: unshown, dropped: alreadyShown } = dropAlreadyShownDrinks(seedKept, shown)
       if (alreadyShown.length > 0) console.warn(`[see more] dropped ${alreadyShown.length} already-shown drink(s): ${alreadyShown.map(s => `${s.recipe_name} [${s.origin}]`).join(', ')}`)
       const newSuggestions = withCardKeys(unshown)
       // Everything the model proposed failed to actually use a listed
@@ -8374,7 +8396,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
             }
           })
           if (isCurrent()) setCurrentRecipeNodeIds(prev => ({ ...prev, ...newIds }))
-          await supabase.from('exploration_nodes').update({ payload: { recipes: mergedSuggestions } }).eq('id', recipeListNodeId)
+          await supabase.from('exploration_nodes').update({ payload: { recipes: listForSave(mergedSuggestions) } }).eq('id', recipeListNodeId)
           await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', wbId)
         } catch (err) {
           console.warn('[whiteboard] failed to persist see-more suggestions:', err.message)
@@ -8403,6 +8425,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     const session = resultsSessionRef.current
     const isCurrent = () => resultsSessionRef.current === session
     const baseSuggestions = result?.suggestions ?? []
+    const shown = shownForExclusion(baseSuggestions)
     setSeeMorePublishedLoading(true)
     setSeeMorePublishedError(null)
     try {
@@ -8448,7 +8471,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         setPublishedBuffer(prev => prev.filter(c => !drainedNames.has(c.name.trim().toLowerCase())))
         if (DIAG_ON) console.log(`[DIAG:tier1-see-more-published-tap${tapN}] drained result`, JSON.stringify({ requested: drainBatch, got: newSuggestions.map(s => ({ name: s.recipe_name, tier: s.tier })) }))
       } else {
-        const excludeNames = baseSuggestions.filter(s => s.origin === 'published' || s.origin === 'published_variation').map(s => s.recipe_name)
+        const excludeNames = shown.filter(s => s.origin === 'published' || s.origin === 'published_variation').map(s => s.recipe_name)
         if (DIAG_ON) {
           const joined = excludeNames.join(', ')
           console.log(`[DIAG:tier1-see-more-published-tap${tapN}] exclusion list ${JSON.stringify({ count: excludeNames.length, chars: joined.length, approxWords: joined.split(/\s+/).filter(Boolean).length })}`)
@@ -8466,17 +8489,24 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         // fired from here, since this branch only runs once the buffer was
         // already empty and there's no results-just-rendered moment to hide
         // a verification cost inside.
-        const allDisplayedNames = new Set([...baseSuggestions, ...newSuggestions].map(s => (s.recipe_name || '').trim().toLowerCase()))
+        const allDisplayedNames = new Set([...shown, ...newSuggestions].map(s => (s.recipe_name || '').trim().toLowerCase()))
         const existingBufferNames = new Set(currentBuffer.map(c => c.name.trim().toLowerCase()))
         const bufferAdditions = (freshData?.buffer || []).filter(c => !existingBufferNames.has(c.name.trim().toLowerCase()) && !allDisplayedNames.has(c.name.trim().toLowerCase()))
         const nextBuffer = [...currentBuffer, ...bufferAdditions].sort((a, b) => (TIER_RANK[a.tier] ?? 1) - (TIER_RANK[b.tier] ?? 1)).slice(0, 10)
         if (DIAG_ON) console.log(`[DIAG:tier1-see-more-published-tap${tapN}] fresh-search buffer merge`, JSON.stringify({ additions: bufferAdditions, newBufferSize: nextBuffer.length }))
         setPublishedBuffer(nextBuffer)
       }
+      // S32: the e43966f backstop, on this path too — the exclusion list
+      // above is only a request to the model, and a restored session's
+      // Kingston Negroni came back beside the one already on screen. Covers
+      // a buffer drain as well: buffered names were deduped when added, but
+      // not against cards that arrived since.
+      const { kept: unshownPublished, dropped: alreadyShownPublished } = dropAlreadyShownDrinks(newSuggestions, shown)
+      if (alreadyShownPublished.length > 0) console.warn(`[see more published] dropped ${alreadyShownPublished.length} already-shown drink(s): ${alreadyShownPublished.map(s => `${s.recipe_name} [${s.origin}]`).join(', ')}`)
       // Session 11, Change 2: only sort the NEW batch among itself, then
       // append after what's already there — see the matching comment in
       // handleSeeMore.
-      newSuggestions = withCardKeys(newSuggestions)
+      newSuggestions = withCardKeys(unshownPublished)
       const mergedSuggestions = [...baseSuggestions, ...sortByOriginRank(newSuggestions)]
       setNewBatchKeys(new Set(newSuggestions.map(s => s.__cardKey)))
 
@@ -8506,7 +8536,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
             }
           })
           if (isCurrent()) setCurrentRecipeNodeIds(prev => ({ ...prev, ...newIds }))
-          await supabase.from('exploration_nodes').update({ payload: { recipes: mergedSuggestions } }).eq('id', currentRecipeListNodeId)
+          await supabase.from('exploration_nodes').update({ payload: { recipes: listForSave(mergedSuggestions) } }).eq('id', currentRecipeListNodeId)
           await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', currentWhiteboardId)
         } catch (err) {
           console.warn('[whiteboard] failed to persist see-more-published suggestions:', err.message)
@@ -10031,6 +10061,10 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
     let autoExpandIndex = -1
     let autoExpandRecipeName = null
     let restoreRecipeNodeId = null
+    // S32: card key → the list entry a tweak is displayed over. The results
+    // screen saves this, not the tweak, whenever it writes the list (see
+    // listForSave in ExplorationsScreen).
+    const listEntryOriginals = {}
     if (node.node_type === 'recipe') {
       autoExpandRecipeName = node.payload?.recipe?.recipe_name ?? null
       restoreRecipeNodeId = node.id
@@ -10047,6 +10081,8 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
         // S32: only the entry that IS this tweak's ancestor node — by name,
         // every same-named card took the tweaked recipe. Its key is kept.
         autoExpandIndex = entryIndexFor(recipeAncestor, originalName)
+        const original = suggestions[autoExpandIndex]
+        if (original?.__cardKey) listEntryOriginals[original.__cardKey] = original
         suggestions = suggestions.map((r, i) => i === autoExpandIndex ? { ...r, ...safeTweaked, __cardKey: r.__cardKey } : r)
       }
       // Prefer tweaked name; fall back to original so the card can still be found
@@ -10107,6 +10143,7 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
       restoreRecipeNodeId,
       restoreNodeData,
       autoExpandNodeData,
+      listEntryOriginals,
     }
   }
 
