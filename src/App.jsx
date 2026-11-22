@@ -7578,6 +7578,28 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // session the user then left, is dropped rather than drained by name into
   // whatever session is current. That loss is the accepted cost.
   const resultsSessionRef = useRef(0)
+
+  // S32: node ids in the id map that are TWEAK nodes, not recipe nodes. A card
+  // restored from a tweak ("Continue from here" on the tweak) is that tweak —
+  // its Tried/notes/rename/save belong on the tweak node. Before card keys its
+  // lifted writes missed the name-keyed map whenever the tweak had a new name
+  // (silently never saved); with card keys they landed on the ANCESTOR recipe
+  // node, so restoring from the list showed the original recipe wearing the
+  // tweak's Tried and notes. buildContinueRestore now maps the card to the
+  // tweak node, and this set tells rename/save which payload shape to write: a
+  // tweak's payload is { prompt, result, conversation?, tweak_label }, and the
+  // recipe-node shape { recipe } would wipe it. Node ids are unique, so the set
+  // never needs clearing between sessions.
+  const tweakNodeIdsRef = useRef(new Set())
+  const writeCardPayload = async (nodeId, recipe) => {
+    if (tweakNodeIdsRef.current.has(nodeId)) {
+      const { data, error } = await supabase.from('exploration_nodes').select('payload').eq('id', nodeId).single()
+      if (error) return { error }
+      const prev = data?.payload || {}
+      return supabase.from('exploration_nodes').update({ payload: { ...prev, result: { ...(prev.result || {}), ...stripInternalFields(recipe) } } }).eq('id', nodeId)
+    }
+    return supabase.from('exploration_nodes').update({ payload: { recipe } }).eq('id', nodeId)
+  }
   const endResultsSession = () => {
     resultsSessionRef.current += 1
     setPendingRecipeNotes({}); setPendingRecipeTried({}); setPendingRecipeNames({})
@@ -7654,7 +7676,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     const nodePayload = { recipe: { ...renamedSuggestion, recipe_name: newName } }
 
     if (nodeId && user) {
-      const { error } = await supabase.from('exploration_nodes').update({ payload: nodePayload }).eq('id', nodeId)
+      const { error } = await writeCardPayload(nodeId, nodePayload.recipe)
       if (error) throw new Error(error.message || 'Could not save name.')
       setPendingRecipeNames(prev => {
         if (!(cardKey in prev)) return prev
@@ -7684,7 +7706,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       ...prev,
       suggestions: (prev.suggestions || []).map(x => x.__cardKey === cardKey ? renamedSuggestion : x),
     } : prev)
-    if (user && currentRecipeListNodeId && result?.suggestions) {
+    // S32: a tweak card's list entry is the ORIGINAL recipe — the tweak
+    // lives on its own node — so its rename/save isn't synced into the list.
+    if (user && currentRecipeListNodeId && result?.suggestions && !(nodeId && tweakNodeIdsRef.current.has(nodeId))) {
       const updatedList = result.suggestions.map(x => x.__cardKey === cardKey ? renamedSuggestion : x)
       supabase.from('exploration_nodes').update({ payload: { recipes: updatedList } }).eq('id', currentRecipeListNodeId)
         .then(({ error }) => { if (error) console.warn('[rename] sibling list sync failed (non-fatal, primary save already succeeded):', error.message) })
@@ -7709,7 +7733,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     const nodePayload = { recipe: savedSuggestion }
 
     if (nodeId && user) {
-      const { error } = await supabase.from('exploration_nodes').update({ payload: nodePayload }).eq('id', nodeId)
+      const { error } = await writeCardPayload(nodeId, nodePayload.recipe)
       if (error) { console.warn('[save] node persist failed (non-fatal, to_make row already saved):', error.message) }
     } else if (user && currentWhiteboardId && currentRecipeListNodeId) {
       try {
@@ -7734,7 +7758,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       ...prev,
       suggestions: (prev.suggestions || []).map(x => x.__cardKey === cardKey ? savedSuggestion : x),
     } : prev)
-    if (user && currentRecipeListNodeId && result?.suggestions) {
+    // S32: a tweak card's list entry is the ORIGINAL recipe — the tweak
+    // lives on its own node — so its rename/save isn't synced into the list.
+    if (user && currentRecipeListNodeId && result?.suggestions && !(nodeId && tweakNodeIdsRef.current.has(nodeId))) {
       const updatedList = result.suggestions.map(x => x.__cardKey === cardKey ? savedSuggestion : x)
       supabase.from('exploration_nodes').update({ payload: { recipes: updatedList } }).eq('id', currentRecipeListNodeId)
         .then(({ error }) => { if (error) console.warn('[save] sibling list sync failed (non-fatal):', error.message) })
@@ -7766,8 +7792,8 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       // S32: buffer keys are card keys; the value carries the name too.
       const { originalName, newName } = names[name]
       const existing = (result?.suggestions || []).find(x => x.__cardKey === name)
-      const payload = { recipe: { ...(existing || { recipe_name: originalName, __cardKey: name }), recipe_name: newName, display_name: newName, name_user_supplied: true } }
-      supabase.from('exploration_nodes').update({ payload }).eq('id', currentRecipeNodeIds[name])
+      const recipe = { ...(existing || { recipe_name: originalName, __cardKey: name }), recipe_name: newName, display_name: newName, name_user_supplied: true }
+      writeCardPayload(currentRecipeNodeIds[name], recipe)
         .then(({ error }) => { if (error) console.warn('[rename] deferred save failed:', error.message) })
     })
     if (noteNames.length > 0) setPendingRecipeNotes(prev => { const n = { ...prev }; noteNames.forEach(k => delete n[k]); return n })
@@ -7864,7 +7890,11 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     setAutoExpandNodeData(pendingRestore.autoExpandNodeData || null)
     // Pre-populate node IDs so RecipeCards bind to existing rows instead of creating duplicates
     const restoredNodeIds = {}
-    Object.entries(nd).forEach(([name, data]) => { if (data.nodeId) restoredNodeIds[name] = data.nodeId })
+    Object.entries(nd).forEach(([name, data]) => {
+      if (!data.nodeId) return
+      restoredNodeIds[name] = data.nodeId
+      if (data.nodeType === 'tweak') tweakNodeIdsRef.current.add(data.nodeId)
+    })
     setCurrentRecipeNodeIds(restoredNodeIds)
     // Seed navStack so Back from restored results → whiteboard → In Progress
     const stack = []
@@ -10031,6 +10061,14 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
     const autoExpandNodeData = autoExpandNode
       ? { tried: triedMap[autoExpandNode.id] ?? !!autoExpandNode.tried, notes: nodeNotes[autoExpandNode.id] ?? autoExpandNode.notes ?? '' }
       : null
+    // S32: restoring from a tweak, the card IS the tweak — point its entry at
+    // the tweak node so Tried/notes/rename/save land there, not on the
+    // ancestor recipe node its list entry is paired with (see tweakNodeIdsRef
+    // in ExplorationsScreen). Display already read the tweak node's data.
+    if (node.node_type === 'tweak' && autoExpandNode && autoExpandIndex !== -1 && Array.isArray(suggestions)) {
+      const key = suggestions[autoExpandIndex]?.__cardKey
+      if (key) restoreNodeData[key] = { nodeId: autoExpandNode.id, nodeType: 'tweak', ...autoExpandNodeData }
+    }
 
     return {
       primary_ingredients: selected,
