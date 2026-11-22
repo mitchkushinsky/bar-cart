@@ -1193,6 +1193,61 @@ function stripInternalFields(obj) {
   return out
 }
 
+// S32: a results card's identity in Create. recipe_name can't be one — See
+// More riffs routinely come back with the same name as a tier-1 card ("Negroni"
+// beside the Negroni), and every name-keyed lookup then picked whichever card
+// wrote last. The node id can't be one either: a card is on screen and taking
+// input before its node insert resolves. So each suggestion gets a key the
+// moment it enters the results list, and the node-id map, the notes/tried/
+// rename buffers, restore data and the New badge all key off it.
+// Persisted ON PURPOSE in the recipe node's payload.recipe and the list node's
+// payload.recipes, so a restore can pair each list entry with its own node.
+// `__`-prefixed so stripInternalFields keeps it out of RecipeCard (the
+// results list passes it as its own prop) and out of every prompt.
+function newCardKey() {
+  return globalThis.crypto?.randomUUID?.() ?? `ck-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+function withCardKeys(list) {
+  return (list || []).map(s => (s && typeof s === 'object' && !s.__cardKey) ? { ...s, __cardKey: newCardKey() } : s)
+}
+// Pairs each recipe_list entry with its own recipe node. Keyed rows match on
+// __cardKey. Rows written before keys existed fall back to the nth entry with
+// a name <-> the nth sibling node with that name, in creation order (callers
+// pass nodes ordered by created_at) — the old code mapped every same-named
+// entry to whichever node came last. An entry with no node keeps (or gets) a
+// key of its own; a legacy entry that does match takes its node's id as key.
+function pairListWithNodes(recipes, siblingNodes) {
+  const byKey = new Map()
+  const byId = new Map()
+  const byName = new Map()
+  const nameOf = r => r?.display_name || r?.recipe_name || null
+  for (const n of siblingNodes || []) {
+    const r = n.payload?.recipe
+    if (!r) continue
+    byId.set(n.id, n)
+    if (r.__cardKey && !byKey.has(r.__cardKey)) { byKey.set(r.__cardKey, n); continue }
+    const nm = nameOf(r)
+    if (!nm) continue
+    if (!byName.has(nm)) byName.set(nm, [])
+    byName.get(nm).push(n)
+  }
+  const used = new Set()
+  return (recipes || []).map(entry => {
+    // A legacy entry restored once took its node's id as its key (below);
+    // if that list was saved again since, the key matches the node by id.
+    let node = entry?.__cardKey ? byKey.get(entry.__cardKey) || byId.get(entry.__cardKey) || null : null
+    if (node && used.has(node.id)) node = null
+    if (!node) {
+      const queue = byName.get(nameOf(entry)) || []
+      while (queue.length && used.has(queue[0].id)) queue.shift()
+      node = queue.shift() || null
+    }
+    if (node) used.add(node.id)
+    const __cardKey = entry?.__cardKey || node?.id || newCardKey()
+    return { entry: { ...entry, __cardKey }, node }
+  })
+}
+
 function stripCiteTags(val) {
   if (typeof val === 'string') return val.replace(/<cite[^>]*>(.*?)<\/cite>/gs, '$1')
   if (Array.isArray(val)) return val.map(stripCiteTags)
@@ -5916,6 +5971,9 @@ function RecipeCard({
   whiteboardId = null,
   recipeListNodeId = null,
   recipeNodeIds = null,
+  // S32: the results list's identity for this card (see newCardKey) —
+  // recipeNodeIds is keyed by it, never by recipe_name.
+  cardKey = null,
   autoExpand = false,
   restoreRecipeNodeId = null,
   initialTried = false,
@@ -5970,7 +6028,7 @@ function RecipeCard({
   // persists a save the same way it persists a rename, see handleRecipeSaved)
   // correctly shows as saved without the id needing to be looked up by name.
   const [toMakeIdOverride, setToMakeIdOverride] = useState(suggestion.to_make_id ?? null)
-  const recipeNodeIdRef = useRef(restoreRecipeNodeId || recipeNodeIds?.[suggestion.recipe_name] || null)
+  const recipeNodeIdRef = useRef(restoreRecipeNodeId || (cardKey != null ? recipeNodeIds?.[cardKey] : null) || null)
   const cardRef = useRef(null)
   const pendingTriedRef = useRef(null)
   const pendingNotesRef = useRef(null)
@@ -6029,8 +6087,8 @@ function RecipeCard({
   // Sync ref when eager recipe-node writes complete after cards have already rendered.
   // Flush any tried/notes/rename mutations that arrived before the ID was known.
   useEffect(() => {
-    if (!recipeNodeIdRef.current && recipeNodeIds?.[suggestion.recipe_name]) {
-      recipeNodeIdRef.current = recipeNodeIds[suggestion.recipe_name]
+    if (!recipeNodeIdRef.current && cardKey != null && recipeNodeIds?.[cardKey]) {
+      recipeNodeIdRef.current = recipeNodeIds[cardKey]
       if (user) {
         if (pendingTriedRef.current !== null) {
           const p = pendingTriedRef.current
@@ -6135,7 +6193,7 @@ function RecipeCard({
       try {
         const { data } = await supabase
           .from('exploration_nodes')
-          .insert({ whiteboard_id: whiteboardId, parent_node_id: recipeListNodeId, node_type: 'recipe', payload: { recipe: displayed } })
+          .insert({ whiteboard_id: whiteboardId, parent_node_id: recipeListNodeId, node_type: 'recipe', payload: { recipe: cardKey != null ? { ...displayed, __cardKey: cardKey } : displayed } })
           .select('id').single()
         recipeNodeIdRef.current = data?.id ?? null
         if (data?.id) {
@@ -7378,7 +7436,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // (the next interaction that would produce a new batch to distinguish), and
   // on a fresh exploration/reset — not on unrelated interactions like opening
   // a card, so the marker stays useful while the user works through a batch.
-  const [newBatchNames, setNewBatchNames] = useState(() => new Set())
+  const [newBatchKeys, setNewBatchKeys] = useState(() => new Set())
   const firstNewCardRef = useRef(null)
   // TEMP DIAGNOSTIC — removable with the rest of the DIAG_ON instrumentation.
   // Starts at 2: the initial Build (handleExplore) is conceptually "tap 1",
@@ -7431,7 +7489,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   const [currentRecipeNodeIds, setCurrentRecipeNodeIds] = useState({})
   const [continueFromNodeId, setContinueFromNodeId] = useState(null)
   const [autoExpandRecipeNodeId, setAutoExpandRecipeNodeId] = useState(null)
-  const [restoreNodeData, setRestoreNodeData] = useState({}) // recipe_name → { nodeId, tried, notes } — siblings only, see buildContinueRestore
+  const [restoreNodeData, setRestoreNodeData] = useState({}) // card key → { nodeId, tried, notes } — siblings only, see buildContinueRestore
   const [autoExpandNodeData, setAutoExpandNodeData] = useState(null) // { tried, notes } for the auto-expanded card, keyed by node id not name
 
   // Session 9, Change 1: notes/tried typed or tapped on a recipe card in the
@@ -7501,38 +7559,38 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // Throws on a real write failure so RecipeCard's own await/catch can roll
   // back its optimistic UI and show the user something actually failed,
   // rather than the previous fire-and-forget `.then()` that swallowed it.
-  const handleRecipeNotesSave = async (recipeName, value) => {
-    const nodeId = currentRecipeNodeIds[recipeName]
+  const handleRecipeNotesSave = async (cardKey, value) => {
+    const nodeId = currentRecipeNodeIds[cardKey]
     if (nodeId && user) {
       const { error } = await supabase.from('exploration_nodes').update({ notes: value }).eq('id', nodeId)
       if (error) throw new Error(error.message || 'Could not save note.')
       setPendingRecipeNotes(prev => {
-        if (!(recipeName in prev)) return prev
-        const next = { ...prev }; delete next[recipeName]; return next
+        if (!(cardKey in prev)) return prev
+        const next = { ...prev }; delete next[cardKey]; return next
       })
     } else {
-      setPendingRecipeNotes(prev => ({ ...prev, [recipeName]: value }))
+      setPendingRecipeNotes(prev => ({ ...prev, [cardKey]: value }))
     }
   }
 
-  const handleRecipeTriedToggle = async (recipeName, next, triedAt) => {
-    const nodeId = currentRecipeNodeIds[recipeName]
+  const handleRecipeTriedToggle = async (cardKey, next, triedAt) => {
+    const nodeId = currentRecipeNodeIds[cardKey]
     if (nodeId && user) {
       const { error } = await supabase.from('exploration_nodes').update({ tried: next, tried_at: triedAt }).eq('id', nodeId)
       if (error) throw new Error(error.message || 'Could not save.')
       setPendingRecipeTried(prev => {
-        if (!(recipeName in prev)) return prev
-        const nextMap = { ...prev }; delete nextMap[recipeName]; return nextMap
+        if (!(cardKey in prev)) return prev
+        const nextMap = { ...prev }; delete nextMap[cardKey]; return nextMap
       })
     } else {
-      setPendingRecipeTried(prev => ({ ...prev, [recipeName]: { tried: next, tried_at: triedAt } }))
+      setPendingRecipeTried(prev => ({ ...prev, [cardKey]: { tried: next, tried_at: triedAt } }))
     }
   }
 
   // Session 15, Change 4: `originalName` is always the suggestion's identity —
   // recipe_name as generated, never a previously-renamed value — because this
   // is invoked from the RecipeCard callsites below as
-  // `onRename={newName => handleRecipeRename(s.recipe_name, newName)}`, and
+  // `onRename={newName => handleRecipeRename(s.__cardKey, s.recipe_name, newName)}`, and
   // `s.recipe_name` in that closure is `result.suggestions`' own copy, which
   // this function deliberately never mutates (see renamedSuggestion below) —
   // exactly so the identity used to look up nodeId/currentRecipeNodeIds can
@@ -7553,21 +7611,21 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   //    display on OTHER cards in the same batch is affected, not the rename
   //    itself. Reported in the session writeup as the one propagation case
   //    that's best-effort rather than guaranteed.
-  const handleRecipeRename = async (originalName, newName) => {
+  const handleRecipeRename = async (cardKey, originalName, newName) => {
     const session = resultsSessionRef.current
-    const nodeId = currentRecipeNodeIds[originalName]
-    const existing = (result?.suggestions || []).find(x => x.recipe_name === originalName)
+    const nodeId = currentRecipeNodeIds[cardKey]
+    const existing = (result?.suggestions || []).find(x => x.__cardKey === cardKey)
     const renamedSuggestion = existing
       ? { ...existing, display_name: newName, name_user_supplied: true }
-      : { recipe_name: originalName, display_name: newName, name_user_supplied: true }
+      : { recipe_name: originalName, __cardKey: cardKey, display_name: newName, name_user_supplied: true }
     const nodePayload = { recipe: { ...renamedSuggestion, recipe_name: newName } }
 
     if (nodeId && user) {
       const { error } = await supabase.from('exploration_nodes').update({ payload: nodePayload }).eq('id', nodeId)
       if (error) throw new Error(error.message || 'Could not save name.')
       setPendingRecipeNames(prev => {
-        if (!(originalName in prev)) return prev
-        const next = { ...prev }; delete next[originalName]; return next
+        if (!(cardKey in prev)) return prev
+        const next = { ...prev }; delete next[cardKey]; return next
       })
     } else if (user && currentWhiteboardId && currentRecipeListNodeId) {
       try {
@@ -7575,12 +7633,12 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           .insert({ whiteboard_id: currentWhiteboardId, parent_node_id: currentRecipeListNodeId, node_type: 'recipe', payload: nodePayload })
           .select('id').single()
         if (error) throw error
-        if (data?.id && resultsSessionRef.current === session) setCurrentRecipeNodeIds(prev => ({ ...prev, [originalName]: data.id }))
+        if (data?.id && resultsSessionRef.current === session) setCurrentRecipeNodeIds(prev => ({ ...prev, [cardKey]: data.id }))
       } catch (err) {
         throw new Error(err?.message || 'Could not save name.')
       }
     } else {
-      setPendingRecipeNames(prev => ({ ...prev, [originalName]: newName }))
+      setPendingRecipeNames(prev => ({ ...prev, [cardKey]: { originalName, newName } }))
     }
     // Best-effort sibling-list sync — see comment above. Never blocks or
     // throws past this point; the primary write above already succeeded.
@@ -7591,10 +7649,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     // suggestions, captured when the rename started.
     if (resultsSessionRef.current === session) setResult(prev => prev ? {
       ...prev,
-      suggestions: (prev.suggestions || []).map(x => x.recipe_name === originalName ? renamedSuggestion : x),
+      suggestions: (prev.suggestions || []).map(x => x.__cardKey === cardKey ? renamedSuggestion : x),
     } : prev)
     if (user && currentRecipeListNodeId && result?.suggestions) {
-      const updatedList = result.suggestions.map(x => x.recipe_name === originalName ? renamedSuggestion : x)
+      const updatedList = result.suggestions.map(x => x.__cardKey === cardKey ? renamedSuggestion : x)
       supabase.from('exploration_nodes').update({ payload: { recipes: updatedList } }).eq('id', currentRecipeListNodeId)
         .then(({ error }) => { if (error) console.warn('[rename] sibling list sync failed (non-fatal, primary save already succeeded):', error.message) })
     }
@@ -7608,13 +7666,13 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // somewhere durable, a fresh mount (navigate to Saved and back via In
   // Progress — the exact sequence in the original bug) would have nothing to
   // derive "already saved" from at all.
-  const handleRecipeSaved = async (originalName, newId) => {
+  const handleRecipeSaved = async (cardKey, originalName, newId) => {
     const session = resultsSessionRef.current
-    const nodeId = currentRecipeNodeIds[originalName]
-    const existing = (result?.suggestions || []).find(x => x.recipe_name === originalName)
+    const nodeId = currentRecipeNodeIds[cardKey]
+    const existing = (result?.suggestions || []).find(x => x.__cardKey === cardKey)
     const savedSuggestion = existing
       ? { ...existing, to_make_id: newId }
-      : { recipe_name: originalName, to_make_id: newId }
+      : { recipe_name: originalName, __cardKey: cardKey, to_make_id: newId }
     const nodePayload = { recipe: savedSuggestion }
 
     if (nodeId && user) {
@@ -7626,7 +7684,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           .insert({ whiteboard_id: currentWhiteboardId, parent_node_id: currentRecipeListNodeId, node_type: 'recipe', payload: nodePayload })
           .select('id').single()
         if (error) throw error
-        if (data?.id && resultsSessionRef.current === session) setCurrentRecipeNodeIds(prev => ({ ...prev, [originalName]: data.id }))
+        if (data?.id && resultsSessionRef.current === session) setCurrentRecipeNodeIds(prev => ({ ...prev, [cardKey]: data.id }))
       } catch (err) {
         console.warn('[save] node create failed (non-fatal, to_make row already saved):', err.message)
       }
@@ -7641,10 +7699,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     // session is current; the list-node write below is this session's own.
     if (resultsSessionRef.current === session) setResult(prev => prev ? {
       ...prev,
-      suggestions: (prev.suggestions || []).map(x => x.recipe_name === originalName ? savedSuggestion : x),
+      suggestions: (prev.suggestions || []).map(x => x.__cardKey === cardKey ? savedSuggestion : x),
     } : prev)
     if (user && currentRecipeListNodeId && result?.suggestions) {
-      const updatedList = result.suggestions.map(x => x.recipe_name === originalName ? savedSuggestion : x)
+      const updatedList = result.suggestions.map(x => x.__cardKey === cardKey ? savedSuggestion : x)
       supabase.from('exploration_nodes').update({ payload: { recipes: updatedList } }).eq('id', currentRecipeListNodeId)
         .then(({ error }) => { if (error) console.warn('[save] sibling list sync failed (non-fatal):', error.message) })
     }
@@ -7672,9 +7730,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         .then(({ error }) => { if (error) console.warn('[tried] deferred save failed:', error.message) })
     })
     renameNames.forEach(name => {
-      const newName = names[name]
-      const existing = (result?.suggestions || []).find(x => x.recipe_name === name)
-      const payload = { recipe: { ...(existing || { recipe_name: name }), recipe_name: newName, display_name: newName, name_user_supplied: true } }
+      // S32: buffer keys are card keys; the value carries the name too.
+      const { originalName, newName } = names[name]
+      const existing = (result?.suggestions || []).find(x => x.__cardKey === name)
+      const payload = { recipe: { ...(existing || { recipe_name: originalName, __cardKey: name }), recipe_name: newName, display_name: newName, name_user_supplied: true } }
       supabase.from('exploration_nodes').update({ payload }).eq('id', currentRecipeNodeIds[name])
         .then(({ error }) => { if (error) console.warn('[rename] deferred save failed:', error.message) })
     })
@@ -7759,7 +7818,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     // genuinely doesn't know: lean toward true. A tap with an empty buffer
     // falls through to a real search, same as any other empty-buffer tap.
     setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(true); setMoreIdeasExist(false); setMorePublishedExist(true)
-    setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set())
+    setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchKeys(new Set())
     bufferFillGenerationRef.current += 1; endResultsSession()
     bufferFillPromiseRef.current = null
     setCurrentWhiteboardId(pendingRestore.whiteboardId || null)
@@ -7815,10 +7874,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // session. A short delay lets the new cards actually paint before measuring
   // where to scroll; mirrors the existing autoExpand scroll pattern on RecipeCard.
   useEffect(() => {
-    if (newBatchNames.size === 0) return
+    if (newBatchKeys.size === 0) return
     const id = setTimeout(() => firstNewCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
     return () => clearTimeout(id)
-  }, [newBatchNames])
+  }, [newBatchKeys])
 
   const upsertHistory = (ingredients, searchTemplate, searchFrozen, searchLowABV, searchNa, searchResult) => {
     const entry = {
@@ -7907,7 +7966,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         setPublishedBuffer(top.publishedBuffer)
         setMorePublishedExist(top.morePublishedExist)
         setCurrentRecipeNodeIds(top.recipeNodeIds)
-        setNewBatchNames(new Set())
+        setNewBatchKeys(new Set())
         bufferFillGenerationRef.current += 1; endResultsSession()
         bufferFillPromiseRef.current = null
         setStep('results')
@@ -7954,7 +8013,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     // scoped to one exploration's search, not carried across a Start Over or
     // a new Build with different ingredients.
     setPublishedBuffer([])
-    setNewBatchNames(new Set())
+    setNewBatchKeys(new Set())
     // Session 11, Change 1: invalidate any background fill still in flight
     // from the exploration this call is replacing — its result, if it lands
     // after this, must be silently discarded rather than overwriting this
@@ -8008,6 +8067,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
         }
       }
       if (!isCurrent()) return null
+      // S32: card keys before anything reads the list — the screen, the
+      // inserts below (recipes is a deep copy, so the keys go into each
+      // node payload and the list payload) and the id map built from them.
+      if (Array.isArray(data?.suggestions)) data.suggestions = withCardKeys(data.suggestions)
       setResult(data)
       setMorePublishedExist(data?.more_published_exist === true)
       if (DIAG_ON) console.log('[DIAG:tier1-build] tiers+candidates', JSON.stringify({ displayed: (data?.suggestions || []).map(s => ({ name: s.recipe_name, tier: s.tier, origin: s.origin })), rawCandidates: data?.buffer || [] }))
@@ -8104,8 +8167,8 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
                 )
                 recipes.forEach((recipe, i) => {
                   const r = settled[i]
-                  if (r.status === 'fulfilled' && r.value?.data?.id && recipe.recipe_name) {
-                    recipeNodeIds[recipe.recipe_name] = r.value.data.id
+                  if (r.status === 'fulfilled' && r.value?.data?.id && recipe.__cardKey) {
+                    recipeNodeIds[recipe.__cardKey] = r.value.data.id
                   }
                 })
               }
@@ -8178,7 +8241,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       // name/alias/generic_type match keeps a suggestion, and an untagged
       // seed still falls back to literal matching rather than being rejected
       // for being untagged alone.
-      const newSuggestions = filterSuggestionsBySeedIngredients(rawSuggestions, selected, inventoryTags, DIAG_ON ? 'tier2-3-see-more-ideas' : null)
+      const newSuggestions = withCardKeys(filterSuggestionsBySeedIngredients(rawSuggestions, selected, inventoryTags, DIAG_ON ? 'tier2-3-see-more-ideas' : null))
       // Everything the model proposed failed to actually use a listed
       // ingredient — the likely cause is a seed that isn't a real/recognized
       // ingredient (typo or invented), not that no ideas exist. Left false
@@ -8191,7 +8254,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       // pull an existing card to a new position whenever a differently-ranked
       // suggestion arrived).
       const mergedSuggestions = [...baseSuggestions, ...sortByOriginRank(newSuggestions)]
-      setNewBatchNames(new Set(newSuggestions.map(s => s.recipe_name)))
+      setNewBatchKeys(new Set(newSuggestions.map(s => s.__cardKey)))
 
       setResult(prev => ({
         ...(prev || {}),
@@ -8216,8 +8279,8 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           const newIds = {}
           newSuggestions.forEach((recipe, i) => {
             const r = settled[i]
-            if (r.status === 'fulfilled' && r.value?.data?.id && recipe.recipe_name) {
-              newIds[recipe.recipe_name] = r.value.data.id
+            if (r.status === 'fulfilled' && r.value?.data?.id && recipe.__cardKey) {
+              newIds[recipe.__cardKey] = r.value.data.id
             }
           })
           if (isCurrent()) setCurrentRecipeNodeIds(prev => ({ ...prev, ...newIds }))
@@ -8323,8 +8386,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       // Session 11, Change 2: only sort the NEW batch among itself, then
       // append after what's already there — see the matching comment in
       // handleSeeMore.
+      newSuggestions = withCardKeys(newSuggestions)
       const mergedSuggestions = [...baseSuggestions, ...sortByOriginRank(newSuggestions)]
-      setNewBatchNames(new Set(newSuggestions.map(s => s.recipe_name)))
+      setNewBatchKeys(new Set(newSuggestions.map(s => s.__cardKey)))
 
       setResult(prev => ({
         ...(prev || {}),
@@ -8347,8 +8411,8 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
           const newIds = {}
           newSuggestions.forEach((recipe, i) => {
             const r = settled[i]
-            if (r.status === 'fulfilled' && r.value?.data?.id && recipe.recipe_name) {
-              newIds[recipe.recipe_name] = r.value.data.id
+            if (r.status === 'fulfilled' && r.value?.data?.id && recipe.__cardKey) {
+              newIds[recipe.__cardKey] = r.value.data.id
             }
           })
           if (isCurrent()) setCurrentRecipeNodeIds(prev => ({ ...prev, ...newIds }))
@@ -8368,7 +8432,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     }
   }
 
-  const reset = () => { bufferFillGenerationRef.current += 1; endResultsSession(); bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchNames(new Set()); setViaSurpriseMe(false); setTier1SeedDropped(false); guidanceRequestRef.current += 1; guidanceAbortRef.current?.abort(); guidanceAbortRef.current = null; setGuidance(null); setGuidanceLoading(false); setGuidanceError(null); setShowAllGuidance(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityKey(null); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null); setWalkLaunch(null) }
+  const reset = () => { bufferFillGenerationRef.current += 1; endResultsSession(); bufferFillPromiseRef.current = null; setStep('ingredients'); setNavStack([]); setSelected([]); setSelectedLabels([]); setSelectedMeta([]); setTemplate(null); setFrozen(false); setNa(false); setLowABV(false); setResult(null); setError(null); setFeedback(''); setFeedbackError(null); setFeedbackBanner(false); setOriginalsFetched(false); setSeeMoreLoading(false); setSeeMoreError(null); setSeeMoreSeedWarning(false); setMoreIdeasExist(false); setMorePublishedExist(false); setSeeMorePublishedLoading(false); setSeeMorePublishedError(null); setPublishedBuffer([]); setSeeMorePublishedFromBuffer(false); setNewBatchKeys(new Set()); setViaSurpriseMe(false); setTier1SeedDropped(false); guidanceRequestRef.current += 1; guidanceAbortRef.current?.abort(); guidanceAbortRef.current = null; setGuidance(null); setGuidanceLoading(false); setGuidanceError(null); setShowAllGuidance(false); setAffinityData({}); setAffinityError(null); setAffinityLoading(false); setContextualAffinityData([]); setContextualAffinityKey(null); setContextualAffinityLoading(false); setContextualAffinityError(null); setCategoryDrawer(null); setCombinationData(null); setCombinationLoading(false); setCombinationError(null); setShowIngredientAdder(false); setAdderQuery(''); setCurrentWhiteboardId(null); setCurrentIngredientsNodeId(null); setCurrentRecipeListNodeId(null); setCurrentRecipeNodeIds({}); setContinueFromNodeId(null); setAutoExpandRecipeNodeId(null); setRestoreNodeData({}); setAutoExpandNodeData(null); setWalkLaunch(null) }
 
   // Session 30: Create Something New — from Help Me Decide (template picked)
   // or the affinities screen. Same seeds and modifiers the Build path uses.
@@ -8385,7 +8449,10 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     try {
       const previousNames = (result?.suggestions || []).map(s => s.recipe_name)
       const data = await refineExplorations(selected, template, { frozen, lowABV, na }, inventoryText, previousNames, feedback.trim())
-      setResult(data)
+      // S32: refined cards get keys of their own, so a refined "Negroni"
+      // no longer inherits the pre-refine Negroni's node id. (Refine still
+      // inserts no nodes for them — logged, out of scope.)
+      setResult(data && Array.isArray(data.suggestions) ? { ...data, suggestions: withCardKeys(data.suggestions) } : data)
       setOriginalsFetched(true) // refine already returns a full revised set; the tier-1/2 split no longer applies
       setMoreIdeasExist(false)
       setMorePublishedExist(false)
@@ -8665,10 +8732,12 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // merged patch back up here so it lands in `result.suggestions` — the
   // session-level cache. Matched by recipe_name, consistent with every other
   // place in this file that keys a suggestion that way (recipeNodeIds, etc.).
-  const handleSuggestionDetailFetched = (recipeName, patch) => {
+  // S32: matched by card key, not recipe_name — by name, a tier-1 card's
+  // fetched detail was merged into a same-named See More card too.
+  const handleSuggestionDetailFetched = (cardKey, patch) => {
     setResult(prev => prev ? {
       ...prev,
-      suggestions: (prev.suggestions || []).map(s => s.recipe_name === recipeName ? { ...s, ...patch } : s),
+      suggestions: (prev.suggestions || []).map(s => s.__cardKey === cardKey ? { ...s, ...patch } : s),
     } : prev)
   }
 
@@ -9534,7 +9603,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventory={inventory} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} toMake={toMake} onSaved={(name, id) => handleRecipeSaved(name, id)} /></div> })}
+                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.__cardKey]; const isNew = newBatchKeys.has(s.__cardKey); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={s.__cardKey ?? i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} cardKey={s.__cardKey} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventory={inventory} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={(_name, patch) => handleSuggestionDetailFetched(s.__cardKey, patch)} onNotesSave={value => handleRecipeNotesSave(s.__cardKey, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.__cardKey, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.__cardKey, s.recipe_name, newName)} toMake={toMake} onSaved={(_name, id) => handleRecipeSaved(s.__cardKey, s.recipe_name, id)} /></div> })}
               </div>
             </div>
           )}
@@ -9542,7 +9611,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Shopping Required ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.recipe_name]; const isNew = newBatchNames.has(s.recipe_name); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventory={inventory} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={handleSuggestionDetailFetched} onNotesSave={value => handleRecipeNotesSave(s.recipe_name, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.recipe_name, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.recipe_name, newName)} toMake={toMake} onSaved={(name, id) => handleRecipeSaved(name, id)} /></div> })}
+                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.__cardKey]; const isNew = newBatchKeys.has(s.__cardKey); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={s.__cardKey ?? i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} cardKey={s.__cardKey} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventory={inventory} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={(_name, patch) => handleSuggestionDetailFetched(s.__cardKey, patch)} onNotesSave={value => handleRecipeNotesSave(s.__cardKey, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.__cardKey, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.__cardKey, s.recipe_name, newName)} toMake={toMake} onSaved={(_name, id) => handleRecipeSaved(s.__cardKey, s.recipe_name, id)} /></div> })}
               </div>
             </div>
           )}
@@ -9851,14 +9920,31 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
     const restoreRecipeListNodeId = isIngredients ? null : (node.node_type === 'recipe_list' ? node.id : recipeListNode?.id ?? null)
     const baseRecipes = isIngredients ? null : (node.node_type === 'recipe_list' ? node.payload?.recipes : recipeListNode?.payload?.recipes) || []
 
+    // S32: pair every list entry with its own recipe node (by card key, or by
+    // name + creation order for rows written before keys existed) — see
+    // pairListWithNodes. Every by-name match below used to pick the first or
+    // last same-named entry, so a See More "Negroni" beside the tier-1
+    // Negroni restored with the other card's node, Tried and notes.
+    const siblingRecipeNodes = restoreRecipeListNodeId
+      ? nodes.filter(n => n.parent_node_id === restoreRecipeListNodeId && n.node_type === 'recipe')
+      : []
+    const pairs = isIngredients ? [] : pairListWithNodes(baseRecipes, siblingRecipeNodes)
+    const entryIndexFor = (recipeNode, fallbackName) => {
+      const byNode = recipeNode ? pairs.findIndex(p => p.node?.id === recipeNode.id) : -1
+      if (byNode !== -1) return byNode
+      return fallbackName ? pairs.findIndex(p => p.entry.recipe_name === fallbackName) : -1
+    }
+
     // For tweak nodes: replace the original recipe in the list with the tweaked version
     // so the card opens showing the tweaked result ready to tweak further.
-    let suggestions = baseRecipes
+    let suggestions = isIngredients ? baseRecipes : pairs.map(p => p.entry)
+    let autoExpandIndex = -1
     let autoExpandRecipeName = null
     let restoreRecipeNodeId = null
     if (node.node_type === 'recipe') {
       autoExpandRecipeName = node.payload?.recipe?.recipe_name ?? null
       restoreRecipeNodeId = node.id
+      autoExpandIndex = entryIndexFor(node, autoExpandRecipeName)
     } else if (node.node_type === 'tweak') {
       const recipeAncestor = selfAndAncestors.find(n => n.node_type === 'recipe')
       const originalName = recipeAncestor?.payload?.recipe?.recipe_name
@@ -9868,7 +9954,10 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
         const safeTweaked = tweakedResult.recipe_name
           ? tweakedResult
           : { ...tweakedResult, recipe_name: originalName }
-        suggestions = baseRecipes.map(r => r.recipe_name === originalName ? { ...r, ...safeTweaked } : r)
+        // S32: only the entry that IS this tweak's ancestor node — by name,
+        // every same-named card took the tweaked recipe. Its key is kept.
+        autoExpandIndex = entryIndexFor(recipeAncestor, originalName)
+        suggestions = suggestions.map((r, i) => i === autoExpandIndex ? { ...r, ...safeTweaked, __cardKey: r.__cardKey } : r)
       }
       // Prefer tweaked name; fall back to original so the card can still be found
       autoExpandRecipeName = tweakedResult?.recipe_name || originalName || null
@@ -9881,33 +9970,22 @@ function WhiteboardScreen({ whiteboardId, onBack, onContinueFromNode, inventory,
     // directly, so the results screen can pick it out by id instead of by recipe_name —
     // the last name-based lookup in this path (a tweak that keeps its parent's name would
     // otherwise be indistinguishable from the parent by name alone).
-    if (restoreRecipeNodeId && autoExpandRecipeName && Array.isArray(suggestions)) {
-      let marked = false
-      suggestions = suggestions.map(r => {
-        if (!marked && r.recipe_name === autoExpandRecipeName) {
-          marked = true
-          return { ...r, __autoExpandNodeId: restoreRecipeNodeId }
-        }
-        return r
-      })
+    if (restoreRecipeNodeId && autoExpandIndex !== -1 && Array.isArray(suggestions)) {
+      suggestions = suggestions.map((r, i) => i === autoExpandIndex ? { ...r, __autoExpandNodeId: restoreRecipeNodeId } : r)
     }
 
     const result = isIngredients ? null : { incompatible: false, incompatibility_reason: null, flavor_profile_note: null, pairs_well_with: null, cross_template_suggestion: null, suggestions }
 
-    // Build a map of recipe_name → { nodeId, tried, notes } from SIBLING recipe nodes only
+    // Build a map of card key → { nodeId, tried, notes } from SIBLING recipe nodes only
     // (children of the recipe_list). This hydrates the non-auto-expanded RecipeCards in the
     // list and prevents duplicate node inserts. It intentionally excludes the auto-expanded
     // card below — that one is looked up by node id, never by name, so a tweak that keeps its
     // parent's recipe_name can never collide with (or be masked by) a sibling entry here.
+    // S32: keyed by card key (see pairListWithNodes), not recipe_name.
     const restoreNodeData = {}
-    if (restoreRecipeListNodeId) {
-      nodes
-        .filter(n => n.parent_node_id === restoreRecipeListNodeId && n.node_type === 'recipe')
-        .forEach(n => {
-          const name = n.payload?.recipe?.recipe_name
-          if (name) restoreNodeData[name] = { nodeId: n.id, tried: triedMap[n.id] ?? !!n.tried, notes: nodeNotes[n.id] ?? n.notes ?? '' }
-        })
-    }
+    pairs.forEach(({ entry, node: n }) => {
+      if (n) restoreNodeData[entry.__cardKey] = { nodeId: n.id, tried: triedMap[n.id] ?? !!n.tried, notes: nodeNotes[n.id] ?? n.notes ?? '' }
+    })
     // Auto-expanded card's tried/notes are resolved directly by node id (never by name) so a
     // tweak node sharing its parent's recipe_name is structurally impossible to collide with.
     const autoExpandNode = restoreRecipeNodeId ? nodeMap[restoreRecipeNodeId] : null
