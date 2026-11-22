@@ -435,6 +435,39 @@ const ORIGIN_RANK = { published: 0, published_variation: 1, riff: 2, original: 3
 // on legacy/saved items), so an unknown tier sorts to the middle rather than
 // pushing a legacy item to either extreme.
 const TIER_RANK = { canon: 0, variation: 1, low: 2 }
+// S32: See More ideas kept returning the drinks already on screen — about a
+// third of results (measured: 15 of 44 over 12 runs on three seeds), e.g. the
+// Boulevardier beside the tier-1 Boulevardier. Its default "riff" substitutes
+// the featured ingredient into the template's formula, which for a canonical
+// pairing (Campari → Bittersweet, rye → Manhattan) IS the canonical drink, and
+// the honest-origin rule then labels it published under its real name. Its
+// exclude list only carried earlier riffs/originals, so nothing told it those
+// drinks were already shown. publishedShownList feeds them to the prompt;
+// dropAlreadyShownDrinks is the code backstop for when it returns one anyway.
+function publishedShownList(shownSuggestions) {
+  return (shownSuggestions || [])
+    .filter(s => s?.origin === 'published' || s?.origin === 'published_variation')
+    .map(s => `${s.recipe_name} (${(s.recipe || []).map(r => r.ingredient).join(', ')})`)
+}
+function normDrinkName(name) {
+  return (name || '').toLowerCase().replace(/^the\s+/, '').replace(/[^a-z0-9]+/g, ' ').trim()
+}
+// A new suggestion named exactly like a card already shown (any origin — a
+// name that IS a known cocktail's name means that cocktail, per the
+// honest-origin rule) or like an earlier one in the same batch is dropped.
+function dropAlreadyShownDrinks(newSuggestions, shownSuggestions) {
+  const shown = new Set((shownSuggestions || []).map(s => normDrinkName(s?.recipe_name)).filter(Boolean))
+  const kept = []
+  const dropped = []
+  for (const s of newSuggestions || []) {
+    const k = normDrinkName(s?.recipe_name)
+    if (k && shown.has(k)) { dropped.push(s); continue }
+    kept.push(s)
+    if (k) shown.add(k)
+  }
+  return { kept, dropped }
+}
+
 function sortByOriginRank(suggestions) {
   return [...suggestions].sort((a, b) => {
     const originDiff = (ORIGIN_RANK[a?.origin] ?? 4) - (ORIGIN_RANK[b?.origin] ?? 4)
@@ -2240,7 +2273,7 @@ This is a first-pass listing, not the full analysis — the user picks it before
 // first failure was truncation.
 const EXPLORATIONS_ORIGINALS_MAX_TOKENS = 4000
 
-async function analyzeExplorationsOriginals(ingredients, template, modifiers, inventoryText, excludeNames = [], diagLabel = null) {
+async function analyzeExplorationsOriginals(ingredients, template, modifiers, inventoryText, excludeNames = [], diagLabel = null, alreadyShownPublished = []) {
   const buildBody = (maxTokens) => ({
     model: MODEL,
     max_tokens: maxTokens,
@@ -2276,7 +2309,7 @@ CHECK THIS EXPLICITLY BEFORE YOU FINALIZE EACH SUGGESTION'S ORIGIN: look at the 
 For any of these paths, suggest infusions, custom syrups, acid adjustments, fat washing, clarifications, or carbonation where genuinely appropriate, and check every non-garnish, non-pantry-staple ingredient against the bar inventory above (note the generic type and aliases listed alongside each bottle — a bottle's generic type or an alias matching an ingredient the recipe calls for means the user owns it).
 
 ${ATTRIBUTION_FIELDS_INSTRUCTION} These four fields apply only when origin is "published" above — leave all four null for riff/original, same as tier is left null for them.
-${excludeNames.length > 0 ? `\nALREADY SURFACED — the user has already seen these suggestions across earlier batches, each shown with its full ingredient list so you can recognize the underlying swap even under a new name — do not return the same swap again under a different invented name:\n${excludeNames.join('\n')}\nJudge distinctness (see below) against this full list, not just against what you're about to return.\n` : ''}
+${excludeNames.length > 0 ? `\nALREADY SURFACED — the user has already seen these suggestions across earlier batches, each shown with its full ingredient list so you can recognize the underlying swap even under a new name — do not return the same swap again under a different invented name:\n${excludeNames.join('\n')}\nJudge distinctness (see below) against this full list, not just against what you're about to return.\n` : ''}${alreadyShownPublished.length > 0 ? `\nALREADY ON SCREEN — these documented drinks are already shown to the user as published recipes, each with its ingredients:\n${alreadyShownPublished.map(x => `- ${x}`).join('\n')}\nDo not return any of these drinks, under any origin or any name. Substituting the featured ingredient(s) into the template's formula can land exactly on one of them — when it does, that is not a riff, it is a drink the user already has; make a different substitution instead. A riff on one of them is welcome only when it genuinely changes the build, named per NAMING above.\n` : ''}
 CRITICAL: Every cocktail MUST feature ALL of the featured ingredients (${ingredients.join(', ')}). Do not omit any featured ingredient from any suggestion.
 
 ${SEED_INGREDIENT_EXEMPT}
@@ -8229,7 +8262,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       const excludeNames = baseSuggestions
         .filter(s => s.origin === 'riff' || s.origin === 'original')
         .map(s => `${s.recipe_name} (${(s.recipe || []).map(r => r.ingredient).join(', ')})`)
-      const freshData = stripCiteTags(await analyzeExplorationsOriginals(selected, activeTemplate, modifiers, inventoryText, excludeNames, DIAG_ON ? 'tier2-3-see-more-ideas' : null))
+      const freshData = stripCiteTags(await analyzeExplorationsOriginals(selected, activeTemplate, modifiers, inventoryText, excludeNames, DIAG_ON ? 'tier2-3-see-more-ideas' : null, publishedShownList(baseSuggestions)))
       if (!isCurrent()) return null
       const rawSuggestions = freshData?.suggestions || []
       // Session 21, Change 2: tier-2/3 has no search tool and, until now, no
@@ -8241,13 +8274,19 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       // name/alias/generic_type match keeps a suggestion, and an untagged
       // seed still falls back to literal matching rather than being rejected
       // for being untagged alone.
-      const newSuggestions = withCardKeys(filterSuggestionsBySeedIngredients(rawSuggestions, selected, inventoryTags, DIAG_ON ? 'tier2-3-see-more-ideas' : null))
+      const seedKept = filterSuggestionsBySeedIngredients(rawSuggestions, selected, inventoryTags, DIAG_ON ? 'tier2-3-see-more-ideas' : null)
+      // S32: the backstop for ALREADY ON SCREEN — see dropAlreadyShownDrinks.
+      const { kept: unshown, dropped: alreadyShown } = dropAlreadyShownDrinks(seedKept, baseSuggestions)
+      if (alreadyShown.length > 0) console.warn(`[see more] dropped ${alreadyShown.length} already-shown drink(s): ${alreadyShown.map(s => `${s.recipe_name} [${s.origin}]`).join(', ')}`)
+      const newSuggestions = withCardKeys(unshown)
       // Everything the model proposed failed to actually use a listed
       // ingredient — the likely cause is a seed that isn't a real/recognized
       // ingredient (typo or invented), not that no ideas exist. Left false
       // when the model itself returned nothing; that's a genuine miss, not
       // something to flag.
-      setSeeMoreSeedWarning(rawSuggestions.length > 0 && newSuggestions.length === 0)
+      // Judged on the seed filter alone: a batch emptied only by the
+      // already-shown check isn't a seed problem.
+      setSeeMoreSeedWarning(rawSuggestions.length > 0 && seedKept.length === 0)
       // Session 11, Change 2: existing cards must not reorder or shift — only
       // sort the NEW batch among itself, then append it after what's already
       // there, rather than re-sorting the whole merged list (which used to
