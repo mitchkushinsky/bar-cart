@@ -6021,6 +6021,9 @@ function RecipeCard({
   template = null,
   modifiers = null,
   onDetailFetched = null,
+  // S32: told the new node id when this card applies a tweak, so a lifted
+  // id map (the Create results list) follows the card onto the tweak node.
+  onNodeChanged = null,
   isNew = false,
   onRename = null,
   toMake = null,
@@ -6367,7 +6370,7 @@ function RecipeCard({
           ? { prompt, result: stampedResult, conversation, tweak_label: tweakLabel || null }
           : { prompt, result: stampedResult, tweak_label: tweakLabel || null }
         const { data } = await supabase.from('exploration_nodes').insert({ whiteboard_id: whiteboardId, parent_node_id: parentNodeId, node_type: 'tweak', payload }).select('id').single()
-        if (data?.id) recipeNodeIdRef.current = data.id
+        if (data?.id) { recipeNodeIdRef.current = data.id; onNodeChanged?.(data.id) }
         await supabase.from('exploration_whiteboards').update({ last_touched_at: new Date().toISOString() }).eq('id', whiteboardId)
       } catch (err) {
         console.warn('[whiteboard] tweak node write failed:', err.message)
@@ -7591,14 +7594,28 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
   // recipe-node shape { recipe } would wipe it. Node ids are unique, so the set
   // never needs clearing between sessions.
   const tweakNodeIdsRef = useRef(new Set())
-  const writeCardPayload = async (nodeId, recipe) => {
+  // `tweakPatch` is only the fields the write changes. A tweak node merges
+  // just those into its result: the list entry `recipe` is built from is the
+  // ORIGINAL recipe whenever the tweak was applied in this session (the card
+  // holds the tweak in its own state), so merging the whole entry would put
+  // the original recipe back over the tweak.
+  const writeCardPayload = async (nodeId, recipe, tweakPatch) => {
     if (tweakNodeIdsRef.current.has(nodeId)) {
       const { data, error } = await supabase.from('exploration_nodes').select('payload').eq('id', nodeId).single()
       if (error) return { error }
       const prev = data?.payload || {}
-      return supabase.from('exploration_nodes').update({ payload: { ...prev, result: { ...(prev.result || {}), ...stripInternalFields(recipe) } } }).eq('id', nodeId)
+      return supabase.from('exploration_nodes').update({ payload: { ...prev, result: { ...(prev.result || {}), ...tweakPatch } } }).eq('id', nodeId)
     }
     return supabase.from('exploration_nodes').update({ payload: { recipe } }).eq('id', nodeId)
+  }
+  // S32: a card that applies a tweak in this session moves onto the new tweak
+  // node (RecipeCard already did, for further tweaks); before this the list's
+  // id map kept pointing at the parent recipe node, so Tried/notes/rename/save
+  // on the tweaked card wrote to the drink it was tweaked FROM.
+  const handleCardNodeChanged = (cardKey, nodeId) => {
+    if (cardKey == null || !nodeId) return
+    tweakNodeIdsRef.current.add(nodeId)
+    setCurrentRecipeNodeIds(prev => ({ ...prev, [cardKey]: nodeId }))
   }
   const endResultsSession = () => {
     resultsSessionRef.current += 1
@@ -7676,7 +7693,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     const nodePayload = { recipe: { ...renamedSuggestion, recipe_name: newName } }
 
     if (nodeId && user) {
-      const { error } = await writeCardPayload(nodeId, nodePayload.recipe)
+      const { error } = await writeCardPayload(nodeId, nodePayload.recipe, { recipe_name: newName, display_name: newName, name_user_supplied: true })
       if (error) throw new Error(error.message || 'Could not save name.')
       setPendingRecipeNames(prev => {
         if (!(cardKey in prev)) return prev
@@ -7702,7 +7719,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     // card with the same name shows this rename. The list-node write below
     // stays unconditional: it uses this session's own list id and
     // suggestions, captured when the rename started.
-    if (resultsSessionRef.current === session) setResult(prev => prev ? {
+    // S32: not for a tweak node either — the list entry is the original
+    // recipe in-session; the card shows its own name/saved state.
+    if (resultsSessionRef.current === session && !(nodeId && tweakNodeIdsRef.current.has(nodeId))) setResult(prev => prev ? {
       ...prev,
       suggestions: (prev.suggestions || []).map(x => x.__cardKey === cardKey ? renamedSuggestion : x),
     } : prev)
@@ -7733,7 +7752,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
     const nodePayload = { recipe: savedSuggestion }
 
     if (nodeId && user) {
-      const { error } = await writeCardPayload(nodeId, nodePayload.recipe)
+      const { error } = await writeCardPayload(nodeId, nodePayload.recipe, { to_make_id: newId })
       if (error) { console.warn('[save] node persist failed (non-fatal, to_make row already saved):', error.message) }
     } else if (user && currentWhiteboardId && currentRecipeListNodeId) {
       try {
@@ -7754,7 +7773,9 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
 
     // S32: same split as handleRecipeRename — the screen only while this
     // session is current; the list-node write below is this session's own.
-    if (resultsSessionRef.current === session) setResult(prev => prev ? {
+    // S32: not for a tweak node either — the list entry is the original
+    // recipe in-session; the card shows its own name/saved state.
+    if (resultsSessionRef.current === session && !(nodeId && tweakNodeIdsRef.current.has(nodeId))) setResult(prev => prev ? {
       ...prev,
       suggestions: (prev.suggestions || []).map(x => x.__cardKey === cardKey ? savedSuggestion : x),
     } : prev)
@@ -7793,7 +7814,7 @@ function ExplorationsScreen({ inventory, inventoryText, inventoryTags, onSaveOnD
       const { originalName, newName } = names[name]
       const existing = (result?.suggestions || []).find(x => x.__cardKey === name)
       const recipe = { ...(existing || { recipe_name: originalName, __cardKey: name }), recipe_name: newName, display_name: newName, name_user_supplied: true }
-      writeCardPayload(currentRecipeNodeIds[name], recipe)
+      writeCardPayload(currentRecipeNodeIds[name], recipe, { recipe_name: newName, display_name: newName, name_user_supplied: true })
         .then(({ error }) => { if (error) console.warn('[rename] deferred save failed:', error.message) })
     })
     if (noteNames.length > 0) setPendingRecipeNotes(prev => { const n = { ...prev }; noteNames.forEach(k => delete n[k]); return n })
@@ -9672,7 +9693,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.green, marginBottom: 12 }}>Can Make Now ({canMake.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.__cardKey]; const isNew = newBatchKeys.has(s.__cardKey); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={s.__cardKey ?? i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} cardKey={s.__cardKey} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventory={inventory} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={(_name, patch) => handleSuggestionDetailFetched(s.__cardKey, patch)} onNotesSave={value => handleRecipeNotesSave(s.__cardKey, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.__cardKey, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.__cardKey, s.recipe_name, newName)} toMake={toMake} onSaved={(_name, id) => handleRecipeSaved(s.__cardKey, s.recipe_name, id)} /></div> })}
+                {canMake.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.__cardKey]; const isNew = newBatchKeys.has(s.__cardKey); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={s.__cardKey ?? i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} cardKey={s.__cardKey} onNodeChanged={nodeId => handleCardNodeChanged(s.__cardKey, nodeId)} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventory={inventory} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={(_name, patch) => handleSuggestionDetailFetched(s.__cardKey, patch)} onNotesSave={value => handleRecipeNotesSave(s.__cardKey, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.__cardKey, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.__cardKey, s.recipe_name, newName)} toMake={toMake} onSaved={(_name, id) => handleRecipeSaved(s.__cardKey, s.recipe_name, id)} /></div> })}
               </div>
             </div>
           )}
@@ -9680,7 +9701,7 @@ Rules:
             <div style={{ marginBottom: 28 }}>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.amber, marginBottom: 12 }}>Shopping Required ({worthBuying.length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.__cardKey]; const isNew = newBatchKeys.has(s.__cardKey); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={s.__cardKey ?? i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} cardKey={s.__cardKey} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventory={inventory} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={(_name, patch) => handleSuggestionDetailFetched(s.__cardKey, patch)} onNotesSave={value => handleRecipeNotesSave(s.__cardKey, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.__cardKey, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.__cardKey, s.recipe_name, newName)} toMake={toMake} onSaved={(_name, id) => handleRecipeSaved(s.__cardKey, s.recipe_name, id)} /></div> })}
+                {worthBuying.map((s, i) => { const isAutoExpand = autoExpandRecipeNodeId != null && s.__autoExpandNodeId === autoExpandRecipeNodeId; const nd = isAutoExpand ? autoExpandNodeData : restoreNodeData[s.__cardKey]; const isNew = newBatchKeys.has(s.__cardKey); const anchorHere = isNew && !firstNewAssigned; if (anchorHere) firstNewAssigned = true; return <div key={s.__cardKey ?? i} ref={anchorHere ? firstNewCardRef : null}><RecipeCard suggestion={stripInternalFields(s)} primaryIngredients={selected} onSaveOnDeck={onSaveOnDeck} user={user} whiteboardId={currentWhiteboardId} recipeListNodeId={currentRecipeListNodeId} recipeNodeIds={currentRecipeNodeIds} cardKey={s.__cardKey} onNodeChanged={nodeId => handleCardNodeChanged(s.__cardKey, nodeId)} autoExpand={isAutoExpand} restoreRecipeNodeId={isAutoExpand ? autoExpandRecipeNodeId : null} initialTried={nd?.tried || false} initialNotes={nd?.notes || ''} inventoryText={inventoryText} inventory={inventory} inventoryTags={inventoryTags} template={template} modifiers={{ frozen, lowABV, na }} onDetailFetched={(_name, patch) => handleSuggestionDetailFetched(s.__cardKey, patch)} onNotesSave={value => handleRecipeNotesSave(s.__cardKey, value)} onTriedToggle={(next, triedAt) => handleRecipeTriedToggle(s.__cardKey, next, triedAt)} isNew={isNew} onRename={newName => handleRecipeRename(s.__cardKey, s.recipe_name, newName)} toMake={toMake} onSaved={(_name, id) => handleRecipeSaved(s.__cardKey, s.recipe_name, id)} /></div> })}
               </div>
             </div>
           )}
