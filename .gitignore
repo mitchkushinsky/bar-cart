@@ -27,3 +27,4 @@ explorations-backup-*.json
 .vercel
 dev.sh
 .env*
+!.env.example
