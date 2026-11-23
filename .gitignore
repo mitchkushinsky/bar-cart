@@ -25,3 +25,5 @@ explorations-backup-*.json
 *.sln
 *.sw?
 .vercel
+dev.sh
+.env*
