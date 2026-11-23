@@ -1,6 +1,11 @@
 /* global process */
 import { createClient } from '@supabase/supabase-js'
 
+// claude-sonnet-4-5 retires 2026-11-30. Sonnet 5.5 thinks by default and
+// thinking counts against max_tokens; between_tools is its no-thinking
+// setting (`disabled` is a 400) - see MODEL in src/App.jsx.
+const MODEL = 'claude-sonnet-5-5'
+
 function extractJSONArray(text) {
   const t = text.trim()
   try { const v = JSON.parse(t); if (Array.isArray(v)) return v } catch { /* fall through */ }
@@ -106,7 +111,8 @@ Return ONLY a valid JSON array with no markdown fences, exactly one object per b
         'content-type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-5',
+        model: MODEL,
+        thinking: { type: 'between_tools' },
         max_tokens: 4096,
         messages: [{ role: 'user', content: prompt }],
       }),

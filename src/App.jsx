@@ -159,7 +159,19 @@ import { supabase } from './supabase.js'
 const DEFAULT_SHEET_URL =
   'https://docs.google.com/spreadsheets/d/e/2PACX-1vSWHwzLTItnOhFiPSAPObW6iJI1OVnpqiYgoaUzM_KYlzM2MgJsr4zFLpnaY_mB6kOVQLp6edO9xMIB/pub?gid=709003368&single=true&output=csv'
 
-const MODEL = 'claude-sonnet-4-5'
+const MODEL = 'claude-sonnet-5-5'
+// Sonnet 5.5 thinks before answering unless told not to, and thinking counts
+// against max_tokens. Measured on this app's own calls (2026-11-23, replaying
+// captured request bodies): with the default, 9 of 19 calls hit max_tokens -
+// the walk steps, finish and consult, Build, card details, template guidance.
+// `between_tools` is the model's lowest setting (no thinking; `disabled` is a
+// 400 on this model) and matched Sonnet 4.5, which never thought. Applied to
+// every request in the four fetch helpers below; a call that wants thinking
+// sets its own `thinking`.
+const NO_THINKING = { type: 'between_tools' }
+function withModelDefaults(body) {
+  return body.thinking ? body : { ...body, thinking: NO_THINKING }
+}
 // Raised from 1500 (hotfix): the diagnostic proved stop_reason: max_tokens,
 // output_tokens: 1500 on a 6-ingredient recipe with a substitution note per
 // line — the ceiling was too low for ordinary input. Shared by every
@@ -1335,7 +1347,7 @@ async function callClaudeText(body, opts = {}) {
     res = await fetch('/api/claude', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(withModelDefaults(body)),
     })
   } catch (_) {
     const err = new Error('Could not reach the server — check your connection and try again.')
@@ -1370,7 +1382,7 @@ async function callClaude(body, opts = {}) {
     res = await fetch('/api/claude', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(withModelDefaults(body)),
     })
   } catch (_) {
     const err = new Error('Could not reach the server — check your connection and try again.')
@@ -1423,7 +1435,7 @@ async function callClaudeStream(body, { onText, signal } = {}) {
     res = await fetch('/api/claude', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ...body, stream: true }),
+      body: JSON.stringify({ ...withModelDefaults(body), stream: true }),
       signal,
     })
   } catch {
@@ -1528,7 +1540,7 @@ async function callClaudeStreamDiag(body, label) {
     res = await fetch('/api/claude', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ...body, stream: true }),
+      body: JSON.stringify({ ...withModelDefaults(body), stream: true }),
     })
   } catch (err) {
     console.error(`[DIAG:${label}] network error`, err.message)
@@ -2491,7 +2503,8 @@ async function analyzeSuggestionDetail(suggestion, primaryIngredients, template,
   const ingredientList = (suggestion.recipe || []).map(r => `- ${r.amount} ${r.ingredient}`).join('\n')
   const body = {
     model: MODEL,
-    max_tokens: 1200,
+    // S33: 1200 -> 2000. With search the cap applies per sampling round, and on claude-sonnet-5-5 the final round carries its between-search progress notes plus the JSON; at 700 four of four runs ran out before writing any JSON.
+    max_tokens: 2000,
     ...(isPublished ? { tools: [{ type: 'web_search_20250305', name: 'web_search' }] } : {}),
     messages: [{
       role: 'user',
@@ -2759,7 +2772,8 @@ async function analyzeVerifyBufferCandidates(candidates, ingredients, template, 
   const candidateList = candidates.map((c, i) => `${i + 1}. "${c.name}"${c.tier ? ` (guessed tier: ${c.tier})` : ''}`).join('\n')
   const body = {
     model: MODEL,
-    max_tokens: 1200,
+    // S33: 1200 -> 2000. Same per-round cap as analyzeSuggestionDetail: claude-sonnet-5-5 ran 10 searches here (4.5: 5) and hit max_tokens in the final round, so the canon buffer silently failed and See More Published fell back to a fresh search.
+    max_tokens: 2000,
     tools: [{ type: 'web_search_20250305', name: 'web_search' }],
     messages: [{
       role: 'user',
@@ -2912,7 +2926,7 @@ Pick exactly one template id that best fits these ingredients. Return ONLY valid
 
   try {
     const parsed = await callClaude({
-      model: 'claude-sonnet-4-5',
+      model: MODEL,
       max_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     })
@@ -2983,7 +2997,7 @@ Return ONLY valid JSON, no markdown fences:
 "ingredients" must have exactly ${ingredients.length} entries, in the same order as listed above.`
 
   const body = {
-    model: 'claude-sonnet-4-5',
+    model: MODEL,
     max_tokens: 1200,
     messages: [{ role: 'user', content: prompt }],
   }
@@ -3033,7 +3047,7 @@ Return ONLY valid JSON, no markdown fences:
 }`
 
   const body = {
-    model: 'claude-sonnet-4-5',
+    model: MODEL,
     max_tokens: 500,
     messages: [{ role: 'user', content: prompt }],
   }
@@ -3198,8 +3212,9 @@ Return ONLY valid JSON, no markdown fences:
 Exactly ten entries, every id listed above exactly once, ranked best fit first.`
 
   const body = {
-    model: 'claude-sonnet-4-5',
-    max_tokens: 1400,
+    model: MODEL,
+    // S33: 1400 -> 2000 for claude-sonnet-5-5 (1379 of 1400 measured).
+    max_tokens: 2000,
     messages: [{ role: 'user', content: prompt }],
   }
   const toEntry = e => ({ id: e.id, suggested: !!e.suggested, trait: e.trait || null, reason: e.reason || null })
@@ -3555,7 +3570,8 @@ Return ONLY valid JSON, no markdown fences:
   "skip": ${step.optional ? '{ "recommended": true or false, "reason": "string" }' : 'null'},
   "options": [{ "ingredients": [{ "name": "string", "kind": "bottle | staple" }], "why": "string — max 22 words", "versus": "string or null — max 14 words", "reference": "string or null" }]
 }`
-  const body = { model: MODEL, max_tokens: 900, messages: [{ role: 'user', content: [walkInventoryBlock(inventoryText), { type: 'text', text: prompt }] }] }
+  // S33: 900 -> 1400 for claude-sonnet-5-5 (up to 607 measured, vs 400 on 4.5).
+  const body = { model: MODEL, max_tokens: 1400, messages: [{ role: 'user', content: [walkInventoryBlock(inventoryText), { type: 'text', text: prompt }] }] }
   const scan = makeArrayElementScanner('options')
   const streamed = []
   const r = await callClaudeStream(body, {
@@ -3672,7 +3688,8 @@ Return ONLY valid JSON, no markdown fences:
   "trajectory": "string or null",
   "notes_check": [{ "step": 1, "holds": true, "note": "string — max 15 words" }]
 }`
-  const r = await callClaudeStream({ model: MODEL, max_tokens: 900, messages: [{ role: 'user', content: [walkInventoryBlock(inventoryText), { type: 'text', text: prompt }] }] }, { signal })
+  // S33: 900 -> 1400 for claude-sonnet-5-5, which writes ~2x Sonnet 4.5 here (867 of 900 measured).
+  const r = await callClaudeStream({ model: MODEL, max_tokens: 1400, messages: [{ role: 'user', content: [walkInventoryBlock(inventoryText), { type: 'text', text: prompt }] }] }, { signal })
   const data = extractJSON(r.text)
   if (!data?.recipe_name || !Array.isArray(data?.recipe) || data.recipe.length === 0) throw new Error('The finished recipe came back incomplete.')
   const kind = ['is_known', 'relative', 'none'].includes(data?.relative?.kind) ? data.relative.kind : 'none'
@@ -8892,7 +8909,7 @@ Rules:
 - Return ONLY valid JSON, no other text.`
 
       const parsed = await callClaude({
-        model: 'claude-sonnet-4-5',
+        model: MODEL,
         max_tokens: 800,
         messages: [{ role: 'user', content: prompt }],
       })
